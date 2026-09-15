@@ -329,18 +329,33 @@ def _stream_local(session: dict, message: str):
             result = event
     model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
                                     stage="chat", result=result or {}, source="chat")
-    # 2026-09-05, Grimmethy: force_summary_on_cap=True is now passed above, so both a
-    # turn-cap hit AND a context-budget hit (see local-tool-client.js's own
-    # RESERVED_RESPONSE_TOKENS/estimateMessagesTokens check) now force one extra no-tools
-    # turn that produces a real considered answer with a RESOLUTION: line, rather than
-    # returning whatever rode along with the run's last tool call. `forcedSummary` /
-    # `forcedSummaryReason` are the real signal for that now -- prefer them over the old
-    # turnsUsed >= max_turns heuristic below (kept only as a fallback for the
-    # exceedingly rare case where forcedSummary itself never got set, e.g. the tools-
-    # disabled kill-switch path).
-    if result and result.get("forcedSummary"):
-        budget = "context room" if result.get("forcedSummaryReason") == "context" else f"its {CHAT_LOCAL_MAX_TURNS}-turn tool budget"
-        yield f"\n\n*(Ran out of {budget} mid-investigation, so it gave its best final answer using what it had already learned.)*"
+    # 2026-09-05, Grimmethy: force_summary_on_cap=True is now passed above, so a
+    # turn-cap hit, a context-budget hit, AND a voluntary early stop with no RESOLUTION:
+    # line (see local-tool-client.js's own RESERVED_RESPONSE_TOKENS/
+    # estimateMessagesTokens check and its runForcedSummaryTurn call sites) all force one
+    # extra no-tools turn that produces a real considered answer with a RESOLUTION: line,
+    # rather than returning whatever rode along with the run's last tool call.
+    # `forcedSummary`/`forcedSummaryReason` are the real signal for that now -- prefer
+    # them over the old turnsUsed >= max_turns heuristic below (kept only as a fallback
+    # for the exceedingly rare case where forcedSummary itself never got set, e.g. the
+    # tools-disabled kill-switch path).
+    #
+    # 2026-09-15 (Grimmethy: "Different stop reasons should absolutely be
+    # distinguishable. It keeps the system understandable."): these three reasons used to
+    # collapse into one of two footers, and 'voluntary-stop' -- by far the MOST common
+    # one, since Chat's own system prompt never asks for a RESOLUTION: line on an
+    # ordinary reply -- shared 'turns'' "ran out of its 100-turn tool budget" text even
+    # when the real turnsUsed was 2. Confirmed live via model-stats.db: two of three real
+    # Chat calls in one session showed that exact false message. 'voluntary-stop' gets NO
+    # footer at all: nothing was actually exhausted, the model gave a complete answer and
+    # was only asked to append the sentinel line the pipeline's resolver parses.
+    if result and result.get("forcedSummary") and result.get("forcedSummaryReason") == "context":
+        yield "\n\n*(Ran out of context room mid-investigation, so it gave its best final answer using what it had already learned.)*"
+    elif result and result.get("forcedSummary") and result.get("forcedSummaryReason") == "turns":
+        yield (
+            f"\n\n*(Ran out of its {CHAT_LOCAL_MAX_TURNS}-turn tool budget mid-investigation, "
+            "so it gave its best final answer using what it had already learned.)*"
+        )
     elif result and result.get("turnsUsed") is not None and result["turnsUsed"] >= CHAT_LOCAL_MAX_TURNS:
         yield (
             f"\n\n*(Ran out of its {CHAT_LOCAL_MAX_TURNS}-turn tool budget mid-investigation -- "
