@@ -1,7 +1,5 @@
-"""Tests for app.py's own small glue functions (verbatim ports of agent-manager's
-app.py -- see that file's own copies for the original rationale/history). Covers the
-pure/file-reading utilities chat_preempt.py, chat_sessions.py, and routes/chat.py all
-rely on via `from app import ...` at call time.
+"""Tests for app.py's own small glue functions. Covers the pure/file-reading utilities
+chat_sessions.py and routes/chat.py rely on via `from app import ...` at call time.
 
 Run: .venv/bin/python -m unittest test_app_glue -v
 """
@@ -132,37 +130,6 @@ class TestActiveProjectSetting(unittest.TestCase):
             self.assertIsNone(app.instances_dir())
 
 
-class TestManifestReaders(unittest.TestCase):
-    def test_read_plugins_manifest_missing_file_returns_empty_list(self):
-        with mock.patch.object(app, "PLUGINS_MANIFEST_PATH", Path("/does/not/exist.json")):
-            self.assertEqual(app._read_plugins_manifest(), [])
-
-    def test_read_plugins_manifest_parses_real_file(self):
-        d = Path(tempfile.mkdtemp())
-        p = d / "plugins.json"
-        p.write_text(json.dumps([{"name": "x", "enabled": True}]), encoding="utf-8")
-        with mock.patch.object(app, "PLUGINS_MANIFEST_PATH", p):
-            self.assertEqual(app._read_plugins_manifest(), [{"name": "x", "enabled": True}])
-
-    def test_read_plugins_manifest_malformed_json_returns_empty_list(self):
-        d = Path(tempfile.mkdtemp())
-        p = d / "plugins.json"
-        p.write_text("{not valid", encoding="utf-8")
-        with mock.patch.object(app, "PLUGINS_MANIFEST_PATH", p):
-            self.assertEqual(app._read_plugins_manifest(), [])
-
-    def test_read_project_registry_missing_file_returns_empty_list(self):
-        with mock.patch.object(app, "PROJECT_REGISTRY_PATH", Path("/does/not/exist.json")):
-            self.assertEqual(app.read_project_registry(), [])
-
-    def test_read_project_registry_parses_real_file(self):
-        d = Path(tempfile.mkdtemp())
-        p = d / "projects.json"
-        p.write_text(json.dumps([{"repoRoot": "/x"}]), encoding="utf-8")
-        with mock.patch.object(app, "PROJECT_REGISTRY_PATH", p):
-            self.assertEqual(app.read_project_registry(), [{"repoRoot": "/x"}])
-
-
 class TestClaudeDefaults(unittest.TestCase):
     def test_defaults_when_no_settings_file(self):
         with mock.patch.object(app, "DASHBOARD_SETTINGS_PATH", Path("/does/not/exist.json")):
@@ -177,44 +144,26 @@ class TestClaudeDefaults(unittest.TestCase):
 
 
 class TestChatRoots(unittest.TestCase):
-    def test_dedupes_and_always_includes_package_root(self):
-        d = Path(tempfile.mkdtemp())
-        core = d / "core"
-        core.mkdir()
-        plugin_dir = d / "plugin"
-        plugin_dir.mkdir()
-        with mock.patch.object(app, "PACKAGE_ROOT", core), \
-             mock.patch.object(app, "_read_plugins_manifest", return_value=[
-                 {"registerPath": str(plugin_dir / "register.js"), "enabled": True},
-             ]), \
-             mock.patch.object(app, "read_project_registry", return_value=[
-                 {"repoRoot": str(plugin_dir)},  # same dir as the plugin -- must dedupe
-             ]):
-            roots = app._chat_roots()
-            self.assertEqual(roots[0], os.path.realpath(str(core)))
-            self.assertEqual(len(roots), 2, "the plugin dir and the identical project repoRoot must dedupe to one entry")
+    """2026-09-15 (Phase 3): _chat_roots() is now a thin wrapper around
+    internal_api_client.get_roots() -- the core dashboard resolves the real list itself.
+    See internal_api_client's own tests for the HTTP call details this mocks around."""
 
-    def test_falls_back_to_package_root_alone_with_nothing_registered(self):
-        d = Path(tempfile.mkdtemp())
-        core = d / "core"
-        core.mkdir()
-        with mock.patch.object(app, "PACKAGE_ROOT", core), \
-             mock.patch.object(app, "_read_plugins_manifest", return_value=[]), \
-             mock.patch.object(app, "read_project_registry", return_value=[]):
-            self.assertEqual(app._chat_roots(), [os.path.realpath(str(core))])
+    def test_returns_the_internal_api_result_when_it_succeeds(self):
+        with mock.patch("internal_api_client.get_roots", return_value=["/a", "/b"]):
+            self.assertEqual(app._chat_roots(), ["/a", "/b"])
 
-    def test_disabled_plugin_is_excluded(self):
+    def test_falls_back_to_core_repo_root_when_the_internal_api_call_fails(self):
+        from internal_api_client import InternalApiError
         d = Path(tempfile.mkdtemp())
-        core = d / "core"
-        core.mkdir()
-        disabled_dir = d / "disabled-plugin"
-        disabled_dir.mkdir()
-        with mock.patch.object(app, "PACKAGE_ROOT", core), \
-             mock.patch.object(app, "_read_plugins_manifest", return_value=[
-                 {"registerPath": str(disabled_dir / "register.js"), "enabled": False},
-             ]), \
-             mock.patch.object(app, "read_project_registry", return_value=[]):
-            self.assertEqual(app._chat_roots(), [os.path.realpath(str(core))])
+        with mock.patch.object(app, "CORE_REPO_ROOT", d), \
+             mock.patch("internal_api_client.get_roots", side_effect=InternalApiError("no token")):
+            self.assertEqual(app._chat_roots(), [os.path.realpath(str(d))])
+
+    def test_falls_back_to_core_repo_root_when_the_internal_api_returns_an_empty_list(self):
+        d = Path(tempfile.mkdtemp())
+        with mock.patch.object(app, "CORE_REPO_ROOT", d), \
+             mock.patch("internal_api_client.get_roots", return_value=[]):
+            self.assertEqual(app._chat_roots(), [os.path.realpath(str(d))])
 
 
 class TestDiscussProviderArgs(unittest.TestCase):

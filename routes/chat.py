@@ -1,16 +1,20 @@
 from flask import Blueprint, Response, abort, jsonify, request, session, stream_with_context
 
-import contextlib
 import json
 import sys
-import time
 
-# The app.py helpers these views call (CHAT_STORAGE_DIR, _call_chat, _chat_preempt_enabled, _chat_reservations, _chat_reservations_lock, _chat_roots, _discuss_provider_args, _preempt_pipeline_for_chat, instances_dir) are
-# imported lazily inside each view: app.py imports THIS module to register the
-# blueprint, so a top-level `from app import ...` is a circular import that only
-# fails when app.py is the entrypoint (how the dashboard runs). By the time a view
-# runs, app.py is fully initialised and the import is just a dict lookup. (Same
-# pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)
+# The app.py helpers these views call (CHAT_STORAGE_DIR, _call_chat, _chat_roots,
+# _discuss_provider_args) are imported lazily inside each view: app.py imports THIS
+# module to register the blueprint, so a top-level `from app import ...` is a circular
+# import that only fails when app.py is the entrypoint (how the dashboard runs). By the
+# time a view runs, app.py is fully initialised and the import is just a dict lookup.
+#
+# 2026-09-15 (Phase 3 of the Chat-plugin extraction -- see
+# /home/wok/.claude/plans/immutable-noodling-axolotl.md): the local-provider
+# preempt/priority-marker/reservation logic this file used to call directly (chat_
+# preempt.py, single_flight_lock.py) now goes through internal_api_client.py instead --
+# see api_chat_message and api_chat_reserve below. This repo no longer touches
+# instances//queue/ or holds any GPU lock of its own.
 
 chat_bp = Blueprint("chat-bp", __name__)
 
@@ -109,7 +113,7 @@ def api_chat_message(session_id):
     NOT covered by this -- a known, real, narrower gap (git's own index.lock still turns
     a genuine collision into a clean failure to retry, not silent corruption) rather than
     a solved one; revisit if it causes a real incident."""
-    from app import CHAT_STORAGE_DIR, _chat_preempt_enabled, _chat_reservations, _chat_reservations_lock, _preempt_pipeline_for_chat, instances_dir
+    from app import CHAT_STORAGE_DIR
     body = request.get_json(silent=True) or {}
     message = (body.get("message") or "").strip()
     if not message:
@@ -131,50 +135,50 @@ def api_chat_message(session_id):
     from chat_sessions import stream_message, PROVIDER_LOCAL
     from claude_client import ClaudeClientError
     from local_tool_client import LocalToolClientError
-    import single_flight_lock
+    from internal_api_client import InternalApiError, preempt as internal_preempt
 
     is_local_turn = existing.get("provider") == PROVIDER_LOCAL
-    inst_dir = instances_dir()
 
-    # Make GPU space for a local-provider turn: kill both worker lanes' in-flight draft
-    # (chat precludes workers), the reviewer's only if < ~3 min in. Synchronous, before the
-    # SSE generator / node child runs. Claude-provider turns don't touch the local model.
+    # Make GPU space for a local-provider turn: the internal API's own /preempt route
+    # kills both worker lanes' in-flight draft (chat precludes workers), the reviewer's
+    # only if < ~3 min in -- see chat_preempt.py's original header in the core repo for
+    # the full rationale, and no-ops server-side if AGENT_MANAGER_CHAT_PREEMPT=false.
+    # Synchronous, before the SSE generator runs. Claude-provider turns don't touch the
+    # local model, so this is skipped entirely for them. The internal API's own
+    # /local-turn route separately holds the priority marker for the WHOLE call (not
+    # just this preempt step) -- this repo no longer needs single_flight_lock at all for
+    # the local-provider path; local_tool_client.stream_plan_with_tools() below reaches
+    # that same route.
     preempted = []
-    if is_local_turn and _chat_preempt_enabled():
+    if is_local_turn:
         try:
-            preempted = _preempt_pipeline_for_chat()
-        except Exception as e:  # noqa: BLE001 -- never block a chat turn on this
+            preempted = internal_preempt()
+        except InternalApiError as e:  # noqa: BLE001 -- never block a chat turn on this
             print(f"[chat-preempt] failed (non-fatal): {e}", file=sys.stderr, flush=True)
 
     def generate():
-        # Priority marker held for the WHOLE turn (model call + every tool-loop iteration in
-        # the node child) and kept fresh by priority_marker's own daemon thread, so worker/
-        # reviewer acquire() keeps yielding the GPU the entire time -- not just the ~8s the
-        # bare marker used to cover. Killing a worker (above) only frees the GPU for an
-        # instant; without this the worker daemon respawns and reclaims it between the
-        # chat's tool-loop turns, and the turn starves with no output (confirmed live
-        # 2026-09-02). Inside generate() so its teardown is bound to the SSE generator's
-        # lifecycle (client disconnect -> GeneratorExit -> finally).
-        marker_cm = (single_flight_lock.priority_marker(inst_dir)
-                     if (is_local_turn and inst_dir) else contextlib.nullcontext())
-        with marker_cm:
-            if preempted:
-                yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
-            try:
-                for event in stream_message(CHAT_STORAGE_DIR, session_id, message):
-                    yield f"data: {json.dumps(event)}\n\n"
-            except ClaudeClientError as e:
-                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-            except LocalToolClientError as e:
-                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-            except (TimeoutError, ConnectionError, OSError) as e:
-                yield f"data: {json.dumps({'type': 'error', 'error': f'local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly.'})}\n\n"
+        if preempted:
+            yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
+        try:
+            for event in stream_message(CHAT_STORAGE_DIR, session_id, message):
+                yield f"data: {json.dumps(event)}\n\n"
+        except ClaudeClientError as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        except LocalToolClientError as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        except (TimeoutError, ConnectionError, OSError) as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': f'local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly.'})}\n\n"
 
-    # Reserved sessions refresh their own idle clock on every real message -- same
-    # liveness-refresh shape a worker instance's own heartbeat already follows.
-    with _chat_reservations_lock:
-        if session_id in _chat_reservations:
-            _chat_reservations[session_id]["lastActivity"] = time.time()
+    # Reserved sessions refresh their own idle clock on every real message -- see
+    # api_chat_reserve below: calling the internal API's /reserve again with on:true
+    # while already reserved is a refresh, not a no-op, on the core-dashboard side.
+    if existing.get("reserved"):
+        try:
+            from internal_api_client import reserve as internal_reserve
+            import ollama_client
+            internal_reserve(session_id, ollama_client.MODEL, True)
+        except InternalApiError as e:  # noqa: BLE001 -- best-effort refresh, never block the turn
+            print(f"[chat-reserve] refresh failed (non-fatal): {e}", file=sys.stderr, flush=True)
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
@@ -192,9 +196,10 @@ def api_chat_reserve(session_id):
     Body: {on: bool}. Only meaningful for the local provider (Claude has no shared-
     resource lock, per the earlier decision not to lock Claude calls against each
     other)."""
-    from app import CHAT_STORAGE_DIR, _chat_reservations, _chat_reservations_lock, instances_dir
+    from app import CHAT_STORAGE_DIR
     from chat_sessions import get_session, set_reserved, PROVIDER_LOCAL
-    import single_flight_lock
+    from internal_api_client import InternalApiError, reserve as internal_reserve
+    import ollama_client
 
     session = get_session(CHAT_STORAGE_DIR, session_id)
     if not session:
@@ -205,34 +210,14 @@ def api_chat_reserve(session_id):
     body = request.get_json(silent=True) or {}
     want_on = bool(body.get("on"))
 
-    # single_flight_lock.acquire() BLOCKS (it's the real GPU/model mutex, can wait as
-    # long as a worker lane's current call takes) -- must never be called while holding
-    # _chat_reservations_lock, or every other Chat request (another session's own
-    # message, another reserve toggle) would stall for the same duration. Two short,
-    # separate critical sections instead: check-and-claim first, do the real (possibly
-    # slow) acquire/release outside the lock, then record the result.
-    with _chat_reservations_lock:
-        already_on = session_id in _chat_reservations
-        claiming = want_on and not already_on
-        releasing_record = _chat_reservations.pop(session_id) if (not want_on and already_on) else None
-        if claiming:
-            # Reserve the dict slot now (before the blocking acquire below) so a second,
-            # concurrent toggle-on request for the SAME session can't also start
-            # acquiring -- filled in with the real fh once acquire() returns.
-            _chat_reservations[session_id] = {"fh": None, "lastActivity": time.time(), "storageDir": CHAT_STORAGE_DIR}
-
-    if releasing_record is not None:
-        single_flight_lock.release(releasing_record["fh"])
-    if claiming:
-        inst_dir = instances_dir()
-        if not inst_dir:
-            with _chat_reservations_lock:
-                _chat_reservations.pop(session_id, None)
-            abort(500, description="no active project's instances dir resolvable")
-        import ollama_client
-        fh = single_flight_lock.acquire(inst_dir, ollama_client.MODEL)  # blocking -- may wait for a worker lane's current call on this same model
-        with _chat_reservations_lock:
-            _chat_reservations[session_id] = {"fh": fh, "lastActivity": time.time(), "storageDir": CHAT_STORAGE_DIR}
+    # The real acquire()/release() (and the blocking-for-a-worker-lane's-current-call
+    # wait that can entail) now happens entirely on the core dashboard side, in its own
+    # _internal_chat_reservations registry -- this repo no longer holds an OS file
+    # handle or a lock of its own for this at all, session_id is just an opaque key.
+    try:
+        internal_reserve(session_id, ollama_client.MODEL, want_on)
+    except InternalApiError as e:
+        abort(502, description=f"reservation call to the core dashboard failed: {e}")
 
     session = set_reserved(CHAT_STORAGE_DIR, session_id, want_on)
     return jsonify(session)

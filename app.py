@@ -1,20 +1,23 @@
-"""Standalone Chat plugin for agent-manager (Phase 1 of the extraction plan -- see
+"""Standalone Chat plugin for agent-manager -- see
 /home/wok/.claude/plans/immutable-noodling-axolotl.md in the agent-manager checkout that
-authored this repo).
+authored this repo.
 
 Runs as its own process, started/stopped by agent-manager's plugin_process_manager.py
 (same lifecycle contract as agent-manager-hardware-plugin: GET /healthz for liveness).
 
-Phase 1 deliberately keeps the SAME direct filesystem/subprocess coupling to the CORE
-agent-manager repo the in-tree Chat feature always had (reads its agent-manager.env/
-plugins.json/projects.json, instances/, queue/, shells out to its
-scripts/gpu-arbiter-cli.js) -- this repo is independently runnable/testable, but not yet
-decoupled. Phase 2/3 of the plan replaces this with a small internal API agent-manager
-exposes instead, so this repo no longer needs read/write access to the core repo's
-runtime state at all.
+Phase 3 (2026-09-15): the local-provider preempt/priority-marker/reservation logic and
+roots resolution that used to be vendored here (chat_preempt.py, single_flight_lock.py --
+see git history) or read agent-manager's own plugins.json/projects.json directly now go
+through internal_api_client.py instead, calling the core dashboard's
+/api/internal/chat/* routes over HTTP. This repo no longer reads/writes
+instances//queue/ or holds any GPU lock of its own. claude_client.py and
+model_stats_client.py still point directly at the core repo's own src/ files (NOT part
+of the internal API -- see those modules' own headers for why).
 
-AGENT_MANAGER_CORE_REPO_ROOT points at that core checkout (defaults to the sibling
-directory this repo's own dev machine already uses tonight).
+AGENT_MANAGER_CORE_REPO_ROOT points at the core checkout (still needed by
+claude_client.py/model_stats_client.py); AGENT_MANAGER_CORE_DASHBOARD_URL (default
+http://localhost:7420, see internal_api_client.py) is where the internal API itself is
+reached.
 """
 import json
 import os
@@ -25,19 +28,13 @@ from pathlib import Path
 
 from flask import Flask, abort, jsonify
 
-# --- Core-repo location + small shared utilities (verbatim ports of app.py's own copies,
-# see that file's history for chat_preempt.py's own 2026-09-15 sibling extraction) -------
+# --- Core-repo location + small shared utilities ----------------------------------------
 
 CORE_REPO_ROOT = Path(os.environ.get(
     "AGENT_MANAGER_CORE_REPO_ROOT", "/media/model-cache/github/agent-manager",
 )).resolve()
-# Name matches what chat_preempt.py's lazy `from app import PACKAGE_ROOT` expects --
-# it means "the agent-manager core repo root" there, same meaning this repo gives it.
-PACKAGE_ROOT = CORE_REPO_ROOT
-ENV_FILE_PATH = PACKAGE_ROOT / "agent-manager.env"
-PLUGINS_MANIFEST_PATH = PACKAGE_ROOT / "plugins.json"
-PROJECT_REGISTRY_PATH = PACKAGE_ROOT / "projects.json"
-DASHBOARD_SETTINGS_PATH = PACKAGE_ROOT / "dashboard-settings.json"
+ENV_FILE_PATH = CORE_REPO_ROOT / "agent-manager.env"
+DASHBOARD_SETTINGS_PATH = CORE_REPO_ROOT / "dashboard-settings.json"
 
 # This repo's own state dir (session storage) -- see chat_sessions.py's CHAT_STORAGE_DIR
 # usage below. Kept separate from the core repo entirely (2026-09-15 migration, see the
@@ -123,26 +120,6 @@ def instances_dir():
     return (d / "instances") if d else None
 
 
-def _read_plugins_manifest() -> list:
-    if not PLUGINS_MANIFEST_PATH.is_file():
-        return []
-    try:
-        parsed = json.loads(PLUGINS_MANIFEST_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return []
-    return parsed if isinstance(parsed, list) else []
-
-
-def read_project_registry() -> list:
-    if not PROJECT_REGISTRY_PATH.is_file():
-        return []
-    try:
-        data = json.loads(PROJECT_REGISTRY_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
 def read_dashboard_settings() -> dict:
     if not DASHBOARD_SETTINGS_PATH.is_file():
         return {}
@@ -164,28 +141,23 @@ def claude_defaults() -> dict:
 # --- Chat-specific glue (verbatim ports of app.py's own copies) -------------------------
 
 def _chat_roots() -> list:
-    """Ordered, deduped, existing-on-disk list of every repo Chat can touch. roots[0] is
-    always the agent-manager core repo; the rest are each enabled plugin's repo and each
-    projects.json repoRoot."""
-    raw = [str(PACKAGE_ROOT)]
-    for e in _read_plugins_manifest():
-        rp = e.get("registerPath")
-        if rp and e.get("enabled") is not False:
-            raw.append(os.path.dirname(rp))
-    for e in read_project_registry():
-        if e.get("repoRoot"):
-            raw.append(e["repoRoot"])
-    seen, out = set(), []
-    for p in raw:
-        try:
-            real = os.path.realpath(p)
-        except OSError:
-            continue
-        if real in seen or not os.path.isdir(real):
-            continue
-        seen.add(real)
-        out.append(real)
-    return out or [os.path.realpath(str(PACKAGE_ROOT))]
+    """Ordered, deduped, existing-on-disk list of every repo Chat can touch.
+
+    2026-09-15 (Phase 3 of the Chat-plugin extraction): now a thin wrapper around
+    internal_api_client.get_roots() -- the core dashboard resolves this itself (it owns
+    plugins.json/projects.json), so this repo no longer needs to read those files
+    directly. Falls back to just this repo's own CORE_REPO_ROOT if the internal API call
+    fails (core dashboard not running, bad token, etc.) -- same fail-open shape the
+    in-tree version's own bare-PACKAGE_ROOT fallback had, so a Chat turn still has
+    SOMETHING to root itself at rather than erroring outright."""
+    from internal_api_client import InternalApiError, get_roots
+    try:
+        roots = get_roots()
+        if roots:
+            return roots
+    except InternalApiError:
+        pass
+    return [os.path.realpath(str(CORE_REPO_ROOT))]
 
 
 def _discuss_provider_args(body: dict = None):
@@ -222,25 +194,6 @@ def _call_chat(fn, *args, **kwargs):
         abort(502, description=str(e))
     except (TimeoutError, ConnectionError, OSError) as e:
         abort(502, description=f"local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly.")
-
-
-# --- Chat reservation registry (process-local, verbatim port) ---------------------------
-
-import threading
-
-_chat_reservations = {}
-_chat_reservations_lock = threading.Lock()
-
-# chat_preempt.py's own functions, re-exported into this module's namespace so
-# routes/chat.py's `from app import _chat_preempt_enabled, _preempt_pipeline_for_chat`
-# (same lazy-import convention the in-tree feature used) resolves here. chat_preempt.py's
-# own lazy `from app import PACKAGE_ROOT, ENV_FILE_PATH, read_env_file, instances_dir,
-# queue_dir, read_json_safe, parse_hb_timestamp` closes the loop -- every name it expects
-# is defined above.
-from chat_preempt import (  # noqa: E402
-    _chat_preempt_enabled, _is_preemptable_child_pass, _preempt_decision,
-    _preempt_lane_sets, _preempt_pipeline_for_chat,
-)
 
 
 # --- App + routes ------------------------------------------------------------------------
