@@ -1,0 +1,243 @@
+"""Tests for app.py's own small glue functions (verbatim ports of agent-manager's
+app.py -- see that file's own copies for the original rationale/history). Covers the
+pure/file-reading utilities chat_preempt.py, chat_sessions.py, and routes/chat.py all
+rely on via `from app import ...` at call time.
+
+Run: .venv/bin/python -m unittest test_app_glue -v
+"""
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+import app  # noqa: E402
+
+
+class TestReadEnvFile(unittest.TestCase):
+    def _write(self, text):
+        d = Path(tempfile.mkdtemp())
+        p = d / "test.env"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_parses_key_value_pairs(self):
+        p = self._write("A=1\nB=hello world\n")
+        self.assertEqual(app.read_env_file(p), {"A": "1", "B": "hello world"})
+
+    def test_skips_comments_and_blank_lines(self):
+        p = self._write("# comment\n\nA=1\n  # indented comment\nB=2\n")
+        self.assertEqual(app.read_env_file(p), {"A": "1", "B": "2"})
+
+    def test_missing_file_returns_empty_dict(self):
+        self.assertEqual(app.read_env_file(Path("/does/not/exist.env")), {})
+
+    def test_line_with_no_equals_is_skipped(self):
+        p = self._write("A=1\nnotakeyvalue\nB=2\n")
+        self.assertEqual(app.read_env_file(p), {"A": "1", "B": "2"})
+
+
+class TestReadJsonSafe(unittest.TestCase):
+    def _write(self, text):
+        d = Path(tempfile.mkdtemp())
+        p = d / "test.json"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_valid_json_parses(self):
+        p = self._write('{"a": 1}')
+        self.assertEqual(app.read_json_safe(p), {"a": 1})
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(app.read_json_safe(Path("/does/not/exist.json")))
+
+    def test_malformed_json_returns_none(self):
+        p = self._write("{not valid")
+        self.assertIsNone(app.read_json_safe(p))
+
+
+class TestParseHbTimestamp(unittest.TestCase):
+    def test_none_or_empty_returns_none(self):
+        self.assertIsNone(app.parse_hb_timestamp(None))
+        self.assertIsNone(app.parse_hb_timestamp(""))
+
+    def test_standard_iso_with_z(self):
+        dt = app.parse_hb_timestamp("2026-09-15T10:00:00Z")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2026)
+
+    def test_powershell_7_digit_fractional_seconds_truncated(self):
+        # PowerShell's Get-Date -Format 'o' emits 7-digit fractional seconds (100ns
+        # ticks) -- Python's fromisoformat only accepts 3 or 6 before 3.11.
+        dt = app.parse_hb_timestamp("2026-09-15T10:00:33.6859854-06:00")
+        self.assertIsNotNone(dt)
+
+    def test_garbage_returns_none(self):
+        self.assertIsNone(app.parse_hb_timestamp("not a timestamp"))
+
+    def test_naive_datetime_gets_utc_tzinfo(self):
+        dt = app.parse_hb_timestamp("2026-09-15T10:00:00")
+        self.assertIsNotNone(dt.tzinfo)
+
+
+class TestActiveProjectSetting(unittest.TestCase):
+    def setUp(self):
+        self._saved_env = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._saved_env)
+
+    def test_env_file_wins_over_os_environ(self):
+        d = Path(tempfile.mkdtemp())
+        env_path = d / "agent-manager.env"
+        env_path.write_text("AGENT_MANAGER_REPO_ROOT=/from/file\n", encoding="utf-8")
+        os.environ["AGENT_MANAGER_REPO_ROOT"] = "/from/os-environ"
+        with mock.patch.object(app, "ENV_FILE_PATH", env_path):
+            self.assertEqual(app.get_active_repo_root(), "/from/file")
+
+    def test_falls_back_to_os_environ_when_file_unset(self):
+        d = Path(tempfile.mkdtemp())
+        env_path = d / "agent-manager.env"  # does not exist
+        os.environ["AGENT_MANAGER_REPO_ROOT"] = "/from/os-environ"
+        with mock.patch.object(app, "ENV_FILE_PATH", env_path):
+            self.assertEqual(app.get_active_repo_root(), "/from/os-environ")
+
+    def test_pipeline_dir_falls_back_to_repo_root(self):
+        d = Path(tempfile.mkdtemp())
+        env_path = d / "agent-manager.env"
+        env_path.write_text("AGENT_MANAGER_REPO_ROOT=/x/y\n", encoding="utf-8")
+        with mock.patch.object(app, "ENV_FILE_PATH", env_path):
+            self.assertEqual(app.get_pipeline_dir(), Path("/x/y"))
+
+    def test_queue_dir_and_instances_dir_derive_from_pipeline_dir(self):
+        d = Path(tempfile.mkdtemp())
+        env_path = d / "agent-manager.env"
+        env_path.write_text("AGENT_MANAGER_PIPELINE_DIR=/pipeline\n", encoding="utf-8")
+        with mock.patch.object(app, "ENV_FILE_PATH", env_path):
+            self.assertEqual(app.queue_dir(), Path("/pipeline/queue"))
+            self.assertEqual(app.instances_dir(), Path("/pipeline/instances"))
+
+    def test_queue_dir_is_none_with_no_project_configured(self):
+        d = Path(tempfile.mkdtemp())
+        env_path = d / "agent-manager.env"  # does not exist, os.environ also empty
+        os.environ.pop("AGENT_MANAGER_REPO_ROOT", None)
+        os.environ.pop("AGENT_MANAGER_PIPELINE_DIR", None)
+        with mock.patch.object(app, "ENV_FILE_PATH", env_path):
+            self.assertIsNone(app.queue_dir())
+            self.assertIsNone(app.instances_dir())
+
+
+class TestManifestReaders(unittest.TestCase):
+    def test_read_plugins_manifest_missing_file_returns_empty_list(self):
+        with mock.patch.object(app, "PLUGINS_MANIFEST_PATH", Path("/does/not/exist.json")):
+            self.assertEqual(app._read_plugins_manifest(), [])
+
+    def test_read_plugins_manifest_parses_real_file(self):
+        d = Path(tempfile.mkdtemp())
+        p = d / "plugins.json"
+        p.write_text(json.dumps([{"name": "x", "enabled": True}]), encoding="utf-8")
+        with mock.patch.object(app, "PLUGINS_MANIFEST_PATH", p):
+            self.assertEqual(app._read_plugins_manifest(), [{"name": "x", "enabled": True}])
+
+    def test_read_plugins_manifest_malformed_json_returns_empty_list(self):
+        d = Path(tempfile.mkdtemp())
+        p = d / "plugins.json"
+        p.write_text("{not valid", encoding="utf-8")
+        with mock.patch.object(app, "PLUGINS_MANIFEST_PATH", p):
+            self.assertEqual(app._read_plugins_manifest(), [])
+
+    def test_read_project_registry_missing_file_returns_empty_list(self):
+        with mock.patch.object(app, "PROJECT_REGISTRY_PATH", Path("/does/not/exist.json")):
+            self.assertEqual(app.read_project_registry(), [])
+
+    def test_read_project_registry_parses_real_file(self):
+        d = Path(tempfile.mkdtemp())
+        p = d / "projects.json"
+        p.write_text(json.dumps([{"repoRoot": "/x"}]), encoding="utf-8")
+        with mock.patch.object(app, "PROJECT_REGISTRY_PATH", p):
+            self.assertEqual(app.read_project_registry(), [{"repoRoot": "/x"}])
+
+
+class TestClaudeDefaults(unittest.TestCase):
+    def test_defaults_when_no_settings_file(self):
+        with mock.patch.object(app, "DASHBOARD_SETTINGS_PATH", Path("/does/not/exist.json")):
+            self.assertEqual(app.claude_defaults(), {"model": "sonnet", "effort": "high"})
+
+    def test_reads_saved_settings(self):
+        d = Path(tempfile.mkdtemp())
+        p = d / "dashboard-settings.json"
+        p.write_text(json.dumps({"claudeDefaultModel": "opus", "claudeDefaultEffort": "max"}), encoding="utf-8")
+        with mock.patch.object(app, "DASHBOARD_SETTINGS_PATH", p):
+            self.assertEqual(app.claude_defaults(), {"model": "opus", "effort": "max"})
+
+
+class TestChatRoots(unittest.TestCase):
+    def test_dedupes_and_always_includes_package_root(self):
+        d = Path(tempfile.mkdtemp())
+        core = d / "core"
+        core.mkdir()
+        plugin_dir = d / "plugin"
+        plugin_dir.mkdir()
+        with mock.patch.object(app, "PACKAGE_ROOT", core), \
+             mock.patch.object(app, "_read_plugins_manifest", return_value=[
+                 {"registerPath": str(plugin_dir / "register.js"), "enabled": True},
+             ]), \
+             mock.patch.object(app, "read_project_registry", return_value=[
+                 {"repoRoot": str(plugin_dir)},  # same dir as the plugin -- must dedupe
+             ]):
+            roots = app._chat_roots()
+            self.assertEqual(roots[0], os.path.realpath(str(core)))
+            self.assertEqual(len(roots), 2, "the plugin dir and the identical project repoRoot must dedupe to one entry")
+
+    def test_falls_back_to_package_root_alone_with_nothing_registered(self):
+        d = Path(tempfile.mkdtemp())
+        core = d / "core"
+        core.mkdir()
+        with mock.patch.object(app, "PACKAGE_ROOT", core), \
+             mock.patch.object(app, "_read_plugins_manifest", return_value=[]), \
+             mock.patch.object(app, "read_project_registry", return_value=[]):
+            self.assertEqual(app._chat_roots(), [os.path.realpath(str(core))])
+
+    def test_disabled_plugin_is_excluded(self):
+        d = Path(tempfile.mkdtemp())
+        core = d / "core"
+        core.mkdir()
+        disabled_dir = d / "disabled-plugin"
+        disabled_dir.mkdir()
+        with mock.patch.object(app, "PACKAGE_ROOT", core), \
+             mock.patch.object(app, "_read_plugins_manifest", return_value=[
+                 {"registerPath": str(disabled_dir / "register.js"), "enabled": False},
+             ]), \
+             mock.patch.object(app, "read_project_registry", return_value=[]):
+            self.assertEqual(app._chat_roots(), [os.path.realpath(str(core))])
+
+
+class TestDiscussProviderArgs(unittest.TestCase):
+    def test_defaults_to_local_with_no_model_effort(self):
+        provider, model, effort = app._discuss_provider_args({})
+        self.assertEqual(provider, "local")
+        self.assertIsNone(model)
+        self.assertIsNone(effort)
+
+    def test_invalid_provider_falls_back_to_local(self):
+        provider, _, _ = app._discuss_provider_args({"provider": "bogus"})
+        self.assertEqual(provider, "local")
+
+    def test_claude_provider_fills_in_saved_defaults_when_unset(self):
+        with mock.patch.object(app, "claude_defaults", return_value={"model": "opus", "effort": "max"}):
+            provider, model, effort = app._discuss_provider_args({"provider": "claude"})
+            self.assertEqual((provider, model, effort), ("claude", "opus", "max"))
+
+    def test_claude_provider_explicit_override_wins_over_saved_defaults(self):
+        with mock.patch.object(app, "claude_defaults", return_value={"model": "opus", "effort": "max"}):
+            provider, model, effort = app._discuss_provider_args({"provider": "claude", "model": "sonnet", "effort": "low"})
+            self.assertEqual((provider, model, effort), ("claude", "sonnet", "low"))
+
+
+if __name__ == "__main__":
+    unittest.main()

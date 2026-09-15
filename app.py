@@ -237,7 +237,10 @@ _chat_reservations_lock = threading.Lock()
 # own lazy `from app import PACKAGE_ROOT, ENV_FILE_PATH, read_env_file, instances_dir,
 # queue_dir, read_json_safe, parse_hb_timestamp` closes the loop -- every name it expects
 # is defined above.
-from chat_preempt import _chat_preempt_enabled, _preempt_pipeline_for_chat  # noqa: E402
+from chat_preempt import (  # noqa: E402
+    _chat_preempt_enabled, _is_preemptable_child_pass, _preempt_decision,
+    _preempt_lane_sets, _preempt_pipeline_for_chat,
+)
 
 
 # --- App + routes ------------------------------------------------------------------------
