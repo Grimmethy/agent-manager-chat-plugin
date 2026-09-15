@@ -120,6 +120,16 @@ def instances_dir():
     return (d / "instances") if d else None
 
 
+def get_second_brain_dir():
+    """2026-09-15 (per-session context log, see chat_sessions.py's _build_local_messages
+    and internal_chat_context_log.py): same precedence as get_active_repo_root/
+    get_pipeline_dir above -- agent-manager.env FILE wins over os.environ. Returns None
+    (not a raised error) when unconfigured, same fail-open contract every other optional
+    setting in this module already holds itself to."""
+    v = _active_project_setting("SECOND_BRAIN_DIR")
+    return Path(v) if v else None
+
+
 def read_dashboard_settings() -> dict:
     if not DASHBOARD_SETTINGS_PATH.is_file():
         return {}

@@ -35,6 +35,20 @@ body {
 
 .chat-reserve-btn.active, #chat-reserve-btn.active { background: var(--warn); color: #1a1300; border-color: var(--warn); }
 
+#chat-context-log-panel {
+  border-bottom: 2px solid var(--border); background: var(--panel);
+  max-height: 40vh; display: flex; flex-direction: column;
+}
+.chat-context-log-header {
+  padding: 8px 16px; display: flex; align-items: center; justify-content: space-between;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+#chat-context-log-content {
+  padding: 10px 16px; overflow-y: auto; white-space: pre-wrap; font-size: 12px;
+  line-height: 1.5; color: var(--text);
+}
+
 .field-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-top: 14px; }
 
 .chat-transcript { max-height: none; height: 100%; overflow-y: auto; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }

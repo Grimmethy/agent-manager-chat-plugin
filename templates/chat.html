@@ -30,7 +30,19 @@
     <h2 id="chat-title" title="Rooted at the agent-manager repo, with read/write access to every registered plugin and project repo.">System Chat</h2>
     <span id="chat-provider-container"></span>
     <button type="button" class="secondary" id="chat-reserve-btn" style="display:none" title="Hold the local model exclusively for this conversation until you turn it back off">Reserve</button>
+    <button type="button" class="secondary" id="chat-context-log-btn" title="View this session's context log -- a compacted, durable record built from CONTEXT-LOG: blocks at the end of each response, cross-referenced to any task discussed">Log</button>
     <button type="button" class="secondary" id="chat-new-btn" title="Start a fresh conversation">New</button>
+  </div>
+  <!-- Collapsed by default; toggled by #chat-context-log-btn. See chat.js's own comment
+       on why this panel's one fetch call is an ABSOLUTE path, unlike every other
+       fetch()/href/src in this file -- it deliberately targets the core dashboard's own
+       route, not this plugin's proxied ones. -->
+  <div id="chat-context-log-panel" hidden>
+    <div class="chat-context-log-header">
+      <span>Context Log</span>
+      <button type="button" class="secondary" id="chat-context-log-close">Close</button>
+    </div>
+    <div id="chat-context-log-content"></div>
   </div>
   <div class="chat-body">
     <div id="chat-transcript"></div>

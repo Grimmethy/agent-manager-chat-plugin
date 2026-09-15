@@ -309,7 +309,15 @@ _LOCAL_SYSTEM_PROMPT = (
     "without ever checking the dashboard's own /api/git/unmerged-branches API, which "
     "already knew that branch would conflict. Read-only git commands "
     "(log/diff/show/status/branch/fetch) are completely unaffected -- keep using them to "
-    "investigate."
+    "investigate.\n\n"
+    "Also: end EVERY response with exactly one block -- CONTEXT-LOG: <one tight "
+    "paragraph distilling what this exchange covered or decided>, then optionally "
+    "TASK-REF: <task id> on its own line ONLY when this exchange concerned a specific "
+    "task (omit that line otherwise). This is mandatory, not optional, but keep it "
+    "tight -- never pad it. It becomes a durable, cross-referenced record of this "
+    "conversation that survives even after older turns are trimmed from what you can "
+    "see, so a wrong or invented TASK-REF actively misleads a later reader -- only name "
+    "a task you actually discussed."
 )
 
 
@@ -321,6 +329,49 @@ def _local_system_prompt(session: dict) -> str:
     return prompt
 
 
+# Bounded message-window trimming (2026-09-15, see context-log-marker.js/
+# context-log-sweep.js in the core repo, and the plan's Phase 4): only kicks in once a
+# session's transcript exceeds this many entries (one entry per user OR assistant turn,
+# so this is ~10 exchanges) -- a short conversation is completely unaffected, matching
+# the existing reactive context-budget check's own "don't change behavior until actually
+# needed" spirit. Older entries are replaced by one capped block pulled from this
+# session's own Second Brain context-log note (the durable backstop
+# context-log-sweep.js has already been building turn by turn) rather than silently
+# dropped -- this is the piece that makes trimming safe: what the live window loses is
+# never truly gone, just no longer replayed verbatim.
+CHAT_RECENT_TURNS_KEPT = 20
+
+# Same bounded-tail-keep shape as `clu`'s own compact_old_logs() (see the plan's Context
+# section) -- keeps the MOST RECENT portion of the note, not the oldest, since that's
+# what's most relevant to a conversation resuming right now.
+CONTEXT_LOG_NOTE_CHAR_CAP = 3000
+
+
+def _context_log_note_path(session: dict):
+    from app import get_second_brain_dir
+    second_brain_dir = get_second_brain_dir()
+    if not second_brain_dir:
+        return None
+    safe_id = "".join(c for c in session["id"] if c.isalnum() or c == "-")
+    return second_brain_dir / "Agent Manager Reports" / "Chat Context Logs" / f"{safe_id}.md"
+
+
+def _read_capped_context_log(session: dict) -> str:
+    """Best-effort: a missing note (nothing swept yet, or SECOND_BRAIN_DIR unconfigured)
+    is a normal, expected state, not an error -- returns "" so the caller can skip
+    injecting anything rather than fail the turn over an optional backstop."""
+    path = _context_log_note_path(session)
+    if not path or not path.is_file():
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    if len(content) > CONTEXT_LOG_NOTE_CHAR_CAP:
+        content = "...(truncated)...\n" + content[-CONTEXT_LOG_NOTE_CHAR_CAP:]
+    return content
+
+
 def _build_local_messages(session: dict, message: str) -> list:
     """2026-08-26 (Open WebUI investigation, Grimmethy): replaces the old approach of
     flattening the whole conversation into one giant string inside a single
@@ -329,9 +380,30 @@ def _build_local_messages(session: dict, message: str) -> list:
     {role, content} objects, not narrated "You:"/"User:" text glued together. This also
     incidentally means only a session's very first-ever message is ever a length-1
     request now -- see local-tool-client.js's own comment on why that shape is the one
-    that can hit TokenFold's flaky single-message cache path."""
+    that can hit TokenFold's flaky single-message cache path.
+
+    2026-09-15: transcript replay is now bounded (see CHAT_RECENT_TURNS_KEPT above) --
+    session["transcript"] itself is NEVER trimmed (still the full, permanent record this
+    module has always kept), only what gets REPLAYED to the model each turn is capped.
+    When older entries exist beyond the bound, one extra message stands in for them,
+    built from this session's own context-log note (context-log-sweep.js) rather than
+    just dropping that history outright."""
     messages = [{"role": "system", "content": _local_system_prompt(session)}]
-    for turn in session["transcript"]:
+    transcript = session["transcript"]
+    trimmed_count = max(0, len(transcript) - CHAT_RECENT_TURNS_KEPT)
+    if trimmed_count:
+        capped_note = _read_capped_context_log(session)
+        if capped_note:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"[{trimmed_count} earlier turn(s) of this conversation were trimmed "
+                    "from what you can see directly -- here is a compacted record of "
+                    f"what they covered, from this session's own context log:]\n\n{capped_note}"
+                ),
+            })
+    recent = transcript[len(transcript) - CHAT_RECENT_TURNS_KEPT:] if trimmed_count else transcript
+    for turn in recent:
         role = "assistant" if turn["role"] == "assistant" else "user"
         messages.append({"role": role, "content": turn["text"]})
     messages.append({"role": "user", "content": message})
@@ -349,7 +421,7 @@ def _stream_local(session: dict, message: str):
     for event in local_tool_client.stream_plan_with_tools(
         messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
         primary_root=roots[0], extra_roots=roots[1:], force_summary_on_cap=True,
-        allow_amplification=True,
+        allow_amplification=True, context_log_session_id=session["id"],
     ):
         if event.get("type") == "chunk":
             yield event["text"]

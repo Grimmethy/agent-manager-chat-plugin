@@ -137,6 +137,28 @@ class StreamLocalTurnTest(unittest.TestCase):
             self.assertIn("messages", captured)
             self.assertNotIn("prompt", captured)
 
+    def test_context_log_session_id_included_when_set(self):
+        captured = {}
+
+        def fake_post(url, headers=None, json=None, **kwargs):
+            captured.update(json)
+            return self._fake_stream_response(['data: {"type": "final", "response": "ok"}'])
+
+        with mock.patch("requests.post", side_effect=fake_post):
+            list(iac.stream_local_turn(prompt="hi", context_log_session_id="chat-1-abc"))
+        self.assertEqual(captured.get("contextLogSessionId"), "chat-1-abc")
+
+    def test_context_log_session_id_omitted_when_not_set(self):
+        captured = {}
+
+        def fake_post(url, headers=None, json=None, **kwargs):
+            captured.update(json)
+            return self._fake_stream_response(['data: {"type": "final", "response": "ok"}'])
+
+        with mock.patch("requests.post", side_effect=fake_post):
+            list(iac.stream_local_turn(prompt="hi"))
+        self.assertNotIn("contextLogSessionId", captured)
+
 
 if __name__ == "__main__":
     unittest.main()

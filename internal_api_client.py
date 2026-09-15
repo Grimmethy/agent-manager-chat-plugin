@@ -80,7 +80,7 @@ def reserve(reservation_id: str, model: str, on: bool) -> dict:
 def stream_local_turn(*, messages: list = None, prompt: str = None, max_turns: int = 5,
                        source: str = None, allow_write: bool = False, primary_root: str = None,
                        extra_roots: list = None, force_summary_on_cap: bool = False,
-                       allow_amplification: bool = False):
+                       allow_amplification: bool = False, context_log_session_id: str = None):
     """Generator sibling of local_tool_client.py's own stream_plan_with_tools -- SAME
     result shape ({"type": "chunk"|"final"|"error", ...}), just sourced from the core
     dashboard's SSE stream instead of a local Node subprocess. Read timeout matches
@@ -103,6 +103,8 @@ def stream_local_turn(*, messages: list = None, prompt: str = None, max_turns: i
         body["forceSummaryOnCap"] = True
     if allow_amplification:
         body["allowAmplification"] = True
+    if context_log_session_id:
+        body["contextLogSessionId"] = context_log_session_id
 
     try:
         with requests.post(

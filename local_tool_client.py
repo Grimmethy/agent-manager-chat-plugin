@@ -21,7 +21,8 @@ from internal_api_client import stream_local_turn
 def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns: int = 5,
                             source: str = None, allow_write: bool = False,
                             primary_root: str = None, extra_roots: list = None,
-                            force_summary_on_cap: bool = False, allow_amplification: bool = False):
+                            force_summary_on_cap: bool = False, allow_amplification: bool = False,
+                            context_log_session_id: str = None):
     """Same generator contract the in-tree/Phase-1 version had: yields {"type": "chunk",
     ...} as text arrives, then exactly one {"type": "final", ...}. Delegates entirely to
     internal_api_client.stream_local_turn() -- see that function's own header."""
@@ -29,4 +30,5 @@ def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns:
         messages=messages, prompt=prompt, max_turns=max_turns, source=source,
         allow_write=allow_write, primary_root=primary_root, extra_roots=extra_roots,
         force_summary_on_cap=force_summary_on_cap, allow_amplification=allow_amplification,
+        context_log_session_id=context_log_session_id,
     )

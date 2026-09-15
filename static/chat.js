@@ -96,6 +96,50 @@ function wireProviderToggle() {
   };
 }
 
+// Context Log panel (2026-09-15, see /home/wok/.claude/plans/immutable-noodling-axolotl.md's
+// Phase 5): shows this session's own compacted, durable record -- a plain markdown file
+// context-log-sweep.js (core repo) appends to as the conversation goes, under
+// "Agent Manager Reports/Chat Context Logs/<sessionId>.md" in the Second Brain vault.
+//
+// The fetch below is deliberately an ABSOLUTE path (`/api/second-brain/file?...`), unlike
+// every other fetch()/href/src in this file -- this page is reached through the host
+// dashboard's generic proxy (see this file's own header and chat.html's comment), so a
+// RELATIVE path would resolve against THIS PLUGIN's own routes (forwarded to port 7442,
+// which has no /api/second-brain/* route at all). /api/second-brain/file lives on the
+// CORE dashboard itself (python/dashboard/routes/second_brain.py) -- an absolute path
+// resolves against the proxy's own origin (the host dashboard, same origin the iframe is
+// served through), reaching that real route directly, bypassing the plugin-proxy prefix
+// entirely. This is the one deliberate exception to "always relative" in this file.
+function chatContextLogNotePath() {
+  return `Agent Manager Reports/Chat Context Logs/${chatSession.id}.md`;
+}
+
+async function chatShowContextLog() {
+  const panel = document.getElementById('chat-context-log-panel');
+  const content = document.getElementById('chat-context-log-content');
+  if (!panel || !content || !chatSession) return;
+  panel.hidden = false;
+  content.textContent = 'Loading...';
+  try {
+    const url = `/api/second-brain/file?path=${encodeURIComponent(chatContextLogNotePath())}`;
+    const body = await fetchJson(url);
+    content.textContent = body.content || '(empty)';
+  } catch (e) {
+    // A 404 here just means nothing has been swept into this session's note yet -- a
+    // normal, expected state for a short or brand-new conversation, not an error worth
+    // alarming over.
+    content.textContent = 'No context log entries yet for this session.';
+  }
+}
+
+function chatWireContextLogPanel() {
+  const btn = document.getElementById('chat-context-log-btn');
+  const closeBtn = document.getElementById('chat-context-log-close');
+  const panel = document.getElementById('chat-context-log-panel');
+  if (btn) btn.onclick = chatShowContextLog;
+  if (closeBtn && panel) closeBtn.onclick = () => { panel.hidden = true; };
+}
+
 async function chatPanelInit() {
   const newBtn = document.getElementById('chat-new-btn');
   if (newBtn) newBtn.onclick = chatStartNew;
@@ -107,6 +151,7 @@ async function chatPanelInit() {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSend(); }
     };
   }
+  chatWireContextLogPanel();
   try {
     chatSession = await fetchJson('api/chat/active');
   } catch (e) {

@@ -112,6 +112,21 @@ class TestActiveProjectSetting(unittest.TestCase):
         with mock.patch.object(app, "ENV_FILE_PATH", env_path):
             self.assertEqual(app.get_pipeline_dir(), Path("/x/y"))
 
+    def test_get_second_brain_dir_env_file_wins(self):
+        d = Path(tempfile.mkdtemp())
+        env_path = d / "agent-manager.env"
+        env_path.write_text("SECOND_BRAIN_DIR=/from/file/sb\n", encoding="utf-8")
+        os.environ["SECOND_BRAIN_DIR"] = "/from/os-environ/sb"
+        with mock.patch.object(app, "ENV_FILE_PATH", env_path):
+            self.assertEqual(app.get_second_brain_dir(), Path("/from/file/sb"))
+
+    def test_get_second_brain_dir_returns_none_when_unconfigured(self):
+        d = Path(tempfile.mkdtemp())
+        env_path = d / "agent-manager.env"  # does not exist
+        os.environ.pop("SECOND_BRAIN_DIR", None)
+        with mock.patch.object(app, "ENV_FILE_PATH", env_path):
+            self.assertIsNone(app.get_second_brain_dir())
+
     def test_queue_dir_and_instances_dir_derive_from_pipeline_dir(self):
         d = Path(tempfile.mkdtemp())
         env_path = d / "agent-manager.env"

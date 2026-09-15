@@ -8,6 +8,7 @@ model-stats.db: 2 of 3 real Chat calls in one session showed that exact false me
 Run: .venv/bin/python -m unittest test_chat_sessions -v
 """
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -85,6 +86,108 @@ class StreamLocalFooterTest(unittest.TestCase):
             {"type": "final", "response": "answer", "turnsUsed": 2, "forcedSummary": False},
         ])
         self.assertEqual(out, "answer")
+
+
+class StreamLocalContextLogSessionIdTest(unittest.TestCase):
+    """Confirms _stream_local threads session['id'] through to
+    stream_plan_with_tools(context_log_session_id=...) -- the one wiring hop this
+    module itself owns (the rest is internal_api_client.py/local_tool_client.py)."""
+
+    def setUp(self):
+        self._stats_patch = mock.patch.object(chat_sessions.model_stats_client, "record_call")
+        self._stats_patch.start()
+        self.addCleanup(self._stats_patch.stop)
+
+    def test_session_id_passed_through(self):
+        session = _session()
+        captured = {}
+
+        def fake_stream(**kwargs):
+            captured.update(kwargs)
+            yield {"type": "final", "response": "ok", "turnsUsed": 1, "forcedSummary": False}
+
+        with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools", fake_stream):
+            "".join(chat_sessions._stream_local(session, "hi"))
+        self.assertEqual(captured.get("context_log_session_id"), "chat-test-session")
+
+
+class BuildLocalMessagesTrimmingTest(unittest.TestCase):
+    def _session_with_transcript(self, n_turns):
+        session = _session()
+        session["transcript"] = [
+            {"role": "assistant" if i % 2 else "user", "text": f"turn {i}"}
+            for i in range(n_turns)
+        ]
+        return session
+
+    def test_short_transcript_is_replayed_in_full_unaffected(self):
+        session = self._session_with_transcript(6)
+        messages = chat_sessions._build_local_messages(session, "new message")
+        # system + 6 transcript turns + the new message, no trimming block
+        self.assertEqual(len(messages), 1 + 6 + 1)
+        self.assertNotIn("earlier turn(s)", messages[1]["content"])
+
+    def test_long_transcript_trims_to_the_bound_with_no_note_available(self):
+        n = chat_sessions.CHAT_RECENT_TURNS_KEPT + 10
+        session = self._session_with_transcript(n)
+        with mock.patch.object(chat_sessions, "_read_capped_context_log", return_value=""):
+            messages = chat_sessions._build_local_messages(session, "new message")
+        # no note available -> no stand-in block gets inserted, just the bounded replay
+        self.assertEqual(len(messages), 1 + chat_sessions.CHAT_RECENT_TURNS_KEPT + 1)
+        self.assertEqual(messages[1]["content"], "turn 10")  # first of the KEPT window
+
+    def test_long_transcript_trims_and_injects_the_capped_note_as_a_stand_in(self):
+        n = chat_sessions.CHAT_RECENT_TURNS_KEPT + 10
+        session = self._session_with_transcript(n)
+        with mock.patch.object(chat_sessions, "_read_capped_context_log", return_value="compacted prior context here"):
+            messages = chat_sessions._build_local_messages(session, "new message")
+        self.assertEqual(len(messages), 1 + 1 + chat_sessions.CHAT_RECENT_TURNS_KEPT + 1)
+        self.assertIn("10 earlier turn(s)", messages[1]["content"])
+        self.assertIn("compacted prior context here", messages[1]["content"])
+
+    def test_real_transcript_array_is_never_mutated_by_trimming(self):
+        n = chat_sessions.CHAT_RECENT_TURNS_KEPT + 10
+        session = self._session_with_transcript(n)
+        with mock.patch.object(chat_sessions, "_read_capped_context_log", return_value=""):
+            chat_sessions._build_local_messages(session, "new message")
+        self.assertEqual(len(session["transcript"]), n)
+
+
+class ContextLogNoteReadingTest(unittest.TestCase):
+    def test_missing_second_brain_dir_returns_empty_string(self):
+        session = _session()
+        with mock.patch.object(app, "get_second_brain_dir", return_value=None):
+            self.assertEqual(chat_sessions._read_capped_context_log(session), "")
+
+    def test_missing_note_file_returns_empty_string(self):
+        session = _session()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(app, "get_second_brain_dir", return_value=Path(tmp)):
+                self.assertEqual(chat_sessions._read_capped_context_log(session), "")
+
+    def test_real_note_under_the_cap_is_returned_verbatim(self):
+        session = _session()
+        with tempfile.TemporaryDirectory() as tmp:
+            note_dir = Path(tmp) / "Agent Manager Reports" / "Chat Context Logs"
+            note_dir.mkdir(parents=True)
+            (note_dir / f"{session['id']}.md").write_text("# chat-test-session\n- entry one\n")
+            with mock.patch.object(app, "get_second_brain_dir", return_value=Path(tmp)):
+                content = chat_sessions._read_capped_context_log(session)
+        self.assertIn("entry one", content)
+        self.assertNotIn("truncated", content)
+
+    def test_real_note_over_the_cap_is_tail_kept_and_marked_truncated(self):
+        session = _session()
+        with tempfile.TemporaryDirectory() as tmp:
+            note_dir = Path(tmp) / "Agent Manager Reports" / "Chat Context Logs"
+            note_dir.mkdir(parents=True)
+            big = "x" * (chat_sessions.CONTEXT_LOG_NOTE_CHAR_CAP + 500) + "THE_TAIL_END"
+            (note_dir / f"{session['id']}.md").write_text(big)
+            with mock.patch.object(app, "get_second_brain_dir", return_value=Path(tmp)):
+                content = chat_sessions._read_capped_context_log(session)
+        self.assertIn("truncated", content)
+        self.assertIn("THE_TAIL_END", content)
+        self.assertLess(len(content), len(big))
 
 
 if __name__ == "__main__":
