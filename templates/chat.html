@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>System Chat</title>
+<!-- RELATIVE hrefs/src throughout this file, deliberately -- this page is reached via
+     the host dashboard's generic proxy (/api/plugins/<name>/proxy/<subpath>), so the
+     iframe's own document URL IS that proxy path, not this plugin's real port. An
+     absolute "/static/chat.css" would resolve against the HOST's own origin instead
+     (wrong file, likely 404) -- "static/chat.css" resolves relative to the current
+     proxy path instead, which the proxy then forwards correctly. Same reasoning applies
+     to every fetch() call in chat.js. -->
+<link rel="stylesheet" href="static/chat.css">
+</head>
+<body>
+<!-- This page is served inside the host dashboard's persistent-sidebar iframe (see
+     agent-manager's static/js/core-ui.js, the slotKind:"persistent-sidebar" mounting).
+     It is a full, standalone document -- no shared JS/CSS context with the host, by
+     design (same-origin-policy-isolated anyway once served from this plugin's own
+     port/proxy path). See app.py's own header and
+     /home/wok/.claude/plans/immutable-noodling-axolotl.md's "Shared frontend
+     rendering" section for why this repo has its own independent transcript renderer
+     (chatRenderTranscript in chat.js) instead of reusing agent-manager's
+     grillRenderTranscript -- an iframe can't call a function in a different document
+     anyway, and the two features drifting independently is fine (each is free to
+     evolve without breaking the other), where the in-tree version's shared function had
+     a documented class-collision bug from exactly this kind of coupling. -->
+<div id="chat-panel">
+  <div class="chat-header">
+    <h2 id="chat-title" title="Rooted at the agent-manager repo, with read/write access to every registered plugin and project repo.">System Chat</h2>
+    <span id="chat-provider-container"></span>
+    <button type="button" class="secondary" id="chat-reserve-btn" style="display:none" title="Hold the local model exclusively for this conversation until you turn it back off">Reserve</button>
+    <button type="button" class="secondary" id="chat-new-btn" title="Start a fresh conversation">New</button>
+  </div>
+  <div class="chat-body">
+    <div id="chat-transcript"></div>
+    <textarea class="chat-input" id="chat-input" rows="3" placeholder="Talk to the chat... (Enter to send, Shift+Enter for a new line)"></textarea>
+    <div class="chat-send-row">
+      <button type="button" class="action" id="chat-send-btn">Send</button>
+    </div>
+  </div>
+</div>
+<script src="static/chat.js"></script>
+</body>
+</html>

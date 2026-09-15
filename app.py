@@ -26,7 +26,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, abort, jsonify
+from flask import Flask, abort, jsonify, render_template
 
 # --- Core-repo location + small shared utilities ----------------------------------------
 
@@ -204,6 +204,21 @@ app = Flask(__name__)
 @app.route("/healthz")
 def healthz():
     return jsonify({"ok": True})
+
+
+@app.route("/chat")
+def chat_page():
+    """The sidebar's actual page -- served at a real, non-root, non-trailing-slash path
+    on purpose: the host dashboard's generic proxy route
+    (/api/plugins/<name>/proxy/<path:subpath>) requires a non-empty subpath (Werkzeug's
+    `path` converter never matches an empty segment), so an iframe src of
+    `/api/plugins/agent-manager-chat-plugin/proxy/` (trailing slash, empty subpath) would
+    404 against it. The host's sidebar iframe points at
+    `/api/plugins/agent-manager-chat-plugin/proxy/chat` instead -- every relative asset/
+    API reference inside chat.html/chat.js then resolves correctly back through that same
+    proxy path (see chat.html's own comment on why every href/src/fetch() there is
+    relative, never absolute)."""
+    return render_template("chat.html")
 
 
 from routes.chat import chat_bp  # noqa: E402
