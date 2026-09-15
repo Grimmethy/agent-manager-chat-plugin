@@ -13,22 +13,53 @@ agent-manager checkout that authored this repo.
 
 ## Status: Phase 1 (in progress)
 
-Building a standalone-but-still-directly-coupled version first (same worker-preemption/
-GPU-arbiter coupling as the in-tree feature, just relocated here) so it's independently
-testable before Phase 2/3 swap that coupling for a small internal API agent-manager
-exposes. The in-tree Chat feature in `agent-manager` is untouched and fully live until
+A standalone Flask app that boots and serves the real Chat routes independently of
+agent-manager's dashboard process -- but Phase 1 deliberately keeps the SAME direct
+filesystem/subprocess coupling to the core agent-manager repo the in-tree feature always
+had (reads its `agent-manager.env`/`plugins.json`/`projects.json`, `instances/`,
+`queue/`, shells out to its `scripts/gpu-arbiter-cli.js`), via `AGENT_MANAGER_CORE_REPO_ROOT`.
+Phase 2/3 of the plan replaces this with a small internal API agent-manager exposes
+instead, so this repo no longer needs read/write access to the core repo's runtime state
+at all. The in-tree Chat feature in `agent-manager` is untouched and fully live until
 cutover (Phase 4).
 
-Files currently present are a **starting-point copy** from agent-manager's
-`python/dashboard/` (`chat_sessions.py`, `claude_client.py`, `claude-client.js`) plus two
-`_original` reference copies (`chat_routes_original.py`, `local_tool_client_original.py`)
-kept only so the real adapted versions can be diffed against what they came from during
-Phase 1 build-out -- not meant to ship as-is.
+**What's vendored into this repo** (self-contained, verified): `chat_sessions.py`,
+`chat_preempt.py` (extracted from agent-manager's `app.py` in PR #270 first, then copied
+here verbatim -- see that PR for why: safety-critical SIGKILL/lock logic, extracted as a
+real, tested module rather than hand-transcribed), `single_flight_lock.py`,
+`ollama_client.py`.
 
-## Running (once Phase 1 lands a real app.py)
+**What stays pointed at the core repo, NOT vendored** (confirmed live, not just by
+reading): `src/claude-client.js` and `src/local-tool-client.js`. Both were originally
+assessed as "comparatively self-contained" in the plan's design pass -- that assessment
+was wrong for `claude-client.js`, caught by actually running it: it requires
+`src/local-client.js` (10+ further pipeline-internal modules) plus `sandbox.js`,
+`side-finding.js`, `incident-amplification.js`, `concepts.js` -- genuine pipeline
+features Chat's `allow_amplification=True` path really exercises (a Claude chat turn can
+raise real side-findings into the brain dump and record concept-build tallies), not
+incidental bloat safe to strip. `model_stats_client.py` similarly stays pointed at the
+core repo's `src/model-stats-db.js` (writes into `model-stats.db`, which lives there).
+
+## Running
 
 ```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+set -a; source /media/model-cache/github/agent-manager/agent-manager.env; set +a
+AGENT_MANAGER_CORE_REPO_ROOT=/media/model-cache/github/agent-manager \
+AGENT_MANAGER_CHAT_PLUGIN_PORT=7442 \
 .venv/bin/python app.py
+
 curl localhost:7442/healthz
+curl localhost:7442/api/chat/active
 ```
+
+Verified live 2026-09-15: `/healthz`, `/api/chat/active` (correctly resolves all 11
+`_chat_roots()` entries from the core repo's real `plugins.json`/`projects.json`), a
+Claude-provider turn (correctly reaches the real `claude-client.js`, correctly refuses
+without `CLAUDE_CODE_OAUTH_TOKEN` set), and a local-provider turn (the chat-preempt chain
+fires against live `instances/`/`queue/` state, `local-tool-client.js` spawns and runs a
+real turn against the live Ollama backend).
+
+Session storage lives at `~/.local/state/agent-manager-chat-plugin/sessions/` by
+default (override with `AGENT_MANAGER_CHAT_STORAGE_DIR`) -- independent of the core
+repo's own root, unlike the in-tree feature's hardcoded `CHAT_STORAGE_DIR`.

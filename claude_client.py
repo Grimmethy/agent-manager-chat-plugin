@@ -18,8 +18,18 @@ import tempfile
 import uuid
 from pathlib import Path
 
-SRC_DIR = Path(__file__).resolve().parent.parent.parent / "src"
-CLAUDE_CLIENT_JS = SRC_DIR / "claude-client.js"
+# 2026-09-15 (Phase 1 of the Chat-plugin extraction -- see
+# /home/wok/.claude/plans/immutable-noodling-axolotl.md): claude-client.js is NOT
+# vendored, despite the plan's own original assessment that it looked self-contained --
+# confirmed live it actually requires src/local-client.js (10+ further pipeline-internal
+# modules) AND src/sandbox.js, side-finding.js, incident-amplification.js, concepts.js --
+# genuine pipeline features Chat's allow_amplification=True path really exercises (a
+# Claude chat turn can raise real side-findings into the brain dump and record concept-
+# build tallies), not incidental bloat safe to strip. Same "point at the core repo's real
+# copy" treatment as local_tool_client.py, not vendoring.
+from app import CORE_REPO_ROOT
+
+CLAUDE_CLIENT_JS = CORE_REPO_ROOT / "src" / "claude-client.js"
 
 # Mirrors claude-client.js's own REQUEST_TIMEOUT_MS default (300s) plus headroom for
 # Node startup itself -- the JS side already enforces its own timeout on the `claude`

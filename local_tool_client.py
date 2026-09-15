@@ -1,11 +1,23 @@
-"""Python-side wrapper for src/local-tool-client.js's CLI mode -- the local model's
-multi-turn tool-calling loop (grep_codebase/read_file/list_directory, plus Chat's own
-opt-in write_file/edit_file/run_bash), needed by the dashboard's Chat panel the same way
-claude_client.py already wraps claude-client.js for the Claude provider.
+"""Python-side wrapper for the CORE agent-manager repo's src/local-tool-client.js CLI
+mode -- the local model's multi-turn tool-calling loop (grep_codebase/read_file/
+list_directory, plus Chat's own opt-in write_file/edit_file/run_bash), needed by Chat the
+same way claude_client.py already wraps the vendored claude-client.js for the Claude
+provider.
 
 Deliberately shells out to the Node module rather than reimplementing the /api/chat
 tool-loop logic in Python -- same "one implementation of the real thing, called from two
 languages" reasoning as claude_client.py's own header.
+
+2026-09-15 (Phase 1 of the Chat-plugin extraction -- see
+/home/wok/.claude/plans/immutable-noodling-axolotl.md): local-tool-client.js itself is
+NOT vendored into this repo, unlike claude-client.js -- it calls getConfig() from the
+core repo's own src/config.js and reads/writes that repo's instances/ and queue/
+directly, a hard dependency on agent-manager's own process/env conventions the plan's
+Phase 2/3 replaces with a small internal API instead of duplicating here. Until then this
+module points AGENT_MANAGER_CORE_REPO_ROOT/src/local-tool-client.js -- same coupling the
+in-tree Chat feature always had, just resolved from this repo's own app.py instead of a
+sibling directory three levels up (the in-tree version's own relative __file__ math,
+which does not hold from this repo's different directory depth).
 """
 import json
 import os
@@ -14,8 +26,9 @@ import tempfile
 import uuid
 from pathlib import Path
 
-SRC_DIR = Path(__file__).resolve().parent.parent.parent / "src"
-LOCAL_TOOL_CLIENT_JS = SRC_DIR / "local-tool-client.js"
+from app import CORE_REPO_ROOT
+
+LOCAL_TOOL_CLIENT_JS = CORE_REPO_ROOT / "src" / "local-tool-client.js"
 
 # local-tool-client.js's own REQUEST_TIMEOUT_MS default is 240s per TURN, not per call --
 # this was originally sized as "one slow turn plus headroom for Node startup," which was
