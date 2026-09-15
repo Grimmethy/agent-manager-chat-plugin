@@ -410,25 +410,47 @@ def _build_local_messages(session: dict, message: str) -> list:
     return messages
 
 
-def _stream_local(session: dict, message: str):
+def _stream_local(session: dict, message: str, result_box: dict = None):
     """Yields plain text chunks as the local model generates them (Open WebUI-style live
     streaming, see this module's own recent header note) -- the caller accumulates them
-    into the final transcript entry."""
+    into the final transcript entry for real-time display.
+
+    2026-09-15 (real bug, caught live testing the context-log feature): the caller used
+    to treat that raw streamed concatenation as the FINAL stored transcript text too --
+    but those chunks are the model's UNCLEANED output, streamed token-by-token, before
+    local-tool-client.js's own SIDE-FINDING:/AMPLIFY:/CONCEPT-BUILD:/CONTEXT-LOG: marker
+    stripping ever runs (that only happens on the fully-accumulated response, inside
+    local-tool-client.js's withUsage()). So every marker block has been silently leaking
+    into the visible, PERSISTED chat transcript this whole time streaming has existed
+    here -- unnoticed for SIDE-FINDING/AMPLIFY because they're rare opt-in flags, made
+    obvious immediately once CONTEXT-LOG made a marker mandatory on every single turn.
+
+    `result_box`, when given, is populated with `{"final_text": ...}` -- the real,
+    authoritative text (cleaned model response + any footer this function itself adds
+    below) -- once the turn is fully done, so the caller can OVERWRITE what it stored
+    with the correct value instead of trusting the raw stream. Real-time DISPLAY during
+    the turn is intentionally unaffected (still raw, unavoidably, for genuine
+    token-by-token streaming) -- this only fixes what ends up permanently stored."""
     started = time.time()
     messages = _build_local_messages(session, message)
     roots = session.get("roots") or [session["repoRoot"]]
     result = None
+    raw_chunks = []
     for event in local_tool_client.stream_plan_with_tools(
         messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
         primary_root=roots[0], extra_roots=roots[1:], force_summary_on_cap=True,
         allow_amplification=True, context_log_session_id=session["id"],
     ):
         if event.get("type") == "chunk":
+            raw_chunks.append(event["text"])
             yield event["text"]
         elif event.get("type") == "final":
             result = event
     model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
                                     stage="chat", result=result or {}, source="chat")
+    final_text = (result or {}).get("response")
+    if final_text is None:
+        final_text = "".join(raw_chunks)
     # 2026-09-05, Grimmethy: force_summary_on_cap=True is now passed above, so a
     # turn-cap hit, a context-budget hit, AND a voluntary early stop with no RESOLUTION:
     # line (see local-tool-client.js's own RESERVED_RESPONSE_TOKENS/
@@ -449,19 +471,25 @@ def _stream_local(session: dict, message: str):
     # Chat calls in one session showed that exact false message. 'voluntary-stop' gets NO
     # footer at all: nothing was actually exhausted, the model gave a complete answer and
     # was only asked to append the sentinel line the pipeline's resolver parses.
+    footer = None
     if result and result.get("forcedSummary") and result.get("forcedSummaryReason") == "context":
-        yield "\n\n*(Ran out of context room mid-investigation, so it gave its best final answer using what it had already learned.)*"
+        footer = "\n\n*(Ran out of context room mid-investigation, so it gave its best final answer using what it had already learned.)*"
     elif result and result.get("forcedSummary") and result.get("forcedSummaryReason") == "turns":
-        yield (
+        footer = (
             f"\n\n*(Ran out of its {CHAT_LOCAL_MAX_TURNS}-turn tool budget mid-investigation, "
             "so it gave its best final answer using what it had already learned.)*"
         )
     elif result and result.get("turnsUsed") is not None and result["turnsUsed"] >= CHAT_LOCAL_MAX_TURNS:
-        yield (
+        footer = (
             f"\n\n*(Ran out of its {CHAT_LOCAL_MAX_TURNS}-turn tool budget mid-investigation -- "
             "the above may be a status update rather than a finished answer. Ask again, or "
             "narrow the question, to let it continue.)*"
         )
+    if footer:
+        final_text += footer
+        yield footer
+    if result_box is not None:
+        result_box["final_text"] = final_text
 
 
 def stream_message(storage_dir: Path, session_id: str, message: str):
@@ -498,6 +526,7 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
     _write_sessions(storage_dir, sessions)
 
     reply_parts = []
+    result_box = {}
     if session["provider"] == PROVIDER_CLAUDE:
         reply = _send_claude(session, message)
         reply_parts.append(reply)
@@ -506,14 +535,21 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
         _write_sessions(storage_dir, sessions)
         yield {"type": "chunk", "text": reply}
     else:
-        for chunk in _stream_local(session, message):
+        for chunk in _stream_local(session, message, result_box):
             reply_parts.append(chunk)
             session["transcript"][-1]["text"] = "".join(reply_parts)
             sessions[session_id] = session
             _write_sessions(storage_dir, sessions)
             yield {"type": "chunk", "text": chunk}
 
-    session["transcript"][-1]["text"] = "".join(reply_parts).strip()
+    # 2026-09-15: prefer _stream_local's own authoritative final_text (the model's
+    # response with every SIDE-FINDING:/AMPLIFY:/CONCEPT-BUILD:/CONTEXT-LOG: marker
+    # actually stripped) over the raw streamed concatenation -- see _stream_local's own
+    # header for the real bug this closes. Falls back to the raw join for the Claude
+    # path (no result_box there) and for the rare case _stream_local ran into an error
+    # before ever setting it.
+    final_text = result_box.get("final_text")
+    session["transcript"][-1]["text"] = (final_text if final_text is not None else "".join(reply_parts)).strip()
     sessions[session_id] = session
     _write_sessions(storage_dir, sessions)
     yield {"type": "final", "session": session}

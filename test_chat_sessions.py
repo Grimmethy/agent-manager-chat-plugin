@@ -88,6 +88,67 @@ class StreamLocalFooterTest(unittest.TestCase):
         self.assertEqual(out, "answer")
 
 
+class StreamMessageStoresCleanedTextTest(unittest.TestCase):
+    """Real bug, caught live testing the context-log feature: stream_message used to
+    persist the raw streamed concatenation as the transcript's final text, never the
+    cleaned local-tool-client.js response -- every SIDE-FINDING:/AMPLIFY:/CONTEXT-LOG:
+    marker silently leaked into the stored/visible chat transcript. Unnoticed for
+    SIDE-FINDING/AMPLIFY (rare opt-in), immediately obvious once CONTEXT-LOG made a
+    marker mandatory on every turn."""
+
+    def setUp(self):
+        self._stats_patch = mock.patch.object(chat_sessions.model_stats_client, "record_call")
+        self._stats_patch.start()
+        self.addCleanup(self._stats_patch.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.storage_dir = Path(self.tmp.name)
+
+    def _seed_active_session(self):
+        session = _session()
+        session["provider"] = "local"
+        session["status"] = "active"
+        chat_sessions._write_sessions(self.storage_dir, {session["id"]: session})
+        return session["id"]
+
+    def test_stream_message_stores_the_cleaned_response_not_the_raw_stream(self):
+        session_id = self._seed_active_session()
+        raw = "Real answer.\n\nCONTEXT-LOG: distilled summary\nTASK-REF: t-1"
+        cleaned = "Real answer."
+
+        def fake_stream(**kwargs):
+            # Simulates local-tool-client.js: streams the RAW text chunk by chunk (as
+            # generated, before any marker stripping), then a final event whose
+            # `response` field IS the already-cleaned text.
+            for ch in raw:
+                yield {"type": "chunk", "text": ch}
+            yield {"type": "final", "response": cleaned, "turnsUsed": 2, "forcedSummary": False}
+
+        with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools", fake_stream):
+            list(chat_sessions.stream_message(self.storage_dir, session_id, "hi"))
+
+        stored = chat_sessions._read_sessions(self.storage_dir)[session_id]
+        self.assertEqual(stored["transcript"][-1]["text"], cleaned)
+        self.assertNotIn("CONTEXT-LOG", stored["transcript"][-1]["text"])
+
+    def test_stream_message_still_appends_the_footer_to_the_cleaned_text(self):
+        session_id = self._seed_active_session()
+
+        def fake_stream(**kwargs):
+            for ch in "pong":
+                yield {"type": "chunk", "text": ch}
+            yield {"type": "final", "response": "pong", "turnsUsed": 2,
+                   "forcedSummary": True, "forcedSummaryReason": "voluntary-stop"}
+
+        with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools", fake_stream):
+            list(chat_sessions.stream_message(self.storage_dir, session_id, "hi"))
+
+        stored = chat_sessions._read_sessions(self.storage_dir)[session_id]
+        # voluntary-stop gets no footer at all (see StreamLocalFooterTest) -- confirms
+        # the fix didn't accidentally start adding one.
+        self.assertEqual(stored["transcript"][-1]["text"], "pong")
+
+
 class StreamLocalContextLogSessionIdTest(unittest.TestCase):
     """Confirms _stream_local threads session['id'] through to
     stream_plan_with_tools(context_log_session_id=...) -- the one wiring hop this
