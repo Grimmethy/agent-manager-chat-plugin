@@ -251,5 +251,21 @@ class ContextLogNoteReadingTest(unittest.TestCase):
         self.assertLess(len(content), len(big))
 
 
+class NoGitHandoffPromptTest(unittest.TestCase):
+    """Chat must not offer a git hand-off (2026-09-19): the pipeline cannot perform git operations, and a
+    premium-priority "commit it and merge to master" task queued from Chat held a GPU lane for an hour."""
+
+    def test_prompt_forbids_queueing_git_operations_and_points_at_unmerged_branches_tab(self):
+        prompt = chat_sessions._LOCAL_SYSTEM_PROMPT
+        self.assertIn("NEVER queue a task whose deliverable is a git operation", prompt)
+        self.assertIn("Unmerged Branches tab", prompt)
+        self.assertNotIn("with its own clear error pointing at queue_reviewed_task", prompt)
+
+    def test_prompt_names_current_gpu_lanes_not_the_retired_layout(self):
+        prompt = chat_sessions._LOCAL_SYSTEM_PROMPT
+        self.assertIn("worker-3090", prompt)
+        self.assertNotIn("worker-reasoning", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
