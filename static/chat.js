@@ -14,6 +14,15 @@
 // (core-ui.js's escapeHtmlBright/markLongWords) is not ported -- purely cosmetic, and
 // porting it would mean duplicating a whole marker-based escaping scheme for one visual
 // flourish. Plain escapeHtml() here.
+//
+// Assistant markdown rendering (2026-09-22, Grimmethy: "check github for something that
+// handles this issue well" re: unreadable/unformatted assistant responses): via vendored
+// static/vendor/smd.js (thetarnav/streaming-markdown, MIT -- see that file's own header
+// and static/vendor/README.md for why this one). Only assistant text is rendered as
+// markdown; user messages stay plain-escaped text -- a user's own typed message isn't
+// markdown they're asking to be formatted, and rendering it would just be a bigger HTML
+// surface for no benefit.
+import * as smd from "./vendor/smd.js";
 
 let chatSession = null;
 let providerChoice = 'local';
@@ -54,6 +63,22 @@ function showToast(message, kind = 'error') {
   toastHideTimer = setTimeout(() => { el.classList.remove('show'); }, 3000);
 }
 
+// Renders one segment of assistant text as markdown into an HTML string, via a fresh
+// smd Parser each call. Re-parsing the whole segment from scratch on every
+// chatRender() (rather than keeping one Parser alive across streamed chunks, which is
+// smd's more typical usage) matches how this file already rebuilds the ENTIRE
+// transcript's innerHTML on every render -- see chatRender()'s own
+// `transcriptEl.innerHTML = ...` -- so a persistent per-message Parser tied to DOM
+// nodes that get thrown away each render would just be dead weight. Message-length
+// text re-parses fast enough that this isn't a real cost.
+function renderMarkdown(text) {
+  const container = document.createElement('div');
+  const parser = smd.parser(smd.default_renderer(container));
+  smd.parser_write(parser, String(text));
+  smd.parser_end(parser);
+  return container.innerHTML;
+}
+
 // Own transcript renderer, deliberately NOT the host's shared grillRenderTranscript()
 // (an iframe can't call a function in a different document anyway) -- see this file's
 // own header comment.
@@ -62,15 +87,20 @@ function chatRenderTranscript(transcript, session) {
   const rows = transcript.map((t) => {
     const roleLabel = t.role === 'assistant' ? assistantLabel : 'You';
     const cls = t.role === 'assistant' ? 'chat-msg-assistant' : 'chat-msg-user';
+    const isAssistant = t.role === 'assistant';
     let body;
     if (t.timestamp) {
       const m = String(t.timestamp).match(/T(\d{2}):(\d{2}):(\d{2})/);
       const stamp = m ? `${m[1]}:${m[2]}:${m[3]}` : String(t.timestamp).slice(11, 19);
+      // A <div> wrapper per segment, not <p> -- rendered markdown can itself start
+      // with a block element (<pre>, <ul>, a heading, ...), and a block element
+      // inside a <p> gets silently split by the HTML parser, breaking the timestamp
+      // span's placement.
       body = String(t.text).split(/\n{2,}/).map(seg =>
-        `<p><span class="chat-seg-ts">${escapeHtml(stamp)}</span>${escapeHtml(seg)}</p>`
+        `<div class="chat-msg-seg"><span class="chat-seg-ts">${escapeHtml(stamp)}</span>${isAssistant ? renderMarkdown(seg) : escapeHtml(seg)}</div>`
       ).join('');
     } else {
-      body = escapeHtml(t.text);
+      body = isAssistant ? renderMarkdown(t.text) : escapeHtml(t.text);
     }
     return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div></div>`;
   }).join('');

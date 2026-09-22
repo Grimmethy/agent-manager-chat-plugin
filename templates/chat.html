@@ -52,6 +52,9 @@
     </div>
   </div>
 </div>
-<script src="static/chat.js"></script>
+<!-- type="module" so chat.js can `import` static/vendor/smd.js -- module import
+     specifiers resolve against the importing MODULE's own URL, not the document's, so
+     this stays proxy-safe the same way the plain relative src= above is. -->
+<script type="module" src="static/chat.js"></script>
 </body>
 </html>
