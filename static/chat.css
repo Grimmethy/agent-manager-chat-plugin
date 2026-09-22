@@ -31,7 +31,7 @@ body {
    BOTH nested flex:1 levels, or the transcript grows to fit its whole content instead of
    staying a fixed, internally-scrolling box. */
 .chat-body { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 12px 16px; overflow: hidden; }
-.chat-body #chat-transcript { flex: 1; min-height: 0; overflow: hidden; }
+.chat-body #chat-transcript { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 
 .chat-reserve-btn.active, #chat-reserve-btn.active { background: var(--warn); color: #1a1300; border-color: var(--warn); }
 
@@ -51,7 +51,11 @@ body {
 
 .field-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-top: 14px; }
 
-.chat-transcript { max-height: none; height: 100%; overflow-y: auto; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
+/* flex:1/min-height:0 here, not height:100% -- #chat-transcript also contains the
+   ".field-label" (Conversation) sibling above this box, so height:100% of the parent
+   overflowed the parent's own box by that label's height, and #chat-transcript's
+   overflow:hidden silently clipped the bottom of the transcript by the same amount. */
+.chat-transcript { max-height: none; flex: 1; min-height: 0; overflow-y: auto; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
 .chat-msg-role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
 .chat-msg-assistant .chat-msg-role { color: var(--accent); }
 .chat-msg-text { font-size: 13px; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
