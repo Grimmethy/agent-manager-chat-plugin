@@ -222,8 +222,20 @@ async function chatSend() {
   chatSession.transcript.push(assistantEntry);
   chatRender();
   try {
+    // Accept: text/event-stream is REQUIRED here, not cosmetic -- the host dashboard's
+    // generic plugin proxy (routes/plugin_proxy.py) only takes its true streaming
+    // passthrough path (requests+stream=True, piped chunk by chunk) when BOTH the
+    // plugin's own plugins.json entry declares proxy.sse:true AND the client's request
+    // carries this header; missing it falls through to the proxy's non-SSE path, which
+    // reads the WHOLE upstream response into memory (urllib's r.read()) before ever
+    // replying -- the connection this repo's own /api/chat/<id>/message route always
+    // streams from gets fully buffered one hop upstream, so every response arrives in
+    // one lump at the end instead of trickling in as the model actually generates it.
+    // Root-caused live 2026-09-22 (Grimmethy, through the dashboard's proxied iframe --
+    // this bug never showed hitting the plugin directly on :7442, only through :7420's
+    // proxy): this fetch() had no Accept header at all.
     const resp = await fetch(`api/chat/${encodeURIComponent(chatSession.id)}/message`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
       body: JSON.stringify({ message }),
     });
     if (!resp.ok || !resp.body) {
