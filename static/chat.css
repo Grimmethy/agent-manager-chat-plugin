@@ -103,3 +103,11 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 #toast.show { opacity: 1; transform: translateY(0); }
 #toast.toast-error { background: var(--bad); color: #fff; }
 #toast.toast-info { background: var(--panel); color: var(--text); border: 2px solid var(--border); }
+.chat-msg-error .chat-msg-text { color: var(--bad); border-left: 3px solid var(--bad); padding-left: 8px; }
+.tpl-card { margin-top: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+.tpl-head { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-bottom: 6px; }
+.tpl-card .tpl-key, .tpl-card .tpl-text { width: 100%; box-sizing: border-box; margin-bottom: 6px; background: var(--bg, #0d0f14); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px; font: inherit; font-size: 12px; }
+.tpl-save { padding: 6px 12px; }
+.tpl-note { margin-top: 6px; font-size: 12px; }
+.tpl-note.tpl-saved { color: var(--ok); }
+.tpl-note.tpl-failed { color: var(--bad); }

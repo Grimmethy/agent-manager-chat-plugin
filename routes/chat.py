@@ -157,17 +157,28 @@ def api_chat_message(session_id):
             print(f"[chat-preempt] failed (non-fatal): {e}", file=sys.stderr, flush=True)
 
     def generate():
+        from chat_sessions import record_turn_error
+
+        def fail(msg):
+            # Persist into the transcript first so the error outlives the toast, then
+            # tell the client (it re-reads the session and renders the saved entry).
+            try:
+                record_turn_error(CHAT_STORAGE_DIR, session_id, msg)
+            except Exception as werr:  # noqa: BLE001 -- never mask the original error
+                print(f"[chat-error-record] failed: {werr}", file=sys.stderr, flush=True)
+            return f"data: {json.dumps({'type': 'error', 'error': msg})}\n\n"
+
         if preempted:
             yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
         try:
             for event in stream_message(CHAT_STORAGE_DIR, session_id, message):
                 yield f"data: {json.dumps(event)}\n\n"
-        except ClaudeClientError as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-        except LocalToolClientError as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        except (ClaudeClientError, LocalToolClientError) as e:
+            yield fail(str(e))
         except (TimeoutError, ConnectionError, OSError) as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': f'local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly.'})}\n\n"
+            yield fail(f'local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly.')
+        except Exception as e:  # noqa: BLE001 -- anything else must still land in the history
+            yield fail(f'{type(e).__name__}: {e}')
 
     # Reserved sessions refresh their own idle clock on every real message -- see
     # api_chat_reserve below: calling the internal API's /reserve again with on:true
@@ -221,3 +232,31 @@ def api_chat_reserve(session_id):
 
     session = set_reserved(CHAT_STORAGE_DIR, session_id, want_on)
     return jsonify(session)
+
+
+@chat_bp.route("/api/chat/<session_id>/template/save", methods=["POST"])
+def api_chat_template_save(session_id):
+    """The Save button on a template proposal card. Body: {entry, index, key?, text?} --
+    `entry` is the transcript index of the assistant reply that carries the proposal,
+    `index` the proposal within it; key/text are the user's edits from the card. The
+    outcome (saved, or why not) is persisted on the proposal so it survives a reload, and
+    the updated session comes back so the UI renders it."""
+    from app import CHAT_STORAGE_DIR
+    from chat_sessions import get_session, _read_sessions, _write_sessions
+    import template_store
+    body = request.get_json(silent=True) or {}
+    try:
+        entry, index = int(body["entry"]), int(body["index"])
+    except (KeyError, TypeError, ValueError):
+        abort(400, description="entry and index are required integers")
+    sessions = _read_sessions(CHAT_STORAGE_DIR)
+    session = sessions.get(session_id)
+    if not session or session.get("status") != "active":
+        abort(404)
+    try:
+        prop = template_store.save_proposal(session, entry, index, body.get("key"), body.get("text"))
+    except LookupError:
+        abort(404, description="no such template proposal")
+    sessions[session_id] = session
+    _write_sessions(CHAT_STORAGE_DIR, sessions)
+    return jsonify({"session": session, "proposal": prop})

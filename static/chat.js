@@ -27,6 +27,17 @@ import * as smd from "./vendor/smd.js";
 let chatSession = null;
 let providerChoice = 'local';
 let toastHideTimer = null;
+// Guards BOTH ways a message can be submitted (Send-button click and Enter in the
+// input) against firing a second concurrent turn while one is still streaming. The
+// button's own `disabled` state used to be the only guard, but the Enter-key handler
+// never checked it -- so pressing Enter while a reply was still in flight fired a
+// second POST /api/chat/<id>/message for the same session, racing the first one on
+// the backend's session file (no locking there: two `stream_message()` calls each
+// hold their own in-memory snapshot of the whole transcript and rewrite the whole
+// file on every chunk, so whichever finishes last silently clobbers the other's
+// entries). Root-caused live 2026-09-25 from a session where a slow reply got
+// reprompted mid-stream and its real answer ended up buried under the next turn's.
+let isSending = false;
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -84,10 +95,10 @@ function renderMarkdown(text) {
 // own header comment.
 function chatRenderTranscript(transcript, session) {
   const assistantLabel = session && session.provider === 'claude' ? 'Claude' : 'Local';
-  const rows = transcript.map((t) => {
+  const rows = transcript.map((t, idx) => {
     const roleLabel = t.role === 'assistant' ? assistantLabel : 'You';
-    const cls = t.role === 'assistant' ? 'chat-msg-assistant' : 'chat-msg-user';
-    const isAssistant = t.role === 'assistant';
+    const cls = (t.role === 'assistant' ? 'chat-msg-assistant' : 'chat-msg-user') + (t.error ? ' chat-msg-error' : '');
+    const isAssistant = t.role === 'assistant' && !t.error; // error notices stay literal text, not markdown (underscores in env var names get eaten)
     let body;
     if (t.timestamp) {
       const m = String(t.timestamp).match(/T(\d{2}):(\d{2}):(\d{2})/);
@@ -102,7 +113,16 @@ function chatRenderTranscript(transcript, session) {
     } else {
       body = isAssistant ? renderMarkdown(t.text) : escapeHtml(t.text);
     }
-    return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div></div>`;
+    const cards = (t.templates || []).map((tp, ti) => {
+      const done = tp.status === 'saved';
+      const note = tp.message ? `<div class="tpl-note tpl-${escapeHtml(tp.status)}">${escapeHtml(tp.message)}</div>` : '';
+      return `<div class="tpl-card" data-entry="${idx}" data-tpl="${ti}">
+        <div class="tpl-head">Template proposal &middot; ${escapeHtml(tp.kind)}</div>
+        <input class="tpl-key" value="${escapeHtml(tp.key)}" ${done ? 'disabled' : ''}>
+        <textarea class="tpl-text" rows="6" ${done ? 'disabled' : ''}>${escapeHtml(tp.text)}</textarea>
+        <button type="button" class="tpl-save" ${done ? 'disabled' : ''}>${done ? 'Saved' : 'Save template'}</button>${note}</div>`;
+    }).join('');
+    return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div>${cards}</div>`;
   }).join('');
   return `<div class="field-label">Conversation</div><div class="chat-transcript">${rows}</div>`;
 }
@@ -178,7 +198,11 @@ async function chatPanelInit() {
   const input = document.getElementById('chat-input');
   if (input) {
     input.onkeydown = (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSend(); }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (isSending) return;
+        chatSend();
+      }
     };
   }
   chatWireContextLogPanel();
@@ -210,11 +234,14 @@ async function chatStartNew() {
 }
 
 async function chatSend() {
+  if (isSending) return;
   const input = document.getElementById('chat-input');
   const sendBtn = document.getElementById('chat-send-btn');
   const message = input && input.value.trim();
   if (!message || !chatSession) return;
+  isSending = true;
   input.value = '';
+  input.disabled = true;
   sendBtn.disabled = true;
   sendBtn.textContent = 'Thinking...';
   chatSession.transcript.push({ role: 'user', text: message });
@@ -280,8 +307,21 @@ async function chatSend() {
     if (finalSession) chatSession = finalSession;
   } catch (e) {
     showToast('Chat message failed: ' + e.message);
-    try { chatSession = await fetchJson('api/chat/active'); } catch (e2) { /* leave as-is */ }
+    // The server persists stream errors into the transcript; re-read it so the saved
+    // entry shows. If it couldn't (dropped connection, server down) keep the local
+    // transcript and write the error into it ourselves -- never let it only flash.
+    let refreshed = null;
+    try { refreshed = await fetchJson('api/chat/active'); } catch (e2) { /* fall back below */ }
+    const last = refreshed && refreshed.transcript && refreshed.transcript[refreshed.transcript.length - 1];
+    if (refreshed && refreshed.id === chatSession.id && last && last.error) {
+      chatSession = refreshed;
+    } else {
+      assistantEntry.text = (assistantEntry.text ? assistantEntry.text + '\n\n' : '') + 'Error: ' + e.message;
+      assistantEntry.error = true;
+    }
   } finally {
+    isSending = false;
+    input.disabled = false;
     sendBtn.disabled = false;
     sendBtn.textContent = 'Send';
   }
@@ -367,4 +407,33 @@ window.addEventListener('message', (e) => {
   if (e.data && e.data.type === 'agent-manager-chat-refresh') {
     chatPanelInit();
   }
+});
+
+
+// Save button on a template proposal card (event delegation: chatRender rebuilds the whole
+// transcript's innerHTML, so per-card listeners would be thrown away every render).
+// Reads the card's CURRENT name/text so the user's edits are what get saved; the server
+// persists the outcome (saved / why not) on the proposal, so it survives a reload.
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest && e.target.closest('.tpl-save');
+  if (!btn || !chatSession) return;
+  const card = btn.closest('.tpl-card');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  try {
+    const resp = await fetch(`api/chat/${encodeURIComponent(chatSession.id)}/template/save`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        entry: Number(card.dataset.entry), index: Number(card.dataset.tpl),
+        key: card.querySelector('.tpl-key').value, text: card.querySelector('.tpl-text').value,
+      }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
+    chatSession = body.session;
+    showToast(body.proposal.message, body.proposal.status === 'saved' ? 'info' : 'error');
+  } catch (err) {
+    showToast('Could not save template: ' + err.message);
+  }
+  chatRender();
 });

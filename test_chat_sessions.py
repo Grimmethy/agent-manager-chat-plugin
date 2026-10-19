@@ -267,5 +267,74 @@ class NoGitHandoffPromptTest(unittest.TestCase):
         self.assertNotIn("worker-reasoning", prompt)
 
 
+class RecordTurnErrorTest(unittest.TestCase):
+    """record_turn_error() -- a failed turn's error lands IN the stored transcript (it used
+    to exist only as a 3-second toast)."""
+
+    def setUp(self):
+        self.storage = Path(tempfile.mkdtemp())
+
+    def _store(self, transcript, status="active"):
+        session = _session()
+        session["status"] = status
+        session["transcript"] = transcript
+        chat_sessions._write_sessions(self.storage, {session["id"]: session})
+        return session["id"]
+
+    def _stored(self, session_id):
+        return chat_sessions.get_session(self.storage, session_id)["transcript"]
+
+    def test_fills_the_empty_assistant_placeholder(self):
+        sid = self._store([{"role": "user", "text": "hi"}, {"role": "assistant", "text": ""}])
+        chat_sessions.record_turn_error(self.storage, sid, "boom")
+        transcript = self._stored(sid)
+        self.assertEqual(len(transcript), 2)
+        self.assertEqual(transcript[-1]["text"], "Error: boom")
+        self.assertTrue(transcript[-1]["error"])
+
+    def test_keeps_partial_reply_text_and_appends_the_error(self):
+        sid = self._store([{"role": "user", "text": "hi"}, {"role": "assistant", "text": "half an answer"}])
+        chat_sessions.record_turn_error(self.storage, sid, "boom")
+        transcript = self._stored(sid)
+        self.assertEqual(len(transcript), 2)
+        self.assertEqual(transcript[-1]["text"], "half an answer\n\nError: boom")
+        self.assertTrue(transcript[-1]["error"])
+
+    def test_appends_a_new_entry_after_a_user_turn(self):
+        sid = self._store([{"role": "user", "text": "hi"}])
+        chat_sessions.record_turn_error(self.storage, sid, "boom")
+        transcript = self._stored(sid)
+        self.assertEqual(len(transcript), 2)
+        self.assertEqual(transcript[-1]["role"], "assistant")
+        self.assertEqual(transcript[-1]["text"], "Error: boom")
+        self.assertTrue(transcript[-1]["error"])
+
+    def test_unknown_session_returns_none_and_writes_nothing(self):
+        sid = self._store([{"role": "user", "text": "hi"}])
+        before = chat_sessions.chat_sessions_path(self.storage).read_text(encoding="utf-8")
+        self.assertIsNone(chat_sessions.record_turn_error(self.storage, "chat-no-such-id", "boom"))
+        self.assertEqual(chat_sessions.chat_sessions_path(self.storage).read_text(encoding="utf-8"), before)
+        self.assertEqual(len(self._stored(sid)), 1)
+
+    def test_ended_session_returns_none_and_writes_nothing(self):
+        sid = self._store([{"role": "user", "text": "hi"}], status="ended")
+        self.assertIsNone(chat_sessions.record_turn_error(self.storage, sid, "boom"))
+        self.assertEqual(self._stored(sid), [{"role": "user", "text": "hi"}])
+
+
+class BuildLocalMessagesSkipsErrorsTest(unittest.TestCase):
+    def test_error_entries_are_not_replayed_to_the_model(self):
+        session = _session()
+        session["transcript"] = [
+            {"role": "user", "text": "first question"},
+            {"role": "assistant", "text": "Error: boom", "error": True},
+            {"role": "user", "text": "second question"},
+            {"role": "assistant", "text": "a real answer"},
+        ]
+        messages = chat_sessions._build_local_messages(session, "new message")
+        contents = [m["content"] for m in messages[1:]]
+        self.assertEqual(contents, ["first question", "second question", "a real answer", "new message"])
+
+
 if __name__ == "__main__":
     unittest.main()
