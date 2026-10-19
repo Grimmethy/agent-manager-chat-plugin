@@ -52,6 +52,18 @@ def api_chat_sessions():
     return jsonify(list_sessions(CHAT_STORAGE_DIR))
 
 
+@chat_bp.route("/api/chat/<session_id>", methods=["GET"])
+def api_chat_get(session_id):
+    """The full session JSON for one conversation, so the pane can load a chat that is not
+    the 'active' one. 404 if it does not exist or is ended."""
+    from app import CHAT_STORAGE_DIR
+    from chat_sessions import get_session
+    session = get_session(CHAT_STORAGE_DIR, session_id)
+    if not session or session.get("status") != "active":
+        abort(404)
+    return jsonify(session)
+
+
 @chat_bp.route("/api/chat/<session_id>/close", methods=["POST"])
 def api_chat_close(session_id):
     """Ends one conversation. 404 if it does not exist or is already ended. A reserved
