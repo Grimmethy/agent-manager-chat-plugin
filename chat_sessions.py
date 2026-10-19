@@ -29,6 +29,11 @@ _acquire_apply_lock()/_release_apply_lock() pair already used by the merge-branc
 endpoint, so this module never needs its own git-mutex logic.
 """
 import json
+import os
+import re
+import sys
+import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -65,22 +70,119 @@ CHAT_CLAUDE_MAX_TURNS = 30
 CHAT_LOCAL_MAX_TURNS = 100
 
 
+# 2026-10-18 (multi-chat workspace, Phase 1): one JSON file PER SESSION instead of one
+# file holding every session. The old single file was read and rewritten whole on every
+# streamed chunk, so a turn in session A held a stale copy of session B and erased B's
+# progress the moment both streamed at once -- the design doc's "several chats open at
+# once" cannot work on top of that. Every writer below now reads and rewrites only its
+# own session's file. _read_sessions/_write_sessions keep their names and shapes for the
+# callers that want all sessions, but _write_sessions can only touch the sessions it is
+# handed.
+SESSIONS_DIRNAME = ".agent-manager-chat-sessions"
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_migrate_lock = threading.Lock()
+
+
 def chat_sessions_path(storage_dir: Path) -> Path:
+    """The LEGACY single-file store -- read only by the one-time migration below."""
     return storage_dir / ".agent-manager-chat-sessions.json"
 
 
-def _read_sessions(storage_dir: Path) -> dict:
-    p = chat_sessions_path(storage_dir)
-    if not p.exists():
-        return {}
+def sessions_dir(storage_dir: Path) -> Path:
+    return storage_dir / SESSIONS_DIRNAME
+
+
+def _session_path(storage_dir: Path, session_id: str) -> Path:
+    # Ids become file names: refuse anything that could leave the sessions dir.
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.match(session_id):
+        raise ValueError(f"invalid chat session id: {session_id!r}")
+    return sessions_dir(storage_dir) / f"{session_id}.json"
+
+
+def _migrate_legacy_store(storage_dir: Path):
+    """Splits the legacy single-file store into per-session files, once. Ids that already
+    have a file keep it (never overwritten); the legacy file is renamed to .migrated, never
+    deleted. An unreadable legacy file is left where it is and reported on stderr."""
+    legacy = chat_sessions_path(storage_dir)
+    if not legacy.exists():
+        return
+    with _migrate_lock:
+        if not legacy.exists():
+            return
+        try:
+            sessions = json.loads(legacy.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[chat-sessions] legacy store {legacy} unreadable, not migrated: {e}", file=sys.stderr, flush=True)
+            return
+        sessions_dir(storage_dir).mkdir(parents=True, exist_ok=True)
+        for sid, session in (sessions or {}).items():
+            try:
+                if not _session_path(storage_dir, sid).exists():
+                    _write_session(storage_dir, session)
+            except ValueError as e:
+                print(f"[chat-sessions] skipped legacy session during migration: {e}", file=sys.stderr, flush=True)
+        legacy.rename(legacy.with_name(legacy.name + ".migrated"))
+
+
+def _read_session(storage_dir: Path, session_id: str):
+    _migrate_legacy_store(storage_dir)
+    try:
+        p = _session_path(storage_dir, session_id)
+    except ValueError:
+        return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_session(storage_dir: Path, session: dict):
+    """Writes ONE session atomically: a unique temp file in the same directory, then
+    os.replace, so a reader never sees half a file and two writers never share a temp."""
+    p = _session_path(storage_dir, session["id"])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{session['id']}.", suffix=".tmp", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(session, f, indent=2)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_sessions(storage_dir: Path) -> dict:
+    _migrate_legacy_store(storage_dir)
+    d = sessions_dir(storage_dir)
+    if not d.is_dir():
         return {}
+    sessions = {}
+    for p in d.glob("*.json"):
+        try:
+            s = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(s, dict) and s.get("id"):
+            sessions[s["id"]] = s
+    return sessions
 
 
 def _write_sessions(storage_dir: Path, sessions: dict):
-    chat_sessions_path(storage_dir).write_text(json.dumps(sessions, indent=2), encoding="utf-8")
+    for session in sessions.values():
+        _write_session(storage_dir, session)
+
+
+# Sessions with a turn streaming right now, in THIS process (stream_message adds on entry
+# and removes in its finally). Process-local on purpose: a restart ends every stream.
+_busy_sessions = set()
+_busy_lock = threading.Lock()
+
+
+def _touch(session: dict):
+    session["lastActivityAt"] = _now_iso()
 
 
 def _now_iso() -> str:
@@ -109,6 +211,9 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
         "transcript": [],
         "status": "active",
         "startedAt": _now_iso(),
+        # Last time anything was appended to the transcript -- what "most recently used"
+        # means for get_active_session() and list_sessions(). None until the first entry.
+        "lastActivityAt": None,
         "endedAt": None,
         # "fully reserving the reasoning model" (Brain Dump #153) -- whether this
         # session currently holds .pipeline-single-flight.lock across turns, not just for
@@ -119,40 +224,78 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
     }
 
 
+def _last_used(session: dict) -> str:
+    # ISO-8601 UTC strings compare correctly as text.
+    return max(session.get("lastActivityAt") or "", session.get("startedAt") or "")
+
+
 def get_active_session(storage_dir: Path, roots: list, instances_dir=None,
                         provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
-    """The single ongoing conversation for this project (Brain Dump #153: "hideable panel
-    on the right side of the app" -- global, not per-subject like Discuss). Creates one if
-    none is currently active. Does NOT re-resolve provider/model/effort for an existing
-    active session -- same "fixed for the session's lifetime" reasoning discuss_sessions.py
-    already documents (a mid-conversation provider switch would hand the new
-    provider/model a transcript or --resume history it didn't generate)."""
-    sessions = _read_sessions(storage_dir)
-    active = [s for s in sessions.values() if s.get("status") == "active"]
+    """The conversation the single-pane sidebar shows (Brain Dump #153: "hideable panel
+    on the right side of the app" -- global, not per-subject like Discuss): the most
+    recently used active session, so a chat just made with "New" (startedAt = now) wins
+    until another one is used. Creates one if none is active. Does NOT re-resolve
+    provider/model/effort for an existing active session -- same "fixed for the
+    session's lifetime" reasoning discuss_sessions.py already documents (a
+    mid-conversation provider switch would hand the new provider/model a transcript or
+    --resume history it didn't generate)."""
+    active = [s for s in _read_sessions(storage_dir).values() if s.get("status") == "active"]
     if active:
-        active.sort(key=lambda s: s.get("startedAt") or "", reverse=True)
-        return active[0]
+        return max(active, key=_last_used)
     session = _new_session(roots, instances_dir, provider, model, effort)
-    sessions[session["id"]] = session
-    _write_sessions(storage_dir, sessions)
+    _write_session(storage_dir, session)
     return session
 
 
 def start_new_conversation(storage_dir: Path, roots: list, instances_dir=None,
                             provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
-    """Ends whatever's currently active (if anything -- same shape as Discuss's own
-    end_session, but here there's no subject-owning caller to fold a summary back into,
-    so this just closes it out) and starts a fresh one."""
-    sessions = _read_sessions(storage_dir)
-    now = _now_iso()
-    for s in sessions.values():
-        if s.get("status") == "active":
-            s["status"] = "ended"
-            s["endedAt"] = now
+    """Starts a fresh conversation ALONGSIDE the existing ones (2026-10-18: it used to end
+    every active session first, so "New" destroyed the chat you were in). Use
+    end_session() to close one."""
     session = _new_session(roots, instances_dir, provider, model, effort)
-    sessions[session["id"]] = session
-    _write_sessions(storage_dir, sessions)
+    _write_session(storage_dir, session)
     return session
+
+
+def end_session(storage_dir: Path, session_id: str):
+    """Closes exactly one active session. Returns it, or None if it is missing or already
+    ended."""
+    session = _read_session(storage_dir, session_id)
+    if not session or session.get("status") != "active":
+        return None
+    session["status"] = "ended"
+    session["endedAt"] = _now_iso()
+    _write_session(storage_dir, session)
+    return session
+
+
+def _session_title(session: dict) -> str:
+    for turn in session.get("transcript") or []:
+        if turn.get("role") == "user" and (turn.get("text") or "").strip():
+            text = " ".join(turn["text"].split())
+            return text if len(text) <= 60 else text[:59] + "…"
+    return "New chat"
+
+
+def list_sessions(storage_dir: Path) -> list:
+    """Summary rows for every active session, most recently used first -- what the
+    workspace's session switcher lists. `busy` = a turn is streaming in this process."""
+    with _busy_lock:
+        busy = set(_busy_sessions)
+    rows = [{
+        "id": s["id"],
+        "title": _session_title(s),
+        "provider": s.get("provider"),
+        "model": s.get("model"),
+        "status": s.get("status"),
+        "startedAt": s.get("startedAt"),
+        "lastActivityAt": s.get("lastActivityAt"),
+        "turnCount": len(s.get("transcript") or []),
+        "busy": s["id"] in busy,
+        "reserved": bool(s.get("reserved")),
+    } for s in _read_sessions(storage_dir).values() if s.get("status") == "active"]
+    rows.sort(key=lambda r: max(r["lastActivityAt"] or "", r["startedAt"] or ""), reverse=True)
+    return rows
 
 
 def _roots_blurb(session: dict) -> str:
@@ -519,13 +662,24 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
     transcript is persisted. Claude sessions still resolve in a single blocking
     _send_claude() call (Claude-side token streaming isn't wired up here) but go through
     this same generator shape so app.py's SSE route doesn't need to special-case either
-    provider."""
-    sessions = _read_sessions(storage_dir)
-    session = sessions.get(session_id)
+    provider.
+
+    Persists only THIS session's file (2026-10-18), and marks the session busy in
+    list_sessions() for exactly the life of the generator."""
+    session = _read_session(storage_dir, session_id)
     if not session or session["status"] != "active":
         yield {"type": "final", "session": session}
         return
+    with _busy_lock:
+        _busy_sessions.add(session_id)
+    try:
+        yield from _stream_message_turn(storage_dir, session, message)
+    finally:
+        with _busy_lock:
+            _busy_sessions.discard(session_id)
 
+
+def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     # 2026-09-01 (Grimmethy: "time stamps to the second programmed into each
     # thought segment"): capture the turn's wall-clock time so the transcript
     # render (grillRenderTranscript in index.html) can stamp each segment. Old
@@ -542,8 +696,8 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
     # chunk, regardless of cause (a reloader restart, a crash, a dropped connection) --
     # the whole point is not depending on reaching a specific line of code at the end.
     session["transcript"].append({"role": "assistant", "text": "", "timestamp": _now_iso()})
-    sessions[session_id] = session
-    _write_sessions(storage_dir, sessions)
+    _touch(session)
+    _write_session(storage_dir, session)
 
     reply_parts = []
     result_box = {}
@@ -551,15 +705,13 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
         reply = _send_claude(session, message)
         reply_parts.append(reply)
         session["transcript"][-1]["text"] = reply
-        sessions[session_id] = session
-        _write_sessions(storage_dir, sessions)
+        _write_session(storage_dir, session)
         yield {"type": "chunk", "text": reply}
     else:
         for chunk in _stream_local(session, message, result_box):
             reply_parts.append(chunk)
             session["transcript"][-1]["text"] = "".join(reply_parts)
-            sessions[session_id] = session
-            _write_sessions(storage_dir, sessions)
+            _write_session(storage_dir, session)
             yield {"type": "chunk", "text": chunk}
 
     # 2026-09-15: prefer _stream_local's own authoritative final_text (the model's
@@ -575,13 +727,12 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
     session["transcript"][-1]["text"] = reply.strip()
     if proposals:
         session["transcript"][-1]["templates"] = proposals
-    sessions[session_id] = session
-    _write_sessions(storage_dir, sessions)
+    _write_session(storage_dir, session)
     yield {"type": "final", "session": session}
 
 
 def get_session(storage_dir: Path, session_id: str):
-    return _read_sessions(storage_dir).get(session_id)
+    return _read_session(storage_dir, session_id)
 
 
 def inject_user_message(storage_dir: Path, session_id: str, text: str):
@@ -593,13 +744,12 @@ def inject_user_message(storage_dir: Path, session_id: str, text: str):
     what app.py's POST /api/chat/inject endpoint calls so dashboard "Send to chat"
     buttons (task detail, Brain Dump) can push a task log / brain-dump dump into the
     conversation for follow-up without triggering a model turn."""
-    sessions = _read_sessions(storage_dir)
-    session = sessions.get(session_id)
+    session = _read_session(storage_dir, session_id)
     if not session or session.get("status") != "active":
         return None
     session["transcript"].append({"role": "user", "text": text, "timestamp": _now_iso()})
-    sessions[session_id] = session
-    _write_sessions(storage_dir, sessions)
+    _touch(session)
+    _write_session(storage_dir, session)
     return session
 
 
@@ -611,8 +761,7 @@ def record_turn_error(storage_dir: Path, session_id: str, error_text: str):
     failure was a 3-second toast. This fills the trailing assistant entry (or appends a
     new one) with the error and flags it `error: True` so the UI can style it and the
     local-model replay can skip it. Returns the updated session or None."""
-    sessions = _read_sessions(storage_dir)
-    session = sessions.get(session_id)
+    session = _read_session(storage_dir, session_id)
     if not session or session.get("status") != "active":
         return None
     text = f"Error: {error_text}"
@@ -624,8 +773,8 @@ def record_turn_error(storage_dir: Path, session_id: str, error_text: str):
         last["error"] = True
     else:
         transcript.append({"role": "assistant", "text": text, "timestamp": _now_iso(), "error": True})
-    sessions[session_id] = session
-    _write_sessions(storage_dir, sessions)
+    _touch(session)
+    _write_session(storage_dir, session)
     return session
 
 
@@ -633,11 +782,9 @@ def set_reserved(storage_dir: Path, session_id: str, reserved: bool):
     """Just the persisted flag -- app.py's reservation registry owns actually
     acquiring/releasing the lock and the idle-timeout watchdog; this only keeps the
     dashboard's own display of "is this session reserved" in sync with that."""
-    sessions = _read_sessions(storage_dir)
-    session = sessions.get(session_id)
+    session = _read_session(storage_dir, session_id)
     if not session:
         return None
     session["reserved"] = reserved
-    sessions[session_id] = session
-    _write_sessions(storage_dir, sessions)
+    _write_session(storage_dir, session)
     return session

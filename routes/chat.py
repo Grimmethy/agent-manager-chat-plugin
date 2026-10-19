@@ -20,8 +20,8 @@ chat_bp = Blueprint("chat-bp", __name__)
 
 @chat_bp.route("/api/chat/active", methods=["GET"])
 def api_chat_active():
-    """Loads (or creates, if none exists yet) the single ongoing system-wide
-    conversation -- called on dashboard load so the panel shows where you left off."""
+    """Loads (or creates, if none exists yet) the most recently used conversation --
+    called on dashboard load so the panel shows where you left off."""
     from app import CHAT_STORAGE_DIR, _call_chat, _chat_roots, instances_dir
     from chat_sessions import get_active_session, PROVIDER_LOCAL
     session = _call_chat(get_active_session, CHAT_STORAGE_DIR, _chat_roots(),
@@ -31,15 +31,48 @@ def api_chat_active():
 
 @chat_bp.route("/api/chat/new", methods=["POST"])
 def api_chat_new():
-    """Starts a fresh conversation, ending whatever's currently active. Body:
-    {provider?, model?, effort?} -- same _discuss_provider_args fallback (local by
-    default) every other Discuss-family start route already uses."""
+    """Starts a fresh conversation alongside the existing ones (it no longer ends the
+    active one -- POST /api/chat/<id>/close does that). Body: {provider?, model?,
+    effort?} -- same _discuss_provider_args fallback (local by default) every other
+    Discuss-family start route already uses."""
     from app import CHAT_STORAGE_DIR, _call_chat, _chat_roots, _discuss_provider_args, instances_dir
     from chat_sessions import start_new_conversation
     provider, model, effort = _discuss_provider_args()
     session = _call_chat(start_new_conversation, CHAT_STORAGE_DIR, _chat_roots(),
                            instances_dir(), provider=provider, model=model, effort=effort)
     return jsonify(session)
+
+
+@chat_bp.route("/api/chat/sessions", methods=["GET"])
+def api_chat_sessions():
+    """Every active conversation as a summary row, most recently used first -- the
+    workspace's session switcher (multi-chat design doc, Phase 1)."""
+    from app import CHAT_STORAGE_DIR
+    from chat_sessions import list_sessions
+    return jsonify(list_sessions(CHAT_STORAGE_DIR))
+
+
+@chat_bp.route("/api/chat/<session_id>/close", methods=["POST"])
+def api_chat_close(session_id):
+    """Ends one conversation. 404 if it does not exist or is already ended. A reserved
+    session's reservation is released first (best-effort) so closing a chat never
+    leaves the reasoning model held for a conversation nobody can reach."""
+    from app import CHAT_STORAGE_DIR
+    from chat_sessions import end_session, get_session
+    session = get_session(CHAT_STORAGE_DIR, session_id)
+    if not session or session.get("status") != "active":
+        abort(404)
+    if session.get("reserved"):
+        from internal_api_client import InternalApiError, reserve as internal_reserve
+        import ollama_client
+        try:
+            internal_reserve(session_id, ollama_client.MODEL, False)
+        except InternalApiError as e:  # noqa: BLE001 -- never block closing a chat on this
+            print(f"[chat-close] reservation release failed (non-fatal): {e}", file=sys.stderr, flush=True)
+    ended = end_session(CHAT_STORAGE_DIR, session_id)
+    if not ended:
+        abort(404)
+    return jsonify(ended)
 
 
 @chat_bp.route("/api/chat/inject", methods=["POST"])
@@ -242,21 +275,19 @@ def api_chat_template_save(session_id):
     outcome (saved, or why not) is persisted on the proposal so it survives a reload, and
     the updated session comes back so the UI renders it."""
     from app import CHAT_STORAGE_DIR
-    from chat_sessions import get_session, _read_sessions, _write_sessions
+    from chat_sessions import get_session, _write_session
     import template_store
     body = request.get_json(silent=True) or {}
     try:
         entry, index = int(body["entry"]), int(body["index"])
     except (KeyError, TypeError, ValueError):
         abort(400, description="entry and index are required integers")
-    sessions = _read_sessions(CHAT_STORAGE_DIR)
-    session = sessions.get(session_id)
+    session = get_session(CHAT_STORAGE_DIR, session_id)
     if not session or session.get("status") != "active":
         abort(404)
     try:
         prop = template_store.save_proposal(session, entry, index, body.get("key"), body.get("text"))
     except LookupError:
         abort(404, description="no such template proposal")
-    sessions[session_id] = session
-    _write_sessions(CHAT_STORAGE_DIR, sessions)
+    _write_session(CHAT_STORAGE_DIR, session)
     return jsonify({"session": session, "proposal": prop})

@@ -112,5 +112,59 @@ class MessageRouteErrorTest(RouteTestBase):
         self.assertEqual(transcript[-2]["text"], "hello")
 
 
+class SessionListAndCloseRouteTest(RouteTestBase):
+    def setUp(self):
+        super().setUp()
+        older = _session([{"role": "user", "text": "first chat"}])
+        older.update(id="chat-1-aaaaaaaa", startedAt="2026-10-18T09:00:00Z", lastActivityAt="2026-10-18T09:05:00Z")
+        newer = _session([])
+        newer.update(id="chat-2-bbbbbbbb", startedAt="2026-10-18T10:00:00Z", lastActivityAt=None)
+        ended = _session([])
+        ended.update(id="chat-3-cccccccc", status="ended", startedAt="2026-10-18T11:00:00Z")
+        chat_sessions._write_sessions(self.storage, {s["id"]: s for s in (older, newer, ended)})
+
+    def test_sessions_lists_active_sessions_most_recent_first(self):
+        resp = self.client.get("/api/chat/sessions")
+        self.assertEqual(resp.status_code, 200)
+        rows = resp.get_json()
+        self.assertEqual([r["id"] for r in rows], ["chat-2-bbbbbbbb", "chat-1-aaaaaaaa"])
+        self.assertEqual(rows[1]["title"], "first chat")
+        for key in ("id", "title", "provider", "model", "startedAt", "lastActivityAt", "turnCount", "busy"):
+            self.assertIn(key, rows[0])
+
+    def test_close_ends_one_session_and_leaves_the_others(self):
+        resp = self.client.post("/api/chat/chat-1-aaaaaaaa/close")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["status"], "ended")
+        self.assertEqual(chat_sessions.get_session(self.storage, "chat-1-aaaaaaaa")["status"], "ended")
+        self.assertEqual(chat_sessions.get_session(self.storage, "chat-2-bbbbbbbb")["status"], "active")
+        self.assertEqual([r["id"] for r in self.client.get("/api/chat/sessions").get_json()], ["chat-2-bbbbbbbb"])
+
+    def test_close_unknown_or_already_ended_is_404(self):
+        self.assertEqual(self.client.post("/api/chat/chat-9-ffffffff/close").status_code, 404)
+        self.assertEqual(self.client.post("/api/chat/chat-3-cccccccc/close").status_code, 404)
+
+    def test_close_releases_a_reservation_first(self):
+        s = chat_sessions.get_session(self.storage, "chat-1-aaaaaaaa")
+        s["reserved"] = True
+        chat_sessions._write_session(self.storage, s)
+        import internal_api_client
+        with mock.patch.object(internal_api_client, "reserve") as reserve:
+            resp = self.client.post("/api/chat/chat-1-aaaaaaaa/close")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(reserve.call_args[0][0], "chat-1-aaaaaaaa")
+        self.assertIs(reserve.call_args[0][2], False)
+
+    def test_new_no_longer_ends_the_active_session(self):
+        resp = self.client.post("/api/chat/new", json={"provider": "claude"})
+        self.assertEqual(resp.status_code, 200)
+        new_id = resp.get_json()["id"]
+        ids = [r["id"] for r in self.client.get("/api/chat/sessions").get_json()]
+        self.assertEqual(ids[0], new_id)
+        self.assertIn("chat-1-aaaaaaaa", ids)
+        self.assertIn("chat-2-bbbbbbbb", ids)
+        self.assertEqual(self.client.get("/api/chat/active").get_json()["id"], new_id)
+
+
 if __name__ == "__main__":
     unittest.main()
