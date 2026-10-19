@@ -37,6 +37,7 @@ import claude_client
 import local_tool_client
 import model_stats_client
 import ollama_client
+import template_store
 
 PROVIDER_LOCAL = "local"
 PROVIDER_CLAUDE = "claude"
@@ -324,7 +325,17 @@ _LOCAL_SYSTEM_PROMPT = (
     "tight -- never pad it. It becomes a durable, cross-referenced record of this "
     "conversation that survives even after older turns are trimmed from what you can "
     "see, so a wrong or invented TASK-REF actively misleads a later reader -- only name "
-    "a task you actually discussed."
+    "a task you actually discussed.\n\n"
+    "Also: you can PROPOSE a reusable template for the user to save with one click. Only "
+    "when the user asks you to create or save a template/scene, end the reply (before the "
+    "CONTEXT-LOG block) with exactly:\n"
+    "SAVE-TEMPLATE: scene | <short lowercase name>\n"
+    "<one paragraph of comma-separated image-generation tags: setting first, then props, "
+    "then lighting/mood>\n"
+    "END-TEMPLATE\n"
+    "The chat shows it as a card with a Save button -- you cannot and must not write the "
+    "file yourself. Never claim a template is saved; the user saves it. Do not wrap the "
+    "block in a code fence."
 )
 
 
@@ -411,6 +422,8 @@ def _build_local_messages(session: dict, message: str) -> list:
             })
     recent = transcript[len(transcript) - CHAT_RECENT_TURNS_KEPT:] if trimmed_count else transcript
     for turn in recent:
+        if turn.get("error"):
+            continue  # recorded failure notices are for the human, never replayed to the model
         role = "assistant" if turn["role"] == "assistant" else "user"
         messages.append({"role": role, "content": turn["text"]})
     messages.append({"role": "user", "content": message})
@@ -556,7 +569,12 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
     # path (no result_box there) and for the rare case _stream_local ran into an error
     # before ever setting it.
     final_text = result_box.get("final_text")
-    session["transcript"][-1]["text"] = (final_text if final_text is not None else "".join(reply_parts)).strip()
+    reply = (final_text if final_text is not None else "".join(reply_parts)).strip()
+    # SAVE-TEMPLATE blocks become Save-button proposals (template_store.py); never auto-saved.
+    reply, proposals = template_store.extract_proposals(reply)
+    session["transcript"][-1]["text"] = reply.strip()
+    if proposals:
+        session["transcript"][-1]["templates"] = proposals
     sessions[session_id] = session
     _write_sessions(storage_dir, sessions)
     yield {"type": "final", "session": session}
@@ -580,6 +598,32 @@ def inject_user_message(storage_dir: Path, session_id: str, text: str):
     if not session or session.get("status") != "active":
         return None
     session["transcript"].append({"role": "user", "text": text, "timestamp": _now_iso()})
+    sessions[session_id] = session
+    _write_sessions(storage_dir, sessions)
+    return session
+
+
+def record_turn_error(storage_dir: Path, session_id: str, error_text: str):
+    """Persists a failed turn's error INTO the transcript so it survives the toast.
+
+    stream_message() writes an empty assistant placeholder before the model runs; when
+    the turn then raises, that placeholder used to stay empty and the only trace of the
+    failure was a 3-second toast. This fills the trailing assistant entry (or appends a
+    new one) with the error and flags it `error: True` so the UI can style it and the
+    local-model replay can skip it. Returns the updated session or None."""
+    sessions = _read_sessions(storage_dir)
+    session = sessions.get(session_id)
+    if not session or session.get("status") != "active":
+        return None
+    text = f"Error: {error_text}"
+    transcript = session["transcript"]
+    last = transcript[-1] if transcript else None
+    if last and last["role"] == "assistant" and not last.get("error"):
+        partial = (last.get("text") or "").strip()
+        last["text"] = f"{partial}\n\n{text}" if partial else text
+        last["error"] = True
+    else:
+        transcript.append({"role": "assistant", "text": text, "timestamp": _now_iso(), "error": True})
     sessions[session_id] = session
     _write_sessions(storage_dir, sessions)
     return session
