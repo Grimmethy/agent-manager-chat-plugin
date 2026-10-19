@@ -311,9 +311,10 @@ class RecordTurnErrorTest(unittest.TestCase):
 
     def test_unknown_session_returns_none_and_writes_nothing(self):
         sid = self._store([{"role": "user", "text": "hi"}])
-        before = chat_sessions.chat_sessions_path(self.storage).read_text(encoding="utf-8")
+        sdir = chat_sessions.sessions_dir(self.storage)
+        before = {p.name: p.read_text(encoding="utf-8") for p in sdir.iterdir()}
         self.assertIsNone(chat_sessions.record_turn_error(self.storage, "chat-no-such-id", "boom"))
-        self.assertEqual(chat_sessions.chat_sessions_path(self.storage).read_text(encoding="utf-8"), before)
+        self.assertEqual({p.name: p.read_text(encoding="utf-8") for p in sdir.iterdir()}, before)
         self.assertEqual(len(self._stored(sid)), 1)
 
     def test_ended_session_returns_none_and_writes_nothing(self):
