@@ -187,7 +187,7 @@ class ChatPane {
     this.providerBtn.className = 'secondary provider-toggle';
     this.providerBtn.title = 'Local model vs. your Claude subscription -- click to switch';
     this.providerContainer.appendChild(this.providerBtn);
-    this.renderProviderToggle();
+    this.syncProviderToggle();
     this.providerBtn.onclick = async (e) => {
       e.stopPropagation();
       if (this.isSending) {
@@ -195,7 +195,7 @@ class ChatPane {
         return;
       }
       this.providerChoice = this.providerChoice === 'local' ? 'claude' : 'local';
-      this.renderProviderToggle();
+      this.syncProviderToggle();
       await this.startNew();
     };
 
@@ -225,7 +225,7 @@ class ChatPane {
     this.onSessionChange(session);
   }
 
-  renderProviderToggle() {
+  syncProviderToggle() {
     const claude = this.providerChoice === 'claude';
     this.providerBtn.dataset.provider = this.providerChoice;
     this.providerBtn.textContent = providerButtonLabel(this.providerChoice);
@@ -467,7 +467,7 @@ class ChatPane {
     const session = this.session;
     if (session && session.provider && this.providerChoice !== session.provider) {
       this.providerChoice = session.provider;
-      this.renderProviderToggle();
+      this.syncProviderToggle();
     }
 
     const showReserve = !!session && session.provider === 'local';
