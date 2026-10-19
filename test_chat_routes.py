@@ -155,6 +155,21 @@ class SessionListAndCloseRouteTest(RouteTestBase):
         self.assertEqual(reserve.call_args[0][0], "chat-1-aaaaaaaa")
         self.assertIs(reserve.call_args[0][2], False)
 
+    def test_get_returns_the_full_session(self):
+        resp = self.client.get("/api/chat/chat-1-aaaaaaaa")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body["id"], "chat-1-aaaaaaaa")
+        self.assertEqual(body["transcript"], [{"role": "user", "text": "first chat"}])
+
+    def test_get_unknown_or_ended_is_404(self):
+        self.assertEqual(self.client.get("/api/chat/chat-9-ffffffff").status_code, 404)
+        self.assertEqual(self.client.get("/api/chat/chat-3-cccccccc").status_code, 404)
+
+    def test_get_does_not_shadow_the_fixed_routes(self):
+        self.assertIsInstance(self.client.get("/api/chat/sessions").get_json(), list)
+        self.assertEqual(self.client.get("/api/chat/active").get_json()["id"], "chat-2-bbbbbbbb")
+
     def test_new_no_longer_ends_the_active_session(self):
         resp = self.client.post("/api/chat/new", json={"provider": "claude"})
         self.assertEqual(resp.status_code, 200)
