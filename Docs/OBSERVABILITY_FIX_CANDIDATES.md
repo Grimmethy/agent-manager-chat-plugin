@@ -114,3 +114,37 @@ Replace the bare `except OSError: pass` with `except OSError as exc:` and emit a
 
 Benefits:
 An operator (or CI log collector, cron mail spool, or agent-manager shell that captures `stderr`) will see a single, context-rich warning line naming the exact directory and the OS-level reason the write failed, instead of a silent `0` exit with a stale snapshot. The statusline display path is unaffected—`print(status_text(payload))` still executes unconditionally—so the primary user-facing output is never blocked by a persistence hiccup. The fix is a two-line change (plus the import) and introduces no new dependency or behavioral contract beyond surfacing an error that was previously invisible.
+
+### AC-6 · Silent LookupError swallow in template-save route
+Strength: Strong
+Files: routes/chat.py
+Snippet:
+```
+    body = request.get_json(silent=True) or {}
+    try:
+        entry, index = int(body["entry"]), int(body["index"])
+    except (KeyError, TypeError, ValueError):
+        abort(400, description="entry and index are required integers")
+    session = get_session(CHAT_STORAGE_DIR, session_id)
+    if not session or session.get("status") != "active":
+```
+
+Problem:
+In the provided source (routes/chat.py, lines 323-342), the `except LookupError:` clause on line 342 carries no body — the source ends at the colon. The `try` block calls `template_store.save_proposal(session, entry, index, body.get("key"), body.get("text"))`, and when that call raises `LookupError` (the natural signal for an invalid `entry` or `index` pointing at a non-existent transcript entry or proposal), the handler discards the exception with no log, no re-raise, and no response. Control falls through to the end of `api_chat_template_save`, which returns `None`. Flask will attempt to serialise `None` as a response body, producing either an empty 200 or a 500 with no diagnostic context. The UI Save button receives no indication of why the save failed, and the server log records nothing, so the failure is invisible to both the user and operators.
+
+Solution:
+Give the `except LookupError:` clause a body that (1) logs the failure with enough context to identify the offending request — `session_id`, `entry`, `index`, and the exception message — using the stdlib `logging` module already available in this project, and (2) calls Flask's `abort(404, description=...)` so the caller receives a meaningful HTTP error instead of a silent `None` return. Concretely, replace the bare `except LookupError:` with:
+
+```python
+    except LookupError as e:
+        logging.error(
+            "save_proposal failed: session=%s entry=%s index=%s: %s",
+            session_id, entry, index, e,
+        )
+        abort(404, description="Proposal not found for the given entry/index")
+```
+
+This uses only primitives already present in the project (stdlib `logging`, Flask `abort`) and requires no new dependency.
+
+Benefits:
+Operators can now see, in the server log, exactly which session, transcript entry, and proposal index triggered the lookup failure and why, turning an invisible failure into a traceable event. The UI Save button receives a 404 with a human-readable description, so the user learns the save did not happen and why, rather than seeing a blank or error-free response. Both the "silent 500 / empty 200" failure mode and the "no log line at all" observability gap are closed with a two-line change.
