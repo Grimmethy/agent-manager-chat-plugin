@@ -197,3 +197,47 @@ Add a one-line comment at each `try/except` site explaining the intent (e.g., "R
 
 Benefits:
 The severity distinction becomes self-documenting and resistant to accidental "fixes." Reviewers can verify at a glance that a change preserves the intended fatal/non-fatal contract, and new contributors understand the design rationale without archaeology.
+
+### AC-15 · AC-2a – Add public `save_template` function to chat_sessions.py
+Strength: Strong
+Split-Depth: 1
+Files: chat_sessions.py
+
+Problem:
+The route `api_chat_template_save` in routes/chat.py currently imports the private `_write_session` function across the module boundary (`from chat_sessions import get_session, _write_session`) and pairs it with a direct `template_store.save_proposal(...)` call. This leaks an internal persistence helper into the routing layer. The module `chat_sessions.py` already imports `template_store` at the top level and already defines `_write_session(storage_dir: Path, session: dict)` as a module-level function, so both pieces needed to encapsulate the save-and-flush sequence are already reachable within the module. No public function currently exists that combines the logical mutation (saving the proposal) with the persistence flush (writing the session file).
+
+Solution:
+Add a new public module-level function `save_template(storage_dir: Path, session: dict, entry: int, index: int, key=None, text=None)` in chat_sessions.py, placed near the other public entry points (`get_session`, `inject_user_message`, `record_turn_error`). Its body calls `template_store.save_proposal(session, entry, index, key, text)` (which may raise `LookupError` if the proposal is not found), then calls `_write_session(storage_dir, session)` to flush the mutated session to disk, and returns the proposal object. The function's docstring states: 'Persists a template proposal for the given session and flushes the session to storage. Raises LookupError if the proposal does not exist.' No existing function is modified; `_write_session` remains private and unchanged. The new function is the only addition to the file.
+
+Benefits:
+Provides a single public API surface for the save-and-flush operation, eliminating the need for any external module to reach into `_write_session`. Keeps the persistence mechanism (atomic temp-file write via `os.replace`) fully internal to chat_sessions.py. The function is small, testable in isolation, and follows the same module-level-function style already used by `get_session`, `inject_user_message`, and `record_turn_error` in the same file.
+
+### AC-16 · AC-2b – Replace cross-module `_write_session` import in routes/chat.py with `save_template`
+Strength: Strong
+Split-Depth: 1
+Files: routes/chat.py
+Depends-On: AC-15
+
+Problem:
+The `api_chat_template_save` route currently imports the private `_write_session` from chat_sessions (`from chat_sessions import get_session, _write_session`) and also does `import template_store` solely to call `template_store.save_proposal(...)` before calling `_write_session(CHAT_STORAGE_DIR, session)`. This crosses the module boundary into a private helper and duplicates the save-and-flush orchestration that belongs in the session module. After AC-2a lands, a public `save_template` function exists in chat_sessions.py that encapsulates both steps.
+
+Solution:
+In `api_chat_template_save`, change the import line from `from chat_sessions import get_session, _write_session` to `from chat_sessions import get_session, save_template`. Remove the `import template_store` line (it is no longer needed in this route). Replace the two-step sequence:
+
+    try:
+        prop = template_store.save_proposal(session, entry, index, body.get("key"), body.get("text"))
+    except LookupError:
+        abort(404, description="no such template proposal")
+    _write_session(CHAT_STORAGE_DIR, session)
+
+with a single call:
+
+    try:
+        prop = save_template(CHAT_STORAGE_DIR, session, entry, index, body.get("key"), body.get("text"))
+    except LookupError:
+        abort(404, description="no such template proposal")
+
+The `LookupError` is still raised by `template_store.save_proposal` inside `save_template` before `_write_session` is reached, so the route's error handling is unchanged. The HTTP response (`jsonify({"session": session, "proposal": prop})`), status codes, and all other logic in the route remain identical. No other route in the visible portion of routes/chat.py references `_write_session` or `template_store` for this purpose.
+
+Benefits:
+Eliminates the cross-module import of a private helper. The routing layer now depends only on the public API of chat_sessions. If the internal write mechanism changes (e.g., a different flush strategy), only chat_sessions.py needs updating. The route becomes shorter and its intent clearer: one call to save the template, one catch for the not-found case.
