@@ -228,18 +228,18 @@ def api_chat_message(session_id):
     # kills both worker lanes' in-flight draft (chat precludes workers), the reviewer's
     # only if < ~3 min in -- see chat_preempt.py's original header in the core repo for
     # the full rationale, and no-ops server-side if AGENT_MANAGER_CHAT_PREEMPT=false.
-    # Synchronous, before the SSE generator runs. Claude-provider turns don't touch the
-    # local model, so this is skipped entirely for them. The internal API's own
-    # /local-turn route separately holds the priority marker for the WHOLE call (not
-    # just this preempt step) -- this repo no longer needs single_flight_lock at all for
-    # the local-provider path; local_tool_client.stream_plan_with_tools() below reaches
-    # that same route.
-    preempted = []
-    if is_local_turn:
-        try:
-            preempted = internal_preempt()
-        except InternalApiError as e:  # noqa: BLE001 -- never block a chat turn on this
-            print(f"[chat-preempt] failed (non-fatal): {e}", file=sys.stderr, flush=True)
+    # 2026-09-16 -- this call now runs LAZILY inside generate() below, not here: it
+    # wraps a requests.post with a 20s timeout (internal_api_client.preempt), and run
+    # synchronously before the SSE generator started it made the user stare at a blank
+    # screen for up to 20 s with zero feedback whenever the core dashboard was slow
+    # (e.g. a heavy worker lane). Now the response object is handed to the client
+    # immediately and the preempt step is the generator's first step -- its result
+    # (or an error frame) is the first SSE frame. Still non-fatal on failure, as before.
+    # Claude-provider turns don't touch the local model, so this is skipped entirely
+    # for them. The internal API's own /local-turn route separately holds the priority
+    # marker for the WHOLE call (not just this preempt step) -- this repo no longer
+    # needs single_flight_lock at all for the local-provider path;
+    # local_tool_client.stream_plan_with_tools() below reaches that same route.
 
     def generate():
         from chat_sessions import record_turn_error
@@ -253,8 +253,17 @@ def api_chat_message(session_id):
                 print(f"[chat-error-record] failed: {werr}", file=sys.stderr, flush=True)
             return f"data: {json.dumps({'type': 'error', 'error': msg})}\n\n"
 
-        if preempted:
-            yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
+        # Local-provider turns: make GPU space FIRST, as the very first step of the
+        # stream (see the rationale comment above -- this used to run before the SSE
+        # response was created, a synchronous 20s worst-case hang with no feedback).
+        if is_local_turn:
+            try:
+                preempted = internal_preempt()
+                if preempted:
+                    yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
+            except InternalApiError as e:  # noqa: BLE001 -- never block a chat turn on this
+                print(f"[chat-preempt] failed (non-fatal): {e}", file=sys.stderr, flush=True)
+                yield f"data: {json.dumps({'type': 'error', 'error': f'preempt failed (non-fatal): {e}'})}\n\n"
         try:
             for event in stream_message(CHAT_STORAGE_DIR, session_id, message):
                 yield f"data: {json.dumps(event)}\n\n"
