@@ -197,3 +197,32 @@ Add a one-line comment at each `try/except` site explaining the intent (e.g., "R
 
 Benefits:
 The severity distinction becomes self-documenting and resistant to accidental "fixes." Reviewers can verify at a glance that a change preserves the intended fatal/non-fatal contract, and new contributors understand the design rationale without archaeology.
+
+### AC-24 · Align stream_local_turn error contract: raise InternalApiError instead of yielding an error frame
+Strength: Strong
+Split-Depth: 1
+Files: internal_api_client.py
+
+Problem:
+stream_local_turn currently catches requests.RequestException and yields {"type": "error", "error": ...} as a normal generator item. The caller chain (chat_sessions.stream_message → local_tool_client.stream_plan_with_tools via yield from → routes/chat.py's generate()) expects transport failures to surface as exceptions so that the except (ClaudeClientError, LocalToolClientError) clause in routes/chat.py can invoke record_turn_error and persist the failure into the transcript. A yielded error-dict bypasses that handler entirely: it is serialised as a data: SSE frame to the browser, but record_turn_error is never called, so the error does not land in the session JSON. Additionally, the bare except json.JSONDecodeError: continue silently swallows malformed frames with no log, making mid-stream protocol violations invisible in server logs.
+
+Solution:
+In stream_local_turn, replace the trailing except requests.RequestException as e: yield {"type": "error", ...} with raise InternalApiError(f"internal API local-turn call failed: {e}") from e. This causes the exception to propagate through local_tool_client.stream_plan_with_tools (which uses yield from stream_local_turn(...)) and be caught by routes/chat.py's existing except (ClaudeClientError, LocalToolClientError) clause, because local_tool_client.py re-exports InternalApiError under the name LocalToolClientError (from internal_api_client import InternalApiError as LocalToolClientError). For the json.JSONDecodeError branch, replace the bare continue with a logged skip: import logging at module level (or use the existing print-to-stderr pattern seen elsewhere in the codebase) and emit a one-line warning including the offending line, then continue. This preserves the stream for a single malformed frame while making the event visible in server logs.
+
+Benefits:
+Transport failures now flow through the established exception-based error path: record_turn_error persists the message into the transcript, the browser receives a well-formed error SSE frame via the fail() helper, and the session state is consistent. Malformed frames are no longer silently discarded. No changes are required in routes/chat.py or local_tool_client.py for the exception to be caught and handled correctly.
+
+### AC-25 · Document the exception contract on local_tool_client.stream_plan_with_tools
+Strength: Strong
+Split-Depth: 1
+Files: local_tool_client.py
+Depends-On: AC-24
+
+Problem:
+stream_plan_with_tools's docstring currently reads: 'Same generator contract the in-tree/Phase-1 version had: yields {"type": "chunk", ...} as text arrives, then exactly one {"type": "final", ...}.' It says nothing about what happens on transport failure. After candidate 0 lands, stream_local_turn will raise InternalApiError (re-exported here as LocalToolClientError) on connection errors, timeouts, and non-2xx responses. A reader of this module has no way to know the function can raise without reading internal_api_client.py. This is the public entry point that chat_sessions.stream_message calls, so the contract belongs here.
+
+Solution:
+Extend the stream_plan_with_tools docstring with an explicit Raises section: 'Raises: LocalToolClientError -- if the core-dashboard HTTP call fails (connection refused, timeout, non-2xx status). This is the same class as internal_api_client.InternalApiError, re-exported under this name for callers that import from local_tool_client.' Also add a one-line note to the module-level docstring clarifying that the streaming path propagates exceptions rather than yielding error frames, so that the 'Thin compatibility shim' framing is not misread as implying the function swallows or re-encodes failures.
+
+Benefits:
+Callers (chat_sessions, routes/chat.py) and future contributors can see the exception contract at the point of use without cross-referencing internal_api_client.py. Prevents a future refactor from accidentally re-introducing a yield-error pattern in this shim, since the docstring now explicitly states the raise-based contract.
