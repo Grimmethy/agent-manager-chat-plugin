@@ -22,3 +22,26 @@ Replace the bare `pass` with a `logger.warning` call that records the exception 
 
 Benefits:
 Once the log line is in place, every time the SSE relay stream ends abnormally, the server log records *what* exception occurred and *why*, so an operator can immediately tell a routine agent restart (e.g. `ConnectionError: Remote end closed connection without response`) apart from a real problem (e.g. `ChunkedEncodingError: Invalid chunk header` or a `Timeout` on a specific read). This turns an invisible, silent failure mode into a greppable, debuggable event without changing any runtime behavior, adding any dependency, or altering the SSE reconnect contract the docstring promises.
+
+### AC-2 · SSE relay silently swallows upstream stream errors
+Strength: Strong
+Files: routes/chat.py
+Snippet:
+```
+    def relay():
+        try:
+            yield from agent_client.filter_events(agent_client.iter_chunks(upstream))
+        except (requests.RequestException, OSError):
+            pass
+        finally:
+            upstream.close()
+```
+
+Problem:
+Inside the `relay()` generator in routes/chat.py, the `except (requests.RequestException, OSError): pass` clause discards the exception object entirely. The docstring confirms the intent is to let the stream end so the browser's EventSource can reconnect, and the `finally: upstream.close()` releases the socket, so the control flow is correct. However, the exception itself is never referenced, logged, or recorded anywhere. If the upstream agent is persistently unreachable or the network path is broken, every SSE stream will silently terminate, the browser will silently reconnect, and the next stream will silently terminate again — producing zero server-side log entries. With no metrics system in this project, the stdlib `logging` module is the only available observability channel, and this code path uses none of it. An operator investigating a broken agent at 3 a.m. would see nothing in the logs.
+
+Solution:
+Add `import logging` at the top of routes/chat.py (alongside the existing imports) and a module-level `logger = logging.getLogger(__name__)`. Inside the `relay()` generator, change the bare `except (requests.RequestException, OSError): pass` to `except (requests.RequestException, OSError) as exc:` followed by a single `logger.warning("SSE relay: upstream agent stream ended with error: %s", exc, exc_info=True)`. The `finally: upstream.close()` line is unchanged. No re-raise (would break the SSE contract by turning a clean stream-end into a 500 mid-body), no new dependency, no metric emission.
+
+Benefits:
+A persistent upstream failure now produces a repeating, timestamped, greppable `WARNING` line in the server log with the exception type, message, and full traceback (via `exc_info=True`). An operator can immediately distinguish "agent is down" from "client disconnected" and see the root-cause exception. The fix is a single log statement; control flow, the SSE contract, and resource cleanup are all unchanged.
