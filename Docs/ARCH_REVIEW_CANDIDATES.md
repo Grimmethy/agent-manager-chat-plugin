@@ -197,3 +197,45 @@ Add a one-line comment at each `try/except` site explaining the intent (e.g., "R
 
 Benefits:
 The severity distinction becomes self-documenting and resistant to accidental "fixes." Reviewers can verify at a glance that a change preserves the intended fatal/non-fatal contract, and new contributors understand the design rationale without archaeology.
+
+### AC-17 · Document idempotency and atomicity contract on set_reserved
+Strength: Strong
+Split-Depth: 1
+Files: chat_sessions.py
+
+Problem:
+set_reserved currently reads the session, sets session["reserved"] = reserved, and calls _write_session. The function is already idempotent (calling it twice with the same value converges to the same state without raising) and _write_session already performs an atomic write (tempfile.mkstemp + os.replace). However, nothing in the docstring or code signals this contract to callers. The AC-4 divergence scenario (server-side reservation live, local flag not set) means an operator or future code will retry set_reserved after a partial failure, and there is no documented guarantee that the retry is safe. A future engineer refactoring or wrapping this function has no basis to assume retry-safety.
+
+Solution:
+Extend the existing docstring of set_reserved (currently: "Just the persisted flag -- app.py's reservation registry owns actually acquiring/releasing the lock and the idle-timeout watchdog; this only keeps the dashboard's own display of 'is this session reserved' in sync with that.") with two additional lines: (1) an explicit idempotency contract statement -- "Calling this more than once with the same reserved value is a safe no-op; the final persisted state is identical regardless of how many times it is invoked." (2) An atomicity note -- "Persistence is atomic (tempfile + os.replace in _write_session), so a concurrent reader never observes a half-written session file." No behavioural code change is needed; the function body and _write_session already satisfy both properties. This is a documentation-only edit to the docstring string literal.
+
+Benefits:
+Any future caller (the reconciliation endpoint, a retry wrapper, an operator script) can rely on set_reserved being retry-safe without re-reading the implementation. The AC-4 reconciliation path (sub-candidate below) and any compensating logic can call it idempotently without a separate guard. Removes the plan's "UNKNOWN whether it currently is" flag on atomicity with a verified, in-code statement.
+
+### AC-18 · Add AC4_DIVERGENCE structured logging and operational note to api_chat_reserve
+Strength: Strong
+Split-Depth: 1
+Files: routes/chat.py
+
+Problem:
+In api_chat_reserve, the call sequence is: internal_reserve(session_id, ollama_client.MODEL, want_on) succeeds, then set_reserved(CHAT_STORAGE_DIR, session_id, want_on) is called with no surrounding try/except. If set_reserved raises (disk full, permission error, JSON corruption), the server-side reservation is LIVE but the local session file was never updated. The exception propagates as an unstructured 500 with no log entry that identifies the divergence, making it invisible to operators until a user reports a stuck reservation. There is also no in-code note explaining the known limitation (no compensating release in the error path) or the reconciliation path, so the next engineer touching this function has no context for the gap.
+
+Solution:
+In api_chat_reserve, wrap the existing line `session = set_reserved(CHAT_STORAGE_DIR, session_id, want_on)` in a try/except Exception block. In the except clause: (1) log at ERROR level using the standard library logging module (or the existing print-to-stderr pattern used elsewhere in this file, e.g. `print(f"[chat-close] reservation release failed (non-fatal): {e}", file=sys.stderr, flush=True)`), with the message containing the stable tag `AC4_DIVERGENCE`, the session_id, ollama_client.MODEL, the exception type and message, and the human-readable note "Server-side reservation is LIVE but local chat_sessions state was NOT updated. Manual reconciliation required." (2) Re-raise the exception so Flask still returns 500 (no behaviour change). Above the try/except, add a 3-line comment block stating: the known limitation (no compensating release call in this error path), the reconciliation path (use the /reserve/reconcile endpoint), and the longer-term fix (wire internal_reserve(session_id, model, False) -- the same call api_chat_close already uses -- into this except block, or reorder so local state is set first and the remote call is retried asynchronously). Note: the plan assumed no release API exists, but api_chat_close in this same file already calls `internal_reserve(session_id, ollama_client.MODEL, False)` to release; the longer-term fix can use that existing call without modifying internal_api_client.py.
+
+Benefits:
+Operators can grep for `AC4_DIVERGENCE` in stderr/logs to find every instance where server and local state diverged, with enough context (session_id, model, exception) to act immediately. The in-code comment makes the known gap and its reconciliation path visible to anyone reading api_chat_reserve, preventing the issue from being re-discovered from scratch. No behavioural change to the happy path or the 500 response shape.
+
+### AC-19 · Add POST /api/chat/<session_id>/reserve/reconcile admin endpoint
+Strength: Strong
+Split-Depth: 1
+Files: routes/chat.py
+
+Problem:
+When AC4_DIVERGENCE occurs (server-side reservation live, local flag stale), there is no in-app way to reconcile the local state. An operator must hand-edit the session JSON file in .agent-manager-chat-sessions/<id>.json, which is error-prone and bypasses the _write_session atomicity guarantee. The plan's step 3 calls for an admin endpoint that lets the operator choose which side to trust. The existing codebase has no admin/auth decorator pattern in routes/chat.py (all routes are unauthenticated), so the endpoint should follow the same convention (no additional auth layer) but be clearly named and documented as an operator-only action.
+
+Solution:
+Add a new route in routes/chat.py: `@chat_bp.route("/api/chat/<session_id>/reserve/reconcile", methods=["POST"])` with function `api_chat_reserve_reconcile(session_id)`. Body: `{"action": "force_local_reserved" | "force_local_unreserved"}`. Behaviour: (1) Validate action is one of the two strings; if not, abort(400). (2) Look up the session via `get_session(CHAT_STORAGE_DIR, session_id)`; if missing or not active, abort(404). (3) For `force_local_reserved`: call `set_reserved(CHAT_STORAGE_DIR, session_id, True)` (idempotent per the contract documented in chat_sessions.py). For `force_local_unreserved`: call `set_reserved(CHAT_STORAGE_DIR, session_id, False)`, AND also call `internal_reserve(session_id, ollama_client.MODEL, False)` in a best-effort try/except (mirroring the exact pattern in api_chat_close: `try: internal_reserve(session_id, ollama_client.MODEL, False) except InternalApiError as e: print(...)`). This is safe because api_chat_close already uses this call as a release; no new method in internal_api_client.py is needed. (4) Log the reconciliation at WARNING level with the session_id, the action taken, and (for force_local_unreserved) a note that the server-side release was best-effort. (5) Return `jsonify(session)` with the resulting local state so the operator can confirm. Add a docstring noting this is an operator-only reconciliation path for AC4_DIVERGENCE events and that force_local_unreserved does NOT guarantee the server-side reservation is released (the internal_reserve call is best-effort, same as api_chat_close).
+
+Benefits:
+Operators can fix a divergence from the dashboard or a curl command without touching the filesystem directly. The force_local_unreserved path releases the server-side reservation using the same existing call api_chat_close already makes, closing the loop without modifying internal_api_client.py. The endpoint is small, follows the file's existing patterns (lazy imports, abort codes, jsonify), and is independently testable (mock set_reserved and internal_reserve, assert 200/400/404 responses).
