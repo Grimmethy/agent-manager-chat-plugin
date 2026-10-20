@@ -87,3 +87,8 @@ python3 session_agent.py [--bind 127.0.0.1] [--port 7450] [--token T | AM_AGENT_
   without a token, and with a token every request needs `Authorization: Bearer <token>`.
   Message text is never logged.
 - systemd template: `deploy/session-agent.service`.
+- Experimental: `--allow-send` enables `POST /sessions/<id>/peer-message {"text": ...}`, which
+  writes one line to the session's inbox Unix socket. The socket's wire format is
+  undocumented, so the payload is an unverified placeholder (see the `TODO(peer-message)`
+  block in `session_agent.py`). Peer messages are "not from the user" and cannot approve
+  permission prompts.

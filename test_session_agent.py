@@ -1,5 +1,6 @@
 import json
 import shutil
+import socket
 import tempfile
 import threading
 import time
@@ -188,6 +189,16 @@ class ServerCase(AgentCase):
         self.srv.shutdown()
         self.srv.server_close()
 
+    def post(self, path, body, token=None):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), method="POST")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+
     def get(self, path, token=None):
         req = urllib.request.Request(self.base + path)
         if token:
@@ -267,6 +278,59 @@ class SseTests(ServerCase):
         (self.home / "sessions" / "1002.json").unlink()
         self.agent.refresh()
         self.assertEqual(q.get(timeout=2), ("session.removed", {"id": "sess-wait"}))
+
+
+class PeerMessageTests(ServerCase):
+    def fake_socket(self, sid):
+        """Point the session's registry entry at a fake inbox socket server."""
+        path = str(Path(self.tmp) / "inbox.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        reg = self.home / "sessions" / "1001.json"
+        data = json.loads(reg.read_text())
+        data["messagingSocketPath"] = path
+        reg.write_text(json.dumps(data))
+        received = []
+
+        def serve():
+            conn, _ = srv.accept()
+            with conn:
+                received.append(conn.makefile("rb").readline())
+        threading.Thread(target=serve, daemon=True).start()
+        return received
+
+    def test_disabled_by_default(self):
+        self.start()
+        self.assertEqual(self.post("/sessions/sess-busy/peer-message", {"text": "hi"})[0], 403)
+
+    def test_delivers_one_line_to_fake_socket(self):
+        received = self.fake_socket("sess-busy")
+        self.start(allow_send=True)
+        code, body = self.post("/sessions/sess-busy/peer-message", {"text": "ping"})
+        self.assertEqual((code, body["delivered"]), (200, True))
+        self.assertIn("cannot approve permission prompts", body["note"])
+        deadline = time.time() + 2
+        while not received and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(json.loads(received[0])["text"], "ping")
+        self.assertTrue(received[0].endswith(b"\n"))
+
+    def test_errors(self):
+        self.start(allow_send=True)
+        self.assertEqual(self.post("/sessions/sess-busy/peer-message", {"text": "x"})[0], 502)  # socket absent
+        self.assertEqual(self.post("/sessions/sess-wait/peer-message", {"text": "x"})[0], 404)  # no socket path
+        self.assertEqual(self.post("/sessions/nope/peer-message", {"text": "x"})[0], 404)
+        self.assertEqual(self.post("/sessions/sess-busy/peer-message", {"text": ""})[0], 400)
+
+
+class PeerAuthTests(ServerCase):
+    token = "synthetic-test-token"
+
+    def test_post_requires_token(self):
+        self.start(allow_send=True)
+        self.assertEqual(self.post("/sessions/sess-busy/peer-message", {"text": "x"})[0], 401)
 
 
 if __name__ == "__main__":

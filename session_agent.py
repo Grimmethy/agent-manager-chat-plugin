@@ -261,6 +261,27 @@ def read_transcript(path, cursor, limit):
     return entries, nxt
 
 
+# TODO(peer-message): UNVERIFIED against a real Claude Code session. The wire format of the
+# inbox socket is undocumented. Only an optional first line {"type":"auth","token":"..."}
+# (for the session's own child processes) is documented, and the socket drops a connection that
+# has not sent a complete line within 30 s. The single JSON line below is a PLACEHOLDER, not a
+# known format. Verify against a real session before enabling --allow-send anywhere:
+#   1. the real message envelope (field names, whether "text" is right, newline framing);
+#   2. whether the socket needs the auth line for a non-child sender, and where a token comes from;
+#   3. whether it replies (ack/error) and whether it closes after one message;
+#   4. how the receiver labels the message (peer messages are "not from the user" and CANNOT
+#      approve permission prompts -- this must never be presented as a way to answer one).
+def encode_peer_message(text):
+    return (json.dumps({"type": "message", "text": text}) + "\n").encode()
+
+
+def send_peer(socket_path, text, timeout=5.0):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(socket_path)
+        s.sendall(encode_peer_message(text))
+
+
 class Hub:
     def __init__(self):
         self.lock = threading.Lock()
@@ -290,12 +311,13 @@ class Hub:
 
 class Agent:
     def __init__(self, home, windows=None, token=None, host=None, lister=run_claude_agents,
-                 alive=pid_alive, cli_ttl=2.0):
+                 alive=pid_alive, cli_ttl=2.0, allow_send=False):
         self.home, self.windows, self.token = Path(home), windows or {}, token
         self.host = host or socket.gethostname()
         self.lister, self.alive, self.cli_ttl = lister, alive, cli_ttl
         self.hub, self.lock, self.stop = Hub(), threading.Lock(), threading.Event()
-        self.rows, self.states = {}, {}
+        self.rows, self.states, self.metas = {}, {}, {}
+        self.allow_send = allow_send
         self._cli, self._cli_at = None, 0.0
 
     def discover(self):
@@ -340,9 +362,10 @@ class Agent:
         }
 
     def refresh(self):
-        new_rows, events = {}, []
+        new_rows, events, metas = {}, [], {}
         for meta in self.discover():
             sid = meta["sessionId"]
+            metas[sid] = meta
             st = self.states.setdefault(sid, TranscriptState(self.home, sid))
             entries = st.poll()
             row = self.build_row(meta, st)
@@ -356,7 +379,7 @@ class Agent:
             self.states.pop(sid, None)
             events.append(("session.removed", {"id": sid}))
         with self.lock:
-            self.rows = new_rows
+            self.rows, self.metas = new_rows, metas
         for ev in events:
             self.hub.publish(*ev)
 
@@ -417,6 +440,36 @@ class Handler(BaseHTTPRequestHandler):
             return self._transcript(parts[1], parse_qs(url.query))
         self._json(404, {"error": "not found"})
 
+    def do_POST(self):
+        if not self._authorized():
+            return self._json(401, {"error": "unauthorized"})
+        parts = [p for p in urlparse(self.path).path.split("/") if p]
+        if not (len(parts) == 3 and parts[0] == "sessions" and parts[2] == "peer-message"):
+            return self._json(404, {"error": "not found"})
+        agent = self.agent
+        if not agent.allow_send:
+            return self._json(403, {"error": "sending is disabled (start with --allow-send)"})
+        with agent.lock:
+            meta = agent.metas.get(parts[1])
+        path = meta.get("messagingSocketPath") if meta else None
+        if not isinstance(path, str) or not os.path.isabs(path):
+            return self._json(404, {"error": "unknown session or no inbox socket"})
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+            body = json.loads(self.rfile.read(length)) if 0 < length <= 65536 else None
+        except ValueError:
+            body = None
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip() or len(text) > 8000:
+            return self._json(400, {"error": "body must be {\"text\": \"...\"}"})
+        try:
+            send_peer(path, text)
+        except OSError:
+            return self._json(502, {"error": "could not deliver to the session socket"})
+        self._json(200, {"delivered": True,
+                         "note": "peer message: the receiver treats it as not from the user; "
+                                 "it cannot approve permission prompts"})
+
     def _transcript(self, sid, qs):
         st = self.agent.states.get(sid)
         if st is None or st.path is None:
@@ -475,9 +528,11 @@ def main(argv=None):
     ap.add_argument("--claude-home", default=str(Path.home() / ".claude"))
     ap.add_argument("--windows", help="JSON file: model-id substring -> context window size")
     ap.add_argument("--interval", type=float, default=1.0, help="poll interval, seconds")
+    ap.add_argument("--allow-send", action="store_true",
+                    help="enable POST /sessions/<id>/peer-message (experimental, wire format unverified)")
     args = ap.parse_args(argv)
     windows = load_windows(args.windows) if args.windows else {}
-    agent = Agent(args.claude_home, windows, args.token)
+    agent = Agent(args.claude_home, windows, args.token, allow_send=args.allow_send)
     try:
         srv = make_server(agent, args.bind, args.port)
     except ValueError as e:
