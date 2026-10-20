@@ -68,3 +68,26 @@ Replace the bare `pass` with a single `logging.getLogger(__name__).warning("poll
 
 Benefits:
 Operators gain a minimal, content-free signal that `refresh()` is failing, turning an invisible, indefinite stale-data condition into a visible, repeating warning that can be correlated with deployment changes, network incidents, or upstream API breakage. The warning is low-noise (one line per failed poll, no traceback, no exception payload) so it does not flood logs or leak sensitive data, while still being sufficient to trigger an alert rule or a `grep` in a log aggregator. The resilience guarantee is unchanged: a single or even a sustained burst of failures still does not terminate the agent.
+
+### AC-4 · showContextLog swallows non-404 errors as "no entries yet"
+Strength: Strong
+Files: static/chat.js
+Snippet:
+```
+      const url = `/api/second-brain/file?path=${encodeURIComponent(this.contextLogNotePath())}`;
+      const body = await fetchJson(url);
+      this.logContent.textContent = body.content || '(empty)';
+    } catch (e) {
+      // A 404 here just means nothing has been swept into this session's note yet -- a
+      // normal, expected state for a short or brand-new conversation, not an error worth
+      // alarming over.
+```
+
+Problem:
+In `showContextLog()`, the `catch (e)` block catches every exception thrown by `fetchJson(url)`—a 404, a 500, a network timeout, a DNS failure, a JSON-parse error—and funnels all of them into the same user-facing string `'No context log entries yet for this session.'`. The comment above the assignment documents only the 404 case ("A 404 here just means…"), but the code never inspects `e` to confirm it is in fact a 404. A user whose second-brain service is returning a 500 or whose network is down sees a calm, reassuring "no entries yet" message and has no reason to suspect anything is wrong. Additionally, the exception object `e` is bound and then discarded: there is no `console.error`, no `console.warn`, no diagnostic trace of any kind, so a developer debugging "why is the context log blank?" must open DevTools → Network and guess.
+
+Solution:
+Inside the existing `catch (e)` block, first check whether the error represents the expected 404 (e.g. `e && e.status === 404`, or a string match on `e.message` if `fetchJson` does not attach a `.status` property). For that benign case, keep the current `'No context log entries yet for this session.'` message and `return`. For every other error, call `console.error('showContextLog: failed to load context log', e)` to preserve the original exception for debugging, then set `this.logContent.textContent` to a message that signals a real failure, such as `'Failed to load context log. Please try again.'`. No new dependency, no metrics, no rethrow (the caller is a UI event handler; the `console.error` already surfaces the error to the console).
+
+Benefits:
+A 500, network timeout, or parse failure is now visually and textually distinct from the expected empty state, so the user is not told "everything is fine" when the service is actually broken. The `console.error` call gives a developer an immediate, searchable log line carrying the full exception object, eliminating the need to guess from the Network tab. The 404 path is unchanged, so the common "short session, no note yet" case still displays the same friendly message with zero UX regression.
