@@ -13,6 +13,7 @@ import argparse
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import queue
 import re
@@ -429,8 +430,10 @@ class Agent:
         while not self.stop.wait(interval):
             try:
                 self.refresh()
-            except Exception:  # never let one bad poll kill the agent; never log content
-                pass
+            except Exception as exc:  # never let one bad poll kill the agent; never log content
+                logging.getLogger(__name__).warning(
+                    "session poll failed: %s", type(exc).__name__
+                )
 
 
 def _add_types(d, acc):
