@@ -45,3 +45,26 @@ Add `import logging` at the top of routes/chat.py (alongside the existing import
 
 Benefits:
 A persistent upstream failure now produces a repeating, timestamped, greppable `WARNING` line in the server log with the exception type, message, and full traceback (via `exc_info=True`). An operator can immediately distinguish "agent is down" from "client disconnected" and see the root-cause exception. The fix is a single log statement; control flow, the SSE contract, and resource cleanup are all unchanged.
+
+### AC-3 · Silent exception swallow in poll_forever removes all observability of persistent refresh failures
+Strength: Strong
+Files: session_agent.py
+Snippet:
+```
+        while not self.stop.wait(interval):
+            try:
+                self.refresh()
+            except Exception:  # never let one bad poll kill the agent; never log content
+                pass
+
+
+```
+
+Problem:
+In `poll_forever`, the `except Exception: pass` block (with the comment "never let one bad poll kill the agent; never log content") swallows every exception raised by `self.refresh()` with zero diagnostic output. The resilience intent is sound, but the "never log content" constraint is being applied as a blanket prohibition on *any* log line. If `refresh()` begins failing persistently—due to a network partition, an upstream schema change, or a credentials rotation—the agent loop keeps ticking forever, `self.rows` and `self.metas` go stale, events stop being published to `self.hub`, and no log line, warning, or stderr write is ever produced. An operator inspecting the process sees a healthy, running agent with no indication that its data has been frozen since the first failed poll.
+
+Solution:
+Replace the bare `pass` with a single `logging.getLogger(__name__).warning("poll_forever: refresh() raised an exception")` call. This records *that* a failure occurred (and, because the loop repeats every `interval`, produces a repeating warning that is trivially greppable and alertable) without logging the exception message, traceback, or any data that `refresh()` might have touched—honouring the "never log content" constraint stated in the existing comment. The `import logging` should be hoisted to the module top-level alongside any other imports rather than placed inside the `except` block. No rethrow is added; the loop continues exactly as before, preserving the "never let one bad poll kill the agent" guarantee. No new dependency is introduced; the stdlib `logging` module is already the project's Python logging primitive.
+
+Benefits:
+Operators gain a minimal, content-free signal that `refresh()` is failing, turning an invisible, indefinite stale-data condition into a visible, repeating warning that can be correlated with deployment changes, network incidents, or upstream API breakage. The warning is low-noise (one line per failed poll, no traceback, no exception payload) so it does not flood logs or leak sensitive data, while still being sufficient to trigger an alert rule or a `grep` in a log aggregator. The resilience guarantee is unchanged: a single or even a sustained burst of failures still does not terminate the agent.
