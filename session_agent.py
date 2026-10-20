@@ -30,6 +30,10 @@ TEXT_CAP = 2000
 STEP_CAP = 40
 DEFAULT_LIMIT = 200
 STATUSES = ("busy", "idle", "waiting")
+# Observed on a real install: background sessions report CLI state "blocked" (status still
+# "busy"), and the registry can report status "shell". Both mean "needs you" -> waiting.
+NEEDS_YOU = ("blocked", "shell")
+KIND_ALIASES = {"bg": "background"}  # registry says "bg", the CLI says "background"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 CURSOR_RE = re.compile(r"^o(\d+)$")
 
@@ -44,11 +48,12 @@ def iso_from_ms(ms):
 
 
 def map_status(*raw):
-    """First recognised value of (status, state); anything else is idle."""
-    for value in raw:
-        if isinstance(value, str) and value.lower() in STATUSES:
-            return value.lower()
-    return "idle"
+    """busy|idle|waiting from the raw (status, state, registry status) values. A needs-you
+    value anywhere wins; otherwise the first recognised value; anything else is idle."""
+    vals = [v.lower() for v in raw if isinstance(v, str)]
+    if any(v in NEEDS_YOU for v in vals):
+        return "waiting"
+    return next((v for v in vals if v in STATUSES), "idle")
 
 
 def pid_alive(pid):
@@ -311,13 +316,15 @@ class Hub:
 
 class Agent:
     def __init__(self, home, windows=None, token=None, host=None, lister=run_claude_agents,
-                 alive=pid_alive, cli_ttl=2.0, allow_send=False):
+                 alive=pid_alive, cli_ttl=2.0, allow_send=False, allowed_hosts=()):
         self.home, self.windows, self.token = Path(home), windows or {}, token
         self.host = host or socket.gethostname()
         self.lister, self.alive, self.cli_ttl = lister, alive, cli_ttl
         self.hub, self.lock, self.stop = Hub(), threading.Lock(), threading.Event()
         self.rows, self.states, self.metas = {}, {}, {}
         self.allow_send = allow_send
+        # DNS-rebinding guard: only these Host/Origin names are served (no CORS headers either).
+        self.allowed_hosts = {"localhost", "127.0.0.1", "::1"} | {h.lower() for h in allowed_hosts}
         self._cli, self._cli_at = None, 0.0
 
     def discover(self):
@@ -325,7 +332,10 @@ class Agent:
         if self.lister and now - self._cli_at >= self.cli_ttl:
             self._cli, self._cli_at = self.lister(), now
         merged = {}
-        for src in (read_registry(self.home), self._cli or []):  # CLI (documented) wins
+        registry = read_registry(self.home)
+        for d in registry:
+            d["registryStatus"] = d.get("status")  # survives the CLI overlay below
+        for src in (registry, self._cli or []):  # CLI (documented) wins
             for d in src:
                 sid = d.get("sessionId")
                 if isinstance(sid, str) and SESSION_ID_RE.match(sid):
@@ -335,9 +345,11 @@ class Agent:
     def build_row(self, meta, st):
         waiting_for = meta.get("waitingFor")
         waiting_for = str(waiting_for)[:80] if waiting_for is not None else None
-        status = map_status(meta.get("status"), meta.get("state"))
+        status = map_status(meta.get("status"), meta.get("state"), meta.get("registryStatus"))
         if status == "waiting" and waiting_for:
             step = f"Waiting: {waiting_for}"
+        elif status == "idle":
+            step = None  # the last tool of a finished turn would read as current
         elif st.step:
             step = st.step
         else:
@@ -348,7 +360,7 @@ class Agent:
             "id": meta["sessionId"],
             "name": name if isinstance(name, str) else None,
             "cwd": meta.get("cwd") if isinstance(meta.get("cwd"), str) else None,
-            "kind": meta.get("kind") if isinstance(meta.get("kind"), str) else None,
+            "kind": KIND_ALIASES.get(meta["kind"], meta["kind"]) if isinstance(meta.get("kind"), str) else None,
             "pid": meta.get("pid"),
             "status": status,
             "waitingFor": waiting_for,
@@ -474,6 +486,16 @@ def probe(home, lister=run_claude_agents, alive=pid_alive):
     return report
 
 
+def host_only(value):
+    """Hostname from a Host header or Origin URL (no port, no brackets, lower-case)."""
+    value = (value or "").strip().lower()
+    if "://" in value:
+        value = value.split("://", 1)[1].split("/", 1)[0]
+    if value.startswith("["):
+        return value[1:].split("]", 1)[0]
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
 def is_loopback(host):
     if host == "localhost":
         return True
@@ -497,6 +519,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _host_ok(self):
+        hosts = self.agent.allowed_hosts
+        origin = self.headers.get("Origin")
+        return host_only(self.headers.get("Host")) in hosts and (origin is None or host_only(origin) in hosts)
+
     def _authorized(self):
         token = self.agent.token
         if not token:
@@ -505,6 +532,8 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(got.encode(), f"Bearer {token}".encode())
 
     def do_GET(self):
+        if not self._host_ok():
+            return self._json(403, {"error": "host not allowed"})
         if not self._authorized():
             return self._json(401, {"error": "unauthorized"})
         url = urlparse(self.path)
@@ -520,6 +549,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._host_ok():
+            return self._json(403, {"error": "host not allowed"})
         if not self._authorized():
             return self._json(401, {"error": "unauthorized"})
         parts = [p for p in urlparse(self.path).path.split("/") if p]
@@ -604,7 +635,10 @@ def main(argv=None):
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7450)
     ap.add_argument("--token", default=os.environ.get("AM_AGENT_TOKEN"))
-    ap.add_argument("--claude-home", default=str(Path.home() / ".claude"))
+    ap.add_argument("--claude-home", default=str(Path.home() / ".claude"),
+                    help="registry/transcript directory; does NOT redirect the `claude agents` listing")
+    ap.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                    help="extra Host/Origin hostname to accept (repeatable); localhost/127.0.0.1/::1 always are")
     ap.add_argument("--windows", help="JSON file: model-id substring -> context window size")
     ap.add_argument("--interval", type=float, default=1.0, help="poll interval, seconds")
     ap.add_argument("--allow-send", action="store_true",
@@ -616,7 +650,10 @@ def main(argv=None):
         print(json.dumps(probe(args.claude_home), indent=2))
         return
     windows = load_windows(args.windows) if args.windows else {}
-    agent = Agent(args.claude_home, windows, args.token, allow_send=args.allow_send)
+    extra = list(args.allow_host)
+    if args.bind not in ("0.0.0.0", "::"):
+        extra.append(args.bind)
+    agent = Agent(args.claude_home, windows, args.token, allow_send=args.allow_send, allowed_hosts=extra)
     try:
         srv = make_server(agent, args.bind, args.port)
     except ValueError as e:

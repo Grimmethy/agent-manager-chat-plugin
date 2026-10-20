@@ -48,6 +48,10 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(sa.map_status(None, "idle"), "idle")
         self.assertEqual(sa.map_status("exploding", None), "idle")
         self.assertEqual(sa.map_status(5, ["x"]), "idle")
+        # observed on a real install: bg session CLI status busy + state blocked; registry "shell"
+        self.assertEqual(sa.map_status("busy", "blocked"), "waiting")
+        self.assertEqual(sa.map_status("busy", None, "shell"), "waiting")
+        self.assertEqual(sa.map_status("busy", "running"), "busy")
 
     def test_windows_unknown_model_is_null(self):
         table = sa.load_windows(FIXTURES / "windows.json")
@@ -104,6 +108,28 @@ class RowTests(AgentCase):
         self.assertIsNone(row["step"])
         self.assertEqual(row["statusSince"], "2026-01-01T00:00:06Z")  # no statusUpdatedAt
         self.assertEqual(row["contextTokens"], 10)
+
+    def test_idle_hides_last_tool_and_kind_is_normalised(self):
+        reg = self.home / "sessions" / "1001.json"
+        data = json.loads(reg.read_text())
+        data.update(status="idle", kind="bg")
+        reg.write_text(json.dumps(data))
+        row = self.row(self.make_agent(), "sess-busy")
+        self.assertEqual((row["status"], row["step"], row["kind"]), ("idle", None, "background"))
+
+    def test_blocked_background_session_is_waiting(self):
+        cli = [{"pid": 1001, "sessionId": "sess-busy", "status": "busy", "state": "blocked", "kind": "background"}]
+        row = self.row(self.make_agent(lister=lambda: cli), "sess-busy")
+        self.assertEqual((row["status"], row["kind"]), ("waiting", "background"))
+        self.assertEqual(row["step"], "Bash: echo " + "x" * 35)  # no waitingFor -> last tool
+
+    def test_registry_shell_status_survives_cli_overlay(self):
+        reg = self.home / "sessions" / "1001.json"
+        data = json.loads(reg.read_text())
+        data["status"] = "shell"
+        reg.write_text(json.dumps(data))
+        cli = [{"pid": 1001, "sessionId": "sess-busy", "status": "busy"}]
+        self.assertEqual(self.row(self.make_agent(lister=lambda: cli), "sess-busy")["status"], "waiting")
 
     def test_busy_without_tool_use_is_thinking(self):
         reg = self.home / "sessions" / "1004.json"
@@ -240,6 +266,44 @@ class HttpTests(ServerCase):
         with self.assertRaises(urllib.error.HTTPError) as cm:
             self.get("/sessions/sess-busy/transcript?since=junk")
         self.assertEqual(cm.exception.code, 400)
+
+
+class HostGuardTests(ServerCase):
+    def raw(self, path, host=None, origin=None):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.srv.server_address[1], timeout=5)
+        headers = {k: v for k, v in (("Host", host), ("Origin", origin)) if v}
+        conn.putrequest("GET", path, skip_host=host is not None)
+        for k, v in headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status
+
+    def test_rebinding_hosts_and_foreign_origins_rejected_without_token(self):
+        self.start()
+        for path in ("/healthz", "/sessions"):
+            self.assertEqual(self.raw(path, host="evil.example"), 403)
+            self.assertEqual(self.raw(path, host="evil.example:7450"), 403)
+            self.assertEqual(self.raw(path, host="127.0.0.1", origin="http://evil.example"), 403)
+            for ok in ("127.0.0.1:7450", "localhost", "[::1]:7450"):
+                self.assertEqual(self.raw(path, host=ok), 200)
+        self.assertEqual(self.raw("/healthz", host="localhost:1", origin="http://localhost:3000"), 200)
+
+    def test_configured_names_allowed_and_no_cors_headers(self):
+        self.start(allowed_hosts=["Agent.Internal"])
+        self.assertEqual(self.raw("/healthz", host="agent.internal:7450"), 200)
+        self.assertEqual(self.raw("/healthz", host="other.internal"), 403)
+        req = urllib.request.Request(self.base + "/healthz")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertIsNone(r.headers.get("Access-Control-Allow-Origin"))
+
+    def test_host_checked_before_token(self):
+        self.token = "synthetic-test-token"
+        self.start()
+        self.assertEqual(self.raw("/healthz", host="evil.example"), 403)
 
 
 class AuthTests(ServerCase):

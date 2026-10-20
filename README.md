@@ -81,8 +81,21 @@ python3 session_agent.py [--bind 127.0.0.1] [--port 7450] [--token T | AM_AGENT_
   `~/.claude/sessions/<pid>.json` registry (all keys optional; also the fallback if the CLI is
   unavailable) and the transcripts, tailed by byte offset.
 - Context = input + cache-read + cache-creation tokens of the latest non-sidechain assistant line.
-- `contextWindow` is `null` unless `--windows` maps a model-id substring to a size, e.g.
-  `{"some-model-substring": 123456}` (the agent ships no numbers).
+- `contextWindow` is `null` unless `--windows` maps a model-id substring to a size (the agent
+  ships no numbers). `deploy/windows.example.json` lists 1,000,000 for claude-fable-5-1,
+  claude-opus-5-5, claude-sonnet-5-5 and claude-haiku-5-5 per the API models page; only the
+  sonnet and opus entries are confirmed inside Claude Code (contexts above 900k seen), fable and
+  haiku are not. The status line's `context_window.context_window_size` is the better source
+  (200000 default, 1000000 extended) but is not read yet.
+- Status mapping: `busy|idle|waiting`; CLI state `blocked` and registry status `shell` map to
+  `waiting`; unknown values map to `idle`. Registry kind `bg` is reported as `background`.
+  `step` is `null` while idle. Sub-agent lines live in separate `<sessionId>/subagents/` files, and
+  `isSidechain` lines are excluded anyway.
+- `--claude-home` redirects only the registry/transcript reads; `claude agents` still reads the
+  invoking user's own config.
+- Only Host/Origin names `localhost`, `127.0.0.1`, `::1` (plus the bind address and any
+  `--allow-host NAME`) are served, against DNS rebinding; no CORS headers are sent. If the
+  plugin reaches the agent by another hostname, pass `--allow-host` for it.
 - Transcripts are private: loopback bind by default; a non-loopback `--bind` refuses to start
   without a token, and with a token every request needs `Authorization: Bearer <token>`.
   Message text is never logged.
