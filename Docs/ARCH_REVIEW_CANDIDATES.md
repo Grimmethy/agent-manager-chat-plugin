@@ -197,3 +197,32 @@ Add a one-line comment at each `try/except` site explaining the intent (e.g., "R
 
 Benefits:
 The severity distinction becomes self-documenting and resistant to accidental "fixes." Reviewers can verify at a glance that a change preserves the intended fatal/non-fatal contract, and new contributors understand the design rationale without archaeology.
+
+### AC-29 · Add get_reservation_state() client method to internal_api_client.py
+Strength: Strong
+Split-Depth: 1
+Files: internal_api_client.py
+
+Problem:
+The local JSON `reserved` flag (written by `set_reserved` in routes/chat.py) is the sole decision gate for reservation lifecycle. There is no method in internal_api_client.py to query the core dashboard's actual reservation registry for a given session. The existing methods are `get_roots()`, `preempt()`, `reserve(reservation_id, model, on)`, and `stream_local_turn(...)` — all of which either mutate state or serve unrelated data. Without a read-only state query, routes/chat.py cannot verify whether a reservation is truly held server-side before acting, and the local flag can silently drift (expired, released by another path, core dashboard restarted), producing the split-brain that AC-10 targets.
+
+Solution:
+Add a new function `get_reservation_state(reservation_id: str) -> dict` to internal_api_client.py. It issues `GET {CORE_DASHBOARD_URL}/api/internal/chat/reservations?reservationId=<id>` with the same `_headers()` auth and a 10-second timeout, calls `r.raise_for_status()`, and returns the parsed JSON body (expected shape: `{"reserved": bool, "owner": str|null, "expires_at": str|null}`). On any `requests.RequestException` it raises `InternalApiError` with a descriptive message — it must NOT catch the error and return a default like `{"reserved": false}`. This mirrors the error-handling pattern already used by `get_roots()` in the same file. Prerequisite: the core dashboard must expose (or be asked to expose) this GET endpoint; if it does not yet exist, coordinate with the core-dashboard team before merging the routes/chat.py change that calls this method.
+
+Benefits:
+Provides the single authoritative read primitive that the routes layer needs to reconcile local state against the remote registry. Without this method, any fix in routes/chat.py would still be gated on the local JSON flag and the split-brain persists. The method is small, self-contained, and follows the exact pattern of the existing `get_roots()` function in the same file, so it is low-risk to review and merge independently.
+
+### AC-30 · Replace local-flag gates in routes/chat.py with remote-state reconciliation
+Strength: Strong
+Split-Depth: 1
+Files: routes/chat.py
+Depends-On: AC-29
+
+Problem:
+In `api_chat_message`, the line `if existing.get("reserved"):` reads the local JSON flag and decides whether to issue a refresh (`internal_reserve(session_id, ollama_client.MODEL, True)`) or a fresh reserve. In `api_chat_close`, the line `if session.get("reserved"):` reads the same flag and decides whether to call `internal_reserve(session_id, ollama_client.MODEL, False)` to release. In both cases the local flag is the sole decision input. If the flag is stale — the reservation expired server-side, the core dashboard restarted, or another code path released it — the message path either skips a needed fresh-reserve or refreshes a reservation that no longer exists, and the close path either skips a release that is still needed or attempts a release on an already-gone reservation. The close path additionally catches `InternalApiError` and writes a single line to stderr (`print(f"[chat-close] reservation release failed (non-fatal): {e}", file=sys.stderr, flush=True)`), silently leaking the GPU lock with no application-log visibility and no retry.
+
+Solution:
+In `api_chat_message`: replace the `if existing.get("reserved"):` gate with a call to `get_reservation_state(session_id)` (imported from `internal_api_client`). Decision logic becomes: (a) remote says reserved by this session → issue the existing refresh call; (b) remote says not reserved → issue a fresh preempt + reserve; (c) the GET raises `InternalApiError` → abort the turn with `abort(502, description="cannot confirm reservation state")` — do NOT fall back to the local flag. After a successful reserve/refresh, write the result back to the local flag via `set_reserved` as a cache for debugging only. In `api_chat_close`: replace `if session.get("reserved"):` with `get_reservation_state(session_id)`. Decision logic: (a) remote says not reserved → skip the release call, clear the local flag, log at INFO level; (b) remote says reserved by this session → call `internal_reserve(session_id, ollama_client.MODEL, False)` inside a bounded retry loop (3 attempts, backoff 1s/3s/9s, catching `InternalApiError` each time); (c) remote says reserved by another session → skip release, log WARNING, clear local flag; (d) the GET raises `InternalApiError` → treat as state-unknown, proceed to the retry path in (b). If all 3 retries in (b) fail, write a pending-release marker JSON file to `CHAT_STORAGE_DIR/pending_releases/<session_id>.json` containing `{session_id, failed_at, last_error}`, and log at WARNING level (not stderr). The local flag is still written (as cache) but is never read as a condition that controls whether an internal-API call is made.
+
+Benefits:
+Eliminates the split-brain at the root: the local JSON flag is demoted from decision gate to read-through cache, and every turn and every close is verified against the authoritative remote registry before acting. The close path no longer silently leaks a GPU lock — it retries, logs at application level, and persists a recoverable marker on final failure. The message path no longer acts on stale state. Both changes are confined to the two existing view functions and their immediate logic; no new routes, no new persistence layer, no changes to the core dashboard's data structures.
