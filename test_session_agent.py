@@ -48,9 +48,9 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(sa.map_status(None, "idle"), "idle")
         self.assertEqual(sa.map_status("exploding", None), "idle")
         self.assertEqual(sa.map_status(5, ["x"]), "idle")
-        # observed on a real install: bg session CLI status busy + state blocked; registry "shell"
+        # observed on a real install: bg session CLI status busy + state blocked
         self.assertEqual(sa.map_status("busy", "blocked"), "waiting")
-        self.assertEqual(sa.map_status("busy", None, "shell"), "waiting")
+        self.assertEqual(sa.map_status("shell"), "idle")  # seen once, unexplained: not mapped
         self.assertEqual(sa.map_status("busy", "running"), "busy")
 
     def test_windows_unknown_model_is_null(self):
@@ -123,13 +123,46 @@ class RowTests(AgentCase):
         self.assertEqual((row["status"], row["kind"]), ("waiting", "background"))
         self.assertEqual(row["step"], "Bash: echo " + "x" * 35)  # no waitingFor -> last tool
 
-    def test_registry_shell_status_survives_cli_overlay(self):
-        reg = self.home / "sessions" / "1001.json"
-        data = json.loads(reg.read_text())
-        data["status"] = "shell"
-        reg.write_text(json.dumps(data))
-        cli = [{"pid": 1001, "sessionId": "sess-busy", "status": "busy"}]
-        self.assertEqual(self.row(self.make_agent(lister=lambda: cli), "sess-busy")["status"], "waiting")
+    def test_synthetic_placeholder_lines_do_not_reset_context(self):
+        agent = self.make_agent()
+        with open(self.transcript("sess-busy"), "a") as f:
+            f.write(json.dumps({"type": "assistant", "timestamp": "2026-01-01T00:03:00Z", "isSidechain": False,
+                                "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "x"}],
+                                            "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
+                                                      "cache_creation_input_tokens": 0}}}) + "\n")
+        agent.refresh()
+        row = self.row(agent, "sess-busy")
+        self.assertEqual((row["contextTokens"], row["model"]), (1205, "claude-sonnet-5-5"))
+
+    def test_statusline_window_preferred_when_fresh(self):
+        sl = Path(self.tmp) / "statusline"
+        sl.mkdir()
+        now = time.time()
+        (sl / "sess-busy.json").write_text(json.dumps({"contextWindowSize": 777, "observedAt": now}))
+        (sl / "sess-wait.json").write_text(json.dumps({"contextWindowSize": 888, "observedAt": now - 5000}))  # stale
+        (sl / "sess-idle.json").write_text("{nope")
+        agent = self.make_agent(statusline_dir=sl, windows={"sonnet": 5})
+        self.assertEqual(self.row(agent, "sess-busy")["contextWindow"], 777)
+        self.assertEqual(self.row(agent, "sess-wait")["contextWindow"], 5)  # stale -> falls back to the table
+        self.assertIsNone(self.row(agent, "sess-idle")["contextWindow"])
+
+    def test_statusline_reader_validation(self):
+        sl = Path(self.tmp)
+        iso = "2026-01-01T00:00:00Z"
+        base = datetime_ts = 1767225600.0  # 2026-01-01T00:00:00Z
+        cases = {"a": {"contextWindowSize": 10, "observedAt": iso},
+                 "b": {"contextWindowSize": 10, "observedAt": int(base * 1000)},
+                 "c": {"contextWindowSize": "10", "observedAt": iso},
+                 "d": {"contextWindowSize": True, "observedAt": iso},
+                 "e": {"contextWindowSize": 10},
+                 "f": {"contextWindowSize": 10, "observedAt": "garbage"}}
+        for name, body in cases.items():
+            (sl / f"{name}.json").write_text(json.dumps(body))
+        got = {n: sa.read_statusline_window(sl, n, 600, now=base + 10) for n in cases}
+        self.assertEqual(got, {"a": 10, "b": 10, "c": None, "d": None, "e": None, "f": None})
+        self.assertIsNone(sa.read_statusline_window(sl, "a", 600, now=base + 10_000))
+        self.assertIsNone(sa.read_statusline_window(sl, "../a", 600, now=base))
+        self.assertIsNone(sa.read_statusline_window(None, "a", 600))
 
     def test_busy_without_tool_use_is_thinking(self):
         reg = self.home / "sessions" / "1004.json"
@@ -263,9 +296,10 @@ class HttpTests(ServerCase):
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 self.get(bad)
             self.assertEqual(cm.exception.code, 404)
-        with self.assertRaises(urllib.error.HTTPError) as cm:
-            self.get("/sessions/sess-busy/transcript?since=junk")
-        self.assertEqual(cm.exception.code, 400)
+        for bad in ("since=junk", "since=o" + "9" * 40, "since=o999999999"):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.get("/sessions/sess-busy/transcript?" + bad)
+            self.assertEqual(cm.exception.code, 400, bad)
 
 
 class HostGuardTests(ServerCase):
@@ -299,6 +333,14 @@ class HostGuardTests(ServerCase):
         req = urllib.request.Request(self.base + "/healthz")
         with urllib.request.urlopen(req, timeout=5) as r:
             self.assertIsNone(r.headers.get("Access-Control-Allow-Origin"))
+
+    def test_userinfo_and_odd_hosts_rejected(self):
+        self.start()
+        for host in ("localhost:80@evil.example", "localhost.", "evil.example@localhost:80x", ""):
+            self.assertEqual(self.raw("/healthz", host=host), 403, host)
+        self.assertEqual(sa.host_only("[::1]:7450"), "::1")
+        self.assertEqual(sa.host_only("http://LocalHost:3000"), "localhost")
+        self.assertEqual(self.raw("/healthz", host="localhost", origin="null"), 403)
 
     def test_host_checked_before_token(self):
         self.token = "synthetic-test-token"
@@ -352,6 +394,17 @@ class SseTests(ServerCase):
         self.assertEqual(by_event["transcript.append"]["id"], "sess-wait")
         self.assertEqual(by_event["transcript.append"]["entries"][0]["text"], "more")
         self.assertEqual(by_event["session.updated"]["contextTokens"], 42)
+
+    def test_types_session_filters_out_transcript_events(self):
+        self.start()
+        resp = urllib.request.urlopen(self.base + "/events?types=session", timeout=5)
+        self.addCleanup(resp.close)
+        self.read_events(resp, 3)  # snapshot
+        q = self.agent.hub
+        q.publish("transcript.append", {"id": "sess-wait", "entries": [{"role": "user", "text": "private"}]})
+        q.publish("session.removed", {"id": "sess-wait"})
+        event, data = self.read_events(resp, 1)[0]
+        self.assertEqual((event, data), ("session.removed", {"id": "sess-wait"}))
 
     def test_removed_session_event(self):
         self.start()

@@ -42,7 +42,8 @@ def open_events():
     """An open streaming response for the agent's /events SSE. The caller must close it.
     Read timeout 60s: the agent sends a keepalive comment every 15s."""
     try:
-        r = requests.get(base_url() + "/events", headers=_headers(), stream=True, timeout=(3, 60))
+        r = requests.get(base_url() + "/events", headers=_headers(), params={"types": "session"},
+                         stream=True, timeout=(3, 60))
         r.raise_for_status()
         return r
     except requests.RequestException as e:
@@ -62,3 +63,21 @@ def iter_chunks(resp):
         if not chunk:
             return
         yield chunk
+
+
+def filter_events(chunks, allowed=("session.updated", "session.removed")):
+    """Pass through only whole SSE blocks whose event name is in `allowed` (plus comment
+    keepalives). transcript.append carries private text the UI never shows, so it is dropped
+    here even though the agent is also asked (types=session) not to send it."""
+    buf = b""
+    for chunk in chunks:
+        buf += chunk
+        while b"\n\n" in buf:
+            block, buf = buf.split(b"\n\n", 1)
+            lines = block.split(b"\n")
+            if all(l.startswith(b":") for l in lines):
+                yield block + b"\n\n"
+                continue
+            name = next((l[7:].strip() for l in lines if l.startswith(b"event:")), b"")
+            if name.decode("utf-8", "replace") in allowed:
+                yield block + b"\n\n"

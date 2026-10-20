@@ -82,7 +82,7 @@ def api_terminal_sessions_events():
 
     def relay():
         try:
-            yield from agent_client.iter_chunks(upstream)
+            yield from agent_client.filter_events(agent_client.iter_chunks(upstream))
         except (requests.RequestException, OSError):
             pass
         finally:

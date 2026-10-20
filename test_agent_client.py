@@ -86,6 +86,28 @@ class AgentRouteTests(unittest.TestCase):
         first = [l for l in text.decode().splitlines() if l.startswith("data: ")][0]
         self.assertIn("status", json.loads(first[6:]))
 
+    def test_events_exclude_transcript_text(self):
+        with self.env():
+            resp = self.client.get("/api/chat/terminal-sessions/events")
+            stream = iter(resp.response)
+            text = b""
+            while text.count(b"event: session.updated") < 3:
+                text += next(stream)
+            self.agent.hub.publish("transcript.append", {"id": "x", "entries": [{"text": "private-text"}]})
+            self.agent.hub.publish("session.removed", {"id": "sess-wait"})
+            while b"session.removed" not in text:
+                text += next(stream)
+            resp.close()
+        self.assertNotIn(b"private-text", text)
+        self.assertNotIn(b"transcript.append", text)
+
+    def test_filter_events_reassembles_split_blocks(self):
+        blocks = (b"event: transcript.append\ndata: {\"a\": 1}\n\n: keepalive\n\n"
+                  b"event: session.updated\ndata: {\"id\": \"s\"}\n\nevent: other\ndata: 1\n\n")
+        chunks = [blocks[i:i + 7] for i in range(0, len(blocks), 7)]
+        out = b"".join(agent_client.filter_events(iter(chunks)))
+        self.assertEqual(out, b": keepalive\n\nevent: session.updated\ndata: {\"id\": \"s\"}\n\n")
+
     def test_list_sessions_rejects_wrong_shape(self):
         with mock.patch.dict(os.environ, {"AGENT_MANAGER_SESSION_AGENT_URL": self.url}):
             with mock.patch("agent_client.requests.get") as get:

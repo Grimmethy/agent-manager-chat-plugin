@@ -86,9 +86,18 @@ python3 session_agent.py [--bind 127.0.0.1] [--port 7450] [--token T | AM_AGENT_
   claude-opus-5-5, claude-sonnet-5-5 and claude-haiku-5-5 per the API models page; only the
   sonnet and opus entries are confirmed inside Claude Code (contexts above 900k seen), fable and
   haiku are not. The status line's `context_window.context_window_size` is the better source
-  (200000 default, 1000000 extended) but is not read yet.
-- Status mapping: `busy|idle|waiting`; CLI state `blocked` and registry status `shell` map to
-  `waiting`; unknown values map to `idle`. Registry kind `bg` is reported as `background`.
+  (200000 default, 1000000 extended) is read from optional `<sessionId>.json` files
+  (`{"contextWindowSize": int, "observedAt": ISO string or epoch}`) in `--statusline-dir`
+  (default `~/.local/state/agent-manager/statusline`), written by a status line command from
+  `context_window.context_window_size`. A file older than 10 minutes (`observedAt`) is ignored and
+  `--windows` applies. Nothing writes those files yet; installing a `statusLine` command in
+  `~/.claude/settings.json` is the user's call.
+- `claude agents` is polled at most every 10 s (it costs ~0.2 s CPU per call); registry files fill
+  the gaps. `GET /events?types=session` omits `transcript.append`, and the plugin's passthrough
+  additionally drops everything except `session.updated`/`session.removed`, so transcript text never
+  reaches the browser.
+- Status mapping: `busy|idle|waiting`; CLI state `blocked` maps to `waiting`; unknown values,
+  including registry status `shell` (seen once, unexplained), map to `idle`. Registry kind `bg` is reported as `background`.
   `step` is `null` while idle. Sub-agent lines live in separate `<sessionId>/subagents/` files, and
   `isSidechain` lines are excluded anyway.
 - `--claude-home` redirects only the registry/transcript reads; `claude agents` still reads the

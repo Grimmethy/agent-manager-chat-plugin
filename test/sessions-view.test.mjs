@@ -125,3 +125,10 @@ test('applyTerminalEvent', () => {
   assert.equal(applyTerminalEvent(rows, 'session.updated', {}), rows);
   assert.deepEqual(applyTerminalEvent(rows, 'session.removed', { id: 'a' }), []);
 });
+
+test('prototype keys are not statuses', () => {
+  assert.equal(formatTerminalRow({ id: 'p', status: 'constructor' }, NOW).status, 'Idle');
+  assert.equal(formatTerminalRow({ id: 'p', status: 'toString' }, NOW).busy, false);
+  assert.deepEqual(orderTerminalSessions([{ id: '1', name: 'a', status: 'constructor' },
+    { id: '2', name: 'b', status: 'busy' }]).map((r) => r.id), ['2', '1']);
+});

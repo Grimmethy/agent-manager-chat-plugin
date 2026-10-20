@@ -23,16 +23,16 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 MAX_LINE = 1024 * 1024  # transcript lines larger than this (api-request-blob...) are skipped unparsed
 TEXT_CAP = 2000
 STEP_CAP = 40
 DEFAULT_LIMIT = 200
 STATUSES = ("busy", "idle", "waiting")
-# Observed on a real install: background sessions report CLI state "blocked" (status still
-# "busy"), and the registry can report status "shell". Both mean "needs you" -> waiting.
-NEEDS_YOU = ("blocked", "shell")
+# Background sessions report CLI state "blocked" (status still "busy"): needs you -> waiting.
+# Registry status "shell" was seen once, unexplained, so it is NOT mapped (-> idle).
+NEEDS_YOU = ("blocked",)
 KIND_ALIASES = {"bg": "background"}  # registry says "bg", the CLI says "background"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 CURSOR_RE = re.compile(r"^o(\d+)$")
@@ -48,7 +48,7 @@ def iso_from_ms(ms):
 
 
 def map_status(*raw):
-    """busy|idle|waiting from the raw (status, state, registry status) values. A needs-you
+    """busy|idle|waiting from the raw (status, state) values. A needs-you
     value anywhere wins; otherwise the first recognised value; anything else is idle."""
     vals = [v.lower() for v in raw if isinstance(v, str)]
     if any(v in NEEDS_YOU for v in vals):
@@ -68,6 +68,31 @@ def pid_alive(pid):
     except OSError:
         return False
     return True
+
+
+def read_statusline_window(directory, session_id, max_age, now=None):
+    """contextWindowSize from <dir>/<sessionId>.json (written by a status line command), or
+    None if absent, malformed or older than max_age seconds (observedAt: ISO string or epoch)."""
+    if not directory or not SESSION_ID_RE.match(session_id):
+        return None
+    try:
+        with open(Path(directory) / f"{session_id}.json", "rb") as f:
+            data = json.loads(f.read(4096))
+    except (OSError, ValueError):
+        return None
+    size, seen = (data.get("contextWindowSize"), data.get("observedAt")) if isinstance(data, dict) else (None, None)
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        return None
+    if isinstance(seen, str):
+        try:
+            seen = datetime.fromisoformat(seen.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    elif isinstance(seen, (int, float)) and not isinstance(seen, bool):
+        seen = seen / 1000 if seen > 1e11 else seen
+    else:
+        return None
+    return size if -60 <= (now or time.time()) - seen <= max_age else None
 
 
 def load_windows(path):
@@ -210,6 +235,8 @@ class TranscriptState:
         if isinstance(obj.get("timestamp"), str):
             self.last_ts = obj["timestamp"]
         msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        if msg.get("model") == "<synthetic>":
+            return  # client-generated placeholder with zero usage: not a real API response
         if obj.get("type") == "user":
             if any(e["role"] == "user" for e in entries_of(obj)):
                 self.step = None  # a new prompt starts a fresh turn
@@ -316,13 +343,15 @@ class Hub:
 
 class Agent:
     def __init__(self, home, windows=None, token=None, host=None, lister=run_claude_agents,
-                 alive=pid_alive, cli_ttl=2.0, allow_send=False, allowed_hosts=()):
+                 alive=pid_alive, cli_ttl=10.0, allow_send=False, allowed_hosts=(),
+                 statusline_dir=None, statusline_max_age=600.0):
         self.home, self.windows, self.token = Path(home), windows or {}, token
         self.host = host or socket.gethostname()
         self.lister, self.alive, self.cli_ttl = lister, alive, cli_ttl
         self.hub, self.lock, self.stop = Hub(), threading.Lock(), threading.Event()
         self.rows, self.states, self.metas = {}, {}, {}
         self.allow_send = allow_send
+        self.statusline_dir, self.statusline_max_age = statusline_dir, statusline_max_age
         # DNS-rebinding guard: only these Host/Origin names are served (no CORS headers either).
         self.allowed_hosts = {"localhost", "127.0.0.1", "::1"} | {h.lower() for h in allowed_hosts}
         self._cli, self._cli_at = None, 0.0
@@ -332,10 +361,7 @@ class Agent:
         if self.lister and now - self._cli_at >= self.cli_ttl:
             self._cli, self._cli_at = self.lister(), now
         merged = {}
-        registry = read_registry(self.home)
-        for d in registry:
-            d["registryStatus"] = d.get("status")  # survives the CLI overlay below
-        for src in (registry, self._cli or []):  # CLI (documented) wins
+        for src in (read_registry(self.home), self._cli or []):  # CLI (documented) wins
             for d in src:
                 sid = d.get("sessionId")
                 if isinstance(sid, str) and SESSION_ID_RE.match(sid):
@@ -345,7 +371,7 @@ class Agent:
     def build_row(self, meta, st):
         waiting_for = meta.get("waitingFor")
         waiting_for = str(waiting_for)[:80] if waiting_for is not None else None
-        status = map_status(meta.get("status"), meta.get("state"), meta.get("registryStatus"))
+        status = map_status(meta.get("status"), meta.get("state"))
         if status == "waiting" and waiting_for:
             step = f"Waiting: {waiting_for}"
         elif status == "idle":
@@ -367,7 +393,9 @@ class Agent:
             "statusSince": since,
             "step": step,
             "contextTokens": st.context,
-            "contextWindow": window_for(st.model, self.windows),
+            "contextWindow": read_statusline_window(self.statusline_dir, meta["sessionId"],
+                                                    self.statusline_max_age)
+                             or window_for(st.model, self.windows),
             "model": st.model,
             "startedAt": iso_from_ms(meta.get("startedAt")),
             "host": self.host,
@@ -488,12 +516,13 @@ def probe(home, lister=run_claude_agents, alive=pid_alive):
 
 def host_only(value):
     """Hostname from a Host header or Origin URL (no port, no brackets, lower-case)."""
-    value = (value or "").strip().lower()
-    if "://" in value:
-        value = value.split("://", 1)[1].split("/", 1)[0]
-    if value.startswith("["):
-        return value[1:].split("]", 1)[0]
-    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+    value = (value or "").strip()
+    if "@" in value:  # userinfo has no place in a Host/Origin; never "parse around" it
+        return None
+    try:
+        return urlsplit(value if "://" in value else "//" + value).hostname
+    except ValueError:
+        return None
 
 
 def is_loopback(host):
@@ -543,7 +572,7 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["sessions"]:
             return self._json(200, self.agent.snapshot())
         if parts == ["events"]:
-            return self._events()
+            return self._events(session_only=parse_qs(url.query).get("types") == ["session"])
         if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "transcript":
             return self._transcript(parts[1], parse_qs(url.query))
         self._json(404, {"error": "not found"})
@@ -592,10 +621,16 @@ class Handler(BaseHTTPRequestHandler):
             limit = min(max(int(qs.get("limit", [DEFAULT_LIMIT])[0]), 1), DEFAULT_LIMIT)
         except ValueError:
             return self._json(400, {"error": "bad limit"})
-        entries, nxt = read_transcript(st.path, int(m.group(1)) if m else 0, limit)
+        cursor = int(m.group(1)) if m else 0
+        try:
+            if cursor > st.path.stat().st_size:
+                return self._json(400, {"error": "cursor beyond end of transcript"})
+        except OSError:
+            return self._json(404, {"error": "unknown session"})
+        entries, nxt = read_transcript(st.path, cursor, limit)
         self._json(200, {"entries": entries, "next": f"o{nxt}"})
 
-    def _events(self):
+    def _events(self, session_only=False):
         agent = self.agent
         q = agent.hub.subscribe([("session.updated", r) for r in agent.snapshot()])
         self.send_response(200)
@@ -607,6 +642,8 @@ class Handler(BaseHTTPRequestHandler):
             while not agent.stop.is_set():
                 try:
                     event, data = q.get(timeout=0.5)
+                    if session_only and not event.startswith("session."):
+                        continue
                     out = f"event: {event}\ndata: {json.dumps(data)}\n\n"
                 except queue.Empty:
                     if time.monotonic() - last < 15:
@@ -637,6 +674,9 @@ def main(argv=None):
     ap.add_argument("--token", default=os.environ.get("AM_AGENT_TOKEN"))
     ap.add_argument("--claude-home", default=str(Path.home() / ".claude"),
                     help="registry/transcript directory; does NOT redirect the `claude agents` listing")
+    ap.add_argument("--statusline-dir", default=str(Path.home() / ".local/state/agent-manager/statusline"),
+                    help="optional <sessionId>.json files {contextWindowSize, observedAt} from a status "
+                         "line command; a fresh one overrides --windows")
     ap.add_argument("--allow-host", action="append", default=[], metavar="NAME",
                     help="extra Host/Origin hostname to accept (repeatable); localhost/127.0.0.1/::1 always are")
     ap.add_argument("--windows", help="JSON file: model-id substring -> context window size")
@@ -653,7 +693,8 @@ def main(argv=None):
     extra = list(args.allow_host)
     if args.bind not in ("0.0.0.0", "::"):
         extra.append(args.bind)
-    agent = Agent(args.claude_home, windows, args.token, allow_send=args.allow_send, allowed_hosts=extra)
+    agent = Agent(args.claude_home, windows, args.token, allow_send=args.allow_send, allowed_hosts=extra,
+                  statusline_dir=args.statusline_dir)
     try:
         srv = make_server(agent, args.bind, args.port)
     except ValueError as e:

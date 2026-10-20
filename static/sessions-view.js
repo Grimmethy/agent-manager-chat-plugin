@@ -101,7 +101,7 @@ export function contextLabel(tokens, windowSize) {
 const STATUS_WORDS = { busy: 'Busy', waiting: 'Waiting', idle: 'Idle' };
 
 export function terminalStatusWord(status) {
-  return STATUS_WORDS[status] || 'Idle';
+  return Object.hasOwn(STATUS_WORDS, status) ? STATUS_WORDS[status] : 'Idle';
 }
 
 // 'busy 3m' / 'waiting 12s' / 'idle 2h' from statusSince; the bare word if it is unknown.
@@ -117,7 +117,7 @@ function lastSegment(path) {
 }
 
 export function formatTerminalRow(row, now) {
-  const status = row.status in STATUS_WORDS ? row.status : 'idle';
+  const status = Object.hasOwn(STATUS_WORDS, row.status) ? row.status : 'idle';
   return {
     id: row.id,
     title: truncateTitle(row.name || lastSegment(row.cwd)),
@@ -135,7 +135,7 @@ export function formatTerminalRow(row, now) {
 // Waiting (needs you) first, then busy, then idle; ties by title so the list does not jump.
 export function orderTerminalSessions(rows) {
   const rank = { waiting: 0, busy: 1, idle: 2 };
-  const key = (r) => (r.status in rank ? rank[r.status] : 2);
+  const key = (r) => (Object.hasOwn(rank, r.status) ? rank[r.status] : 2);
   return [...rows].sort((a, b) => key(a) - key(b) || String(a.name || '').localeCompare(String(b.name || '')));
 }
 
