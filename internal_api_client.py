@@ -65,12 +65,12 @@ def reserve(reservation_id: str, model: str, on: bool) -> dict:
     if model:
         body["model"] = model
     try:
-        # Genuinely blocking on the server side (single_flight_lock.acquire() can wait
-        # for a worker lane's current call) -- no short client timeout here, mirroring
-        # the same reasoning the in-tree feature's own comment gives for why acquire()
-        # must never run under a shorter-lived lock.
+        # Server side can block (single_flight_lock.acquire() can wait for a worker
+        # lane's current call), so this is best-effort: a 20s ceiling (matching
+        # preempt() above) keeps a reserved-session refresh from stalling the SSE
+        # stream's start for minutes -- a timeout here is logged, never fatal.
         r = requests.post(f"{CORE_DASHBOARD_URL}/api/internal/chat/reserve", headers=_headers(),
-                           json=body, timeout=300)
+                           json=body, timeout=20)
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:
