@@ -71,9 +71,9 @@ body {
 
 .field-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-top: 14px; }
 
-/* flex:1/min-height:0 here, not height:100% -- #chat-transcript also contains the
+/* flex:1/min-height:0 here, not height:100% -- .chat-transcript-host also contains the
    ".field-label" (Conversation) sibling above this box, so height:100% of the parent
-   overflowed the parent's own box by that label's height, and #chat-transcript's
+   overflowed the parent's own box by that label's height, and .chat-transcript-host's
    overflow:hidden silently clipped the bottom of the transcript by the same amount. */
 .chat-transcript { max-height: none; flex: 1; min-height: 0; overflow-y: auto; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
 .chat-msg-role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }

@@ -25,9 +25,9 @@
      anyway, and the two features drifting independently is fine (each is free to
      evolve without breaking the other), where the in-tree version's shared function had
      a documented class-collision bug from exactly this kind of coupling. -->
-<!-- chat.js's ChatPane builds the whole panel (header with the session switcher,
-     context-log panel, transcript, input) inside this root, with class selectors only, so
-     more than one pane could be mounted on a page later. -->
+<!-- Sole-id contract: #chat-panel is the ONLY id in this document and the sole getElementById contract (mountChat() in static/chat.js).
+     ChatPane.build() replaces its innerHTML with class-based DOM on load, so any consumer (host core-ui.js persistent-sidebar
+     mount, a future multi-pane orchestrator) must query class selectors inside the pane root -- never id-based names. -->
 <div id="chat-panel"></div>
 <!-- type="module" so chat.js can `import` static/vendor/smd.js -- module import
      specifiers resolve against the importing MODULE's own URL, not the document's, so
