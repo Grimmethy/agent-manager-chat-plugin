@@ -197,3 +197,32 @@ Add a one-line comment at each `try/except` site explaining the intent (e.g., "R
 
 Benefits:
 The severity distinction becomes self-documenting and resistant to accidental "fixes." Reviewers can verify at a glance that a change preserves the intended fatal/non-fatal contract, and new contributors understand the design rationale without archaeology.
+
+### AC-20 · Create test_app_integration.py with the seven session-agent route tests
+Strength: Strong
+Split-Depth: 1
+Files: test_app_integration.py
+
+Problem:
+test_agent_client.py currently mixes two concerns in a single AgentRouteTests class: seven tests that spin up a real session_agent server on loopback and exercise app.app HTTP routes (test_disabled_without_url, test_lists_sessions, test_wrong_token_is_unreachable_not_an_error, test_agent_down, test_events_passthrough_hides_token, test_events_exclude_transcript_text, test_token_file_wins_and_is_read_per_call), and two pure unit tests of agent_client (test_filter_events_reassembles_split_blocks, test_list_sessions_rejects_wrong_shape). Because the class-level setUp unconditionally starts a threaded HTTP server, even the two unit tests pay the cost of importing app, session_agent, and the fixture tree. The integration tests need a dedicated file that owns the server lifecycle and the app/session_agent imports, so the unit tests can later be isolated in a file that has zero dependency on the server stack.
+
+Solution:
+Create a new file test_app_integration.py at the same directory level as test_agent_client.py. It contains: a module docstring describing the integration scope; imports for json, os, shutil, sys, tempfile, threading, unittest, pathlib.Path, unittest.mock, and the three project modules (agent_client, app, session_agent) after a sys.path.insert; the FIXTURE_HOME and TOKEN module-level constants; a single TestCase class (e.g. AgentRouteIntegrationTests) whose setUp copies the fixture tree, constructs session_agent.Agent, starts the make_server on 127.0.0.1:0 in a daemon thread, and creates app.app.test_client(); the _stop and env helper methods; and exactly the seven integration test methods listed above, copied verbatim. The __main__ guard runs unittest.main(). No unit-test methods are included.
+
+Benefits:
+The integration tests live in a file whose name and docstring make the server dependency explicit. CI or a developer can run just the fast unit tests without paying server-startup cost, and the integration file can be tagged or excluded in lightweight CI stages. The file is self-contained: it owns the fixture path, the server lifecycle, and the app imports, so nothing is shared across the split.
+
+### AC-21 · Trim test_agent_client.py to the two agent_client unit tests only
+Strength: Strong
+Split-Depth: 1
+Files: test_agent_client.py
+Depends-On: AC-20
+
+Problem:
+After the integration tests are extracted to test_app_integration.py (candidate 0), test_agent_client.py still contains the full AgentRouteTests class with its server-starting setUp, the app and session_agent imports, the FIXTURE_HOME/TOKEN constants, and the seven integration methods. The two unit tests (test_filter_events_reassembles_split_blocks, test_list_sessions_rejects_wrong_shape) are buried inside that class and inherit the server setUp/tearDown, meaning they cannot run in an environment where app or session_agent are absent. The file's docstring also claims to test 'the terminal-sessions routes, against a REAL session_agent server', which is no longer accurate once the integration tests are gone.
+
+Solution:
+Rewrite test_agent_client.py to contain only: an updated module docstring ('Unit tests for agent_client.py — no server, no app import'); imports limited to os, sys, unittest, pathlib.Path, unittest.mock, and agent_client (after sys.path.insert); a single TestCase class (e.g. AgentClientUnitTests) with no setUp/tearDown; the two test methods test_filter_events_reassembles_split_blocks and test_list_sessions_rejects_wrong_shape copied verbatim; and the __main__ guard. Remove the app, session_agent, threading, tempfile, shutil, and json imports; remove FIXTURE_HOME, TOKEN, the env helper, _stop, and all seven integration methods. The file must be importable and runnable in an environment where app and session_agent are not installed.
+
+Benefits:
+The unit-test file has a clean, minimal import surface (agent_client + stdlib only), so it can be collected and executed in any environment that has agent_client.py but not the full server stack. Running the unit tests no longer starts a threaded HTTP server, reducing test time from the server-startup baseline to milliseconds. The file name test_agent_client.py now accurately reflects its content: pure unit tests of the agent_client module.
