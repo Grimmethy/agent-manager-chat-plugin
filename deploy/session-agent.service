@@ -1,0 +1,14 @@
+# Template: copy to ~/.config/systemd/user/session-agent.service, adjust paths, then
+#   systemctl --user daemon-reload && systemctl --user enable --now session-agent
+[Unit]
+Description=Claude Code session agent
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /path/to/agent-manager-chat-plugin/session_agent.py --port 7450
+# Loopback by default. For a non-loopback --bind, set a token (checked on every request):
+# Environment=AM_AGENT_TOKEN=<set-a-long-random-value>
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

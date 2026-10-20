@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""Session agent: discovers local Claude Code terminal sessions and serves them over HTTP.
+
+Stdlib only. Per session it reports status, current step, context size and a busy/idle
+timer source, and it streams changes over Server-Sent Events. Sources:
+  * `claude agents --json --all` (documented listing; optional, registry files are the fallback)
+  * ~/.claude/sessions/<pid>.json (UNDOCUMENTED registry; every key is optional here)
+  * ~/.claude/projects/*/<sessionId>.jsonl (transcripts; tailed by byte offset, never re-read)
+Transcripts are private: loopback bind by default, a non-loopback bind needs a token, and
+no message text is ever logged.
+"""
+import argparse
+import hmac
+import ipaddress
+import json
+import os
+import queue
+import re
+import socket
+import subprocess
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+MAX_LINE = 1024 * 1024  # transcript lines larger than this (api-request-blob...) are skipped unparsed
+TEXT_CAP = 2000
+STEP_CAP = 40
+DEFAULT_LIMIT = 200
+STATUSES = ("busy", "idle", "waiting")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+CURSOR_RE = re.compile(r"^o(\d+)$")
+
+
+def iso_from_ms(ms):
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def map_status(*raw):
+    """First recognised value of (status, state); anything else is idle."""
+    for value in raw:
+        if isinstance(value, str) and value.lower() in STATUSES:
+            return value.lower()
+    return "idle"
+
+
+def pid_alive(pid):
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def load_windows(path):
+    """JSON {model-id substring: window size}. Missing file -> error; bad entries dropped."""
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError("windows config must be a JSON object")
+    return {k: v for k, v in raw.items()
+            if isinstance(k, str) and k and isinstance(v, int) and not isinstance(v, bool) and v > 0}
+
+
+def window_for(model, table):
+    if not isinstance(model, str):
+        return None
+    for key in sorted(table, key=len, reverse=True):
+        if key in model:
+            return table[key]
+    return None
+
+
+def one_line(text, cap):
+    return " ".join(str(text).split())[:cap]
+
+
+def tool_summary(block):
+    """'Bash: <first 40 chars>' for a tool_use block."""
+    name = block.get("name") if isinstance(block.get("name"), str) else "tool"
+    inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+    for key in ("command", "file_path", "pattern", "path", "url", "description"):
+        if isinstance(inp.get(key), str) and inp[key].strip():
+            return f"{name}: {one_line(inp[key], STEP_CAP)}"
+    return name
+
+
+def entries_of(obj):
+    """Role + text/tool summaries for one transcript object (sidechains excluded)."""
+    if not isinstance(obj, dict) or obj.get("isSidechain") is True:
+        return []
+    kind, msg = obj.get("type"), obj.get("message")
+    if kind not in ("user", "assistant") or not isinstance(msg, dict):
+        return []
+    ts = obj.get("timestamp") if isinstance(obj.get("timestamp"), str) else None
+    content = msg.get("content")
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    out = []
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and isinstance(block.get("text"), str) and block["text"].strip():
+            out.append({"role": kind, "text": block["text"][:TEXT_CAP], "ts": ts})
+        elif block.get("type") == "tool_use" and kind == "assistant":
+            out.append({"role": "tool", "text": tool_summary(block), "ts": ts})
+    return out
+
+
+def iter_lines(path, offset):
+    """Yield (object|None, end_offset) per complete line from `offset`. Partial trailing
+    lines wait for the next call; oversized or corrupt lines yield None."""
+    try:
+        f = open(path, "rb")
+    except OSError:
+        return
+    with f:
+        f.seek(offset)
+        while True:
+            raw = f.readline(MAX_LINE + 1)
+            if not raw:
+                return
+            oversized = len(raw) > MAX_LINE and not raw.endswith(b"\n")
+            if oversized:
+                while not raw.endswith(b"\n"):
+                    raw = f.readline(MAX_LINE)
+                    if not raw:
+                        return  # still being written; retry from the line start
+            elif not raw.endswith(b"\n"):
+                return
+            offset = f.tell()
+            obj = None
+            if not oversized and (b'"assistant"' in raw or b'"user"' in raw):
+                try:
+                    obj = json.loads(raw)
+                except ValueError:
+                    obj = None
+            yield (obj if isinstance(obj, dict) else None), offset
+
+
+def read_registry(home):
+    out = []
+    try:
+        names = sorted(os.listdir(home / "sessions"))
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(home / "sessions" / name, "rb") as f:
+                data = json.loads(f.read(65536))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("pid") is None and name[:-5].isdigit():
+            data["pid"] = int(name[:-5])
+        out.append(data)
+    return out
+
+
+def run_claude_agents():
+    try:
+        res = subprocess.run(["claude", "agents", "--json", "--all"], capture_output=True,
+                             text=True, timeout=10, check=True)
+        data = json.loads(res.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else None
+
+
+class TranscriptState:
+    """Incremental view of one session's transcript."""
+
+    def __init__(self, home, session_id):
+        self.home, self.session_id = home, session_id
+        self.path, self.offset, self.ready = None, 0, False
+        self._reset()
+
+    def _reset(self):
+        self.context = self.model = self.step = self.last_ts = None
+
+    def _find(self):
+        for p in sorted((self.home / "projects").glob(f"*/{self.session_id}.jsonl")):
+            return p
+        return None
+
+    def apply(self, obj):
+        if obj.get("isSidechain") is True:
+            return
+        if isinstance(obj.get("timestamp"), str):
+            self.last_ts = obj["timestamp"]
+        msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        if obj.get("type") == "user":
+            if any(e["role"] == "user" for e in entries_of(obj)):
+                self.step = None  # a new prompt starts a fresh turn
+        elif obj.get("type") == "assistant":
+            usage = msg.get("usage")
+            if isinstance(usage, dict):
+                nums = [usage.get(k) for k in ("input_tokens", "cache_read_input_tokens",
+                                               "cache_creation_input_tokens")]
+                self.context = sum(n for n in nums if isinstance(n, int) and not isinstance(n, bool))
+            if isinstance(msg.get("model"), str):
+                self.model = msg["model"]
+            for e in entries_of(obj):
+                if e["role"] == "tool":
+                    self.step = e["text"]
+
+    def poll(self):
+        """Consume new lines; return new entries (empty on the initial catch-up scan)."""
+        if self.path is None:
+            self.path = self._find()
+            if self.path is None:
+                return []
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            self.path = None
+            return []
+        if size < self.offset:  # truncated or replaced
+            self.offset, self.ready = 0, False
+            self._reset()
+        if size == self.offset:
+            self.ready = True
+            return []
+        entries = []
+        for obj, end in iter_lines(self.path, self.offset):
+            self.offset = end
+            if obj is not None:
+                self.apply(obj)
+                entries.extend(entries_of(obj))
+        first, self.ready = not self.ready, True
+        return [] if first else entries
+
+
+def read_transcript(path, cursor, limit):
+    """Entries after byte-offset `cursor`; returns (entries, next_offset)."""
+    entries, nxt = [], cursor
+    for obj, end in iter_lines(path, cursor):
+        es = entries_of(obj) if obj is not None else []
+        if entries and len(entries) + len(es) > limit:
+            break
+        entries.extend(es)
+        nxt = end
+        if len(entries) >= limit:
+            break
+    return entries, nxt
+
+
+class Hub:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.clients = []
+
+    def subscribe(self, initial=()):
+        q = queue.Queue(maxsize=1000)
+        for item in initial:
+            q.put_nowait(item)
+        with self.lock:
+            self.clients.append(q)
+        return q
+
+    def unsubscribe(self, q):
+        with self.lock:
+            if q in self.clients:
+                self.clients.remove(q)
+
+    def publish(self, event, data):
+        with self.lock:
+            for q in self.clients:
+                try:
+                    q.put_nowait((event, data))
+                except queue.Full:
+                    pass  # slow client: drop rather than block the poller
+
+
+class Agent:
+    def __init__(self, home, windows=None, token=None, host=None, lister=run_claude_agents,
+                 alive=pid_alive, cli_ttl=2.0):
+        self.home, self.windows, self.token = Path(home), windows or {}, token
+        self.host = host or socket.gethostname()
+        self.lister, self.alive, self.cli_ttl = lister, alive, cli_ttl
+        self.hub, self.lock, self.stop = Hub(), threading.Lock(), threading.Event()
+        self.rows, self.states = {}, {}
+        self._cli, self._cli_at = None, 0.0
+
+    def discover(self):
+        now = time.monotonic()
+        if self.lister and now - self._cli_at >= self.cli_ttl:
+            self._cli, self._cli_at = self.lister(), now
+        merged = {}
+        for src in (read_registry(self.home), self._cli or []):  # CLI (documented) wins
+            for d in src:
+                sid = d.get("sessionId")
+                if isinstance(sid, str) and SESSION_ID_RE.match(sid):
+                    merged[sid] = {**merged.get(sid, {}), **d}
+        return [d for d in merged.values() if self.alive(d.get("pid"))]
+
+    def build_row(self, meta, st):
+        waiting_for = meta.get("waitingFor")
+        waiting_for = str(waiting_for)[:80] if waiting_for is not None else None
+        status = map_status(meta.get("status"), meta.get("state"))
+        if status == "waiting" and waiting_for:
+            step = f"Waiting: {waiting_for}"
+        elif st.step:
+            step = st.step
+        else:
+            step = "Thinking" if status == "busy" else None
+        since = iso_from_ms(meta.get("statusUpdatedAt")) or st.last_ts or iso_from_ms(meta.get("startedAt"))
+        name = meta.get("name")
+        return {
+            "id": meta["sessionId"],
+            "name": name if isinstance(name, str) else None,
+            "cwd": meta.get("cwd") if isinstance(meta.get("cwd"), str) else None,
+            "kind": meta.get("kind") if isinstance(meta.get("kind"), str) else None,
+            "pid": meta.get("pid"),
+            "status": status,
+            "waitingFor": waiting_for,
+            "statusSince": since,
+            "step": step,
+            "contextTokens": st.context,
+            "contextWindow": window_for(st.model, self.windows),
+            "model": st.model,
+            "startedAt": iso_from_ms(meta.get("startedAt")),
+            "host": self.host,
+        }
+
+    def refresh(self):
+        new_rows, events = {}, []
+        for meta in self.discover():
+            sid = meta["sessionId"]
+            st = self.states.setdefault(sid, TranscriptState(self.home, sid))
+            entries = st.poll()
+            row = self.build_row(meta, st)
+            new_rows[sid] = row
+            if entries:
+                events.append(("transcript.append",
+                               {"id": sid, "entries": entries, "next": f"o{st.offset}"}))
+            if row != self.rows.get(sid):
+                events.append(("session.updated", row))
+        for sid in set(self.rows) - set(new_rows):
+            self.states.pop(sid, None)
+            events.append(("session.removed", {"id": sid}))
+        with self.lock:
+            self.rows = new_rows
+        for ev in events:
+            self.hub.publish(*ev)
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.rows.values())
+
+    def poll_forever(self, interval):
+        while not self.stop.wait(interval):
+            try:
+                self.refresh()
+            except Exception:  # never let one bad poll kill the agent; never log content
+                pass
+
+
+def is_loopback(host):
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class Handler(BaseHTTPRequestHandler):
+    agent = None
+
+    def log_message(self, *args):  # request lines can carry ids; keep the agent silent
+        pass
+
+    def _json(self, code, body):
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _authorized(self):
+        token = self.agent.token
+        if not token:
+            return True
+        got = self.headers.get("Authorization", "")
+        return hmac.compare_digest(got.encode(), f"Bearer {token}".encode())
+
+    def do_GET(self):
+        if not self._authorized():
+            return self._json(401, {"error": "unauthorized"})
+        url = urlparse(self.path)
+        parts = [p for p in url.path.split("/") if p]
+        if parts == ["healthz"]:
+            return self._json(200, {"ok": True})
+        if parts == ["sessions"]:
+            return self._json(200, self.agent.snapshot())
+        if parts == ["events"]:
+            return self._events()
+        if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "transcript":
+            return self._transcript(parts[1], parse_qs(url.query))
+        self._json(404, {"error": "not found"})
+
+    def _transcript(self, sid, qs):
+        st = self.agent.states.get(sid)
+        if st is None or st.path is None:
+            return self._json(404, {"error": "unknown session"})
+        since = qs.get("since", [""])[0]
+        m = CURSOR_RE.match(since) if since else None
+        if since and not m:
+            return self._json(400, {"error": "bad cursor"})
+        try:
+            limit = min(max(int(qs.get("limit", [DEFAULT_LIMIT])[0]), 1), DEFAULT_LIMIT)
+        except ValueError:
+            return self._json(400, {"error": "bad limit"})
+        entries, nxt = read_transcript(st.path, int(m.group(1)) if m else 0, limit)
+        self._json(200, {"entries": entries, "next": f"o{nxt}"})
+
+    def _events(self):
+        agent = self.agent
+        q = agent.hub.subscribe([("session.updated", r) for r in agent.snapshot()])
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        last = time.monotonic()
+        try:
+            while not agent.stop.is_set():
+                try:
+                    event, data = q.get(timeout=0.5)
+                    out = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+                except queue.Empty:
+                    if time.monotonic() - last < 15:
+                        continue
+                    out = ": keepalive\n\n"
+                self.wfile.write(out.encode())
+                self.wfile.flush()
+                last = time.monotonic()
+        except OSError:
+            pass
+        finally:
+            agent.hub.unsubscribe(q)
+
+
+def make_server(agent, host, port):
+    if not is_loopback(host) and not agent.token:
+        raise ValueError("a non-loopback bind requires --token (or AM_AGENT_TOKEN)")
+    handler = type("BoundHandler", (Handler,), {"agent": agent})
+    srv = ThreadingHTTPServer((host, port), handler)
+    srv.daemon_threads = True
+    return srv
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--bind", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=7450)
+    ap.add_argument("--token", default=os.environ.get("AM_AGENT_TOKEN"))
+    ap.add_argument("--claude-home", default=str(Path.home() / ".claude"))
+    ap.add_argument("--windows", help="JSON file: model-id substring -> context window size")
+    ap.add_argument("--interval", type=float, default=1.0, help="poll interval, seconds")
+    args = ap.parse_args(argv)
+    windows = load_windows(args.windows) if args.windows else {}
+    agent = Agent(args.claude_home, windows, args.token)
+    try:
+        srv = make_server(agent, args.bind, args.port)
+    except ValueError as e:
+        ap.error(str(e))
+    agent.refresh()
+    threading.Thread(target=agent.poll_forever, args=(args.interval,), daemon=True).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        agent.stop.set()
+
+
+if __name__ == "__main__":
+    main()

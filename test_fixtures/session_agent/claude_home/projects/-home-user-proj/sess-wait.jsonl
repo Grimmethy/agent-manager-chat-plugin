@@ -1,0 +1,1 @@
+{"type": "assistant", "timestamp": "2026-01-01T00:00:05Z", "sessionId": "x", "isSidechain": false, "message": {"model": "claude-sonnet-5-5", "usage": {"input_tokens": 1, "cache_creation_input_tokens": 2, "cache_read_input_tokens": 3, "output_tokens": 7}, "content": [{"type": "text", "text": "need approval"}]}}

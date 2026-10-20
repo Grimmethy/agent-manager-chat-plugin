@@ -1,0 +1,14 @@
+{
+ "pid": 1001,
+ "sessionId": "sess-busy",
+ "cwd": "/home/user/proj",
+ "startedAt": 1792301206964,
+ "version": "0.0.0",
+ "kind": "interactive",
+ "entrypoint": "cli",
+ "name": "proj-busy",
+ "status": "busy",
+ "statusUpdatedAt": 1792301300000,
+ "updatedAt": 1792301300000,
+ "messagingSocketPath": "/tmp/fake-busy.sock"
+}

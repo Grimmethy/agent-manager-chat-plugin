@@ -1,0 +1,12 @@
+{
+ "pid": 1003,
+ "sessionId": "sess-dead",
+ "cwd": "/home/user/proj",
+ "startedAt": 1792301206964,
+ "version": "0.0.0",
+ "kind": "interactive",
+ "entrypoint": "cli",
+ "name": "proj-dead",
+ "status": "busy",
+ "statusUpdatedAt": 1792301300000
+}

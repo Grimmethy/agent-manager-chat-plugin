@@ -1,0 +1,14 @@
+{
+ "pid": 1004,
+ "sessionId": "sess-idle",
+ "cwd": "/home/user/proj",
+ "startedAt": 1792301206964,
+ "version": "0.0.0",
+ "kind": "interactive",
+ "entrypoint": "cli",
+ "name": "proj-idle",
+ "status": "idle",
+ "extra_unknown_key": {
+  "x": 1
+ }
+}

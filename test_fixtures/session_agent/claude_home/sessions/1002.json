@@ -1,0 +1,13 @@
+{
+ "pid": 1002,
+ "sessionId": "sess-wait",
+ "cwd": "/home/user/proj",
+ "startedAt": 1792301206964,
+ "version": "0.0.0",
+ "kind": "interactive",
+ "entrypoint": "cli",
+ "name": "proj-wait",
+ "status": "waiting",
+ "waitingFor": "permission prompt",
+ "statusUpdatedAt": 1792301400000
+}

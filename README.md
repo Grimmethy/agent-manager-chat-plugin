@@ -63,3 +63,27 @@ real turn against the live Ollama backend).
 Session storage lives at `~/.local/state/agent-manager-chat-plugin/sessions/` by
 default (override with `AGENT_MANAGER_CHAT_STORAGE_DIR`) -- independent of the core
 repo's own root, unlike the in-tree feature's hardcoded `CHAT_STORAGE_DIR`.
+
+## Session agent (`session_agent.py`)
+
+Standalone, stdlib-only (Python 3.12) helper that runs on the developer's machine, discovers
+local Claude Code terminal sessions and serves them over HTTP for the chat panel to consume
+later. It does not touch the Flask app.
+
+```
+python3 session_agent.py [--bind 127.0.0.1] [--port 7450] [--token T | AM_AGENT_TOKEN=T] \
+    [--windows windows.json] [--claude-home ~/.claude] [--interval 1.0]
+```
+
+- `GET /healthz`, `GET /sessions`, `GET /sessions/<id>/transcript?since=<cursor>&limit=200`,
+  `GET /events` (SSE: `session.updated`, `session.removed`, `transcript.append`).
+- Sources: `claude agents --json --all` (documented), the undocumented
+  `~/.claude/sessions/<pid>.json` registry (all keys optional; also the fallback if the CLI is
+  unavailable) and the transcripts, tailed by byte offset.
+- Context = input + cache-read + cache-creation tokens of the latest non-sidechain assistant line.
+- `contextWindow` is `null` unless `--windows` maps a model-id substring to a size, e.g.
+  `{"some-model-substring": 123456}` (the agent ships no numbers).
+- Transcripts are private: loopback bind by default; a non-loopback `--bind` refuses to start
+  without a token, and with a token every request needs `Authorization: Bearer <token>`.
+  Message text is never logged.
+- systemd template: `deploy/session-agent.service`.
