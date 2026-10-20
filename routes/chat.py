@@ -3,6 +3,10 @@ from flask import Blueprint, Response, abort, jsonify, request, session, stream_
 import json
 import sys
 
+import requests
+
+import agent_client
+
 # The app.py helpers these views call (CHAT_STORAGE_DIR, _call_chat, _chat_roots,
 # _discuss_provider_args) are imported lazily inside each view: app.py imports THIS
 # module to register the blueprint, so a top-level `from app import ...` is a circular
@@ -50,6 +54,42 @@ def api_chat_sessions():
     from app import CHAT_STORAGE_DIR
     from chat_sessions import list_sessions
     return jsonify(list_sessions(CHAT_STORAGE_DIR))
+
+
+@chat_bp.route("/api/chat/terminal-sessions", methods=["GET"])
+def api_terminal_sessions():
+    """Local Claude Code terminal sessions, as reported by the optional session agent
+    (agent_client.py). Never an error: 'enabled' says whether the feature is configured,
+    'reachable' whether the agent answered. Read-only."""
+    if not agent_client.enabled():
+        return jsonify({"enabled": False, "reachable": False, "sessions": []})
+    try:
+        return jsonify({"enabled": True, "reachable": True, "sessions": agent_client.list_sessions()})
+    except agent_client.AgentError:
+        return jsonify({"enabled": True, "reachable": False, "sessions": []})
+
+
+@chat_bp.route("/api/chat/terminal-sessions/events", methods=["GET"])
+def api_terminal_sessions_events():
+    """SSE passthrough of the session agent's /events (the agent token stays server-side).
+    The stream just ends if the agent goes away; the browser's EventSource reconnects."""
+    if not agent_client.enabled():
+        abort(404, description="session agent is not configured")
+    try:
+        upstream = agent_client.open_events()
+    except agent_client.AgentError:
+        abort(502, description="session agent is unreachable")
+
+    def relay():
+        try:
+            yield from agent_client.filter_events(agent_client.iter_chunks(upstream))
+        except (requests.RequestException, OSError):
+            pass
+        finally:
+            upstream.close()
+
+    return Response(stream_with_context(relay()), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @chat_bp.route("/api/chat/<session_id>", methods=["GET"])

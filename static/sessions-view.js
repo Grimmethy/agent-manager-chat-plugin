@@ -77,3 +77,86 @@ export function formatRow(row, now) {
     context: null, // TODO(context): not reported by plugin chats yet -- see comment above
   };
 }
+
+// --- Terminal sessions (read-only rows reported by the local session agent) ---------------
+
+export function formatTokens(n) {
+  if (!Number.isFinite(n) || n < 0) return null;
+  if (n < 1000) return String(Math.round(n));
+  if (n < 1000000) return Math.round(n / 1000) + 'k';
+  return (n / 1000000).toFixed(1) + 'M';
+}
+
+// '138k / 1.0M (14%)' when the agent knows the window, else just '138k tokens' -- the agent
+// reports contextWindow:null for models it has no configured size for, and nothing is guessed.
+export function contextLabel(tokens, windowSize) {
+  const used = formatTokens(tokens);
+  if (used == null) return null;
+  if (Number.isFinite(windowSize) && windowSize > 0) {
+    return used + ' / ' + formatTokens(windowSize) + ' (' + Math.round((tokens / windowSize) * 100) + '%)';
+  }
+  return used + ' tokens';
+}
+
+const STATUS_WORDS = { busy: 'Busy', waiting: 'Waiting', idle: 'Idle' };
+
+export function terminalStatusWord(status) {
+  return Object.hasOwn(STATUS_WORDS, status) ? STATUS_WORDS[status] : 'Idle';
+}
+
+// 'busy 3m' / 'waiting 12s' / 'idle 2h' from statusSince; the bare word if it is unknown.
+// A busy row with no transcript activity for STALE_BUSY_SECS reads 'busy, no activity 29h'.
+// A session can show 'busy' for a day with nothing written to its transcript (hung, or its
+// process was suspended): past this much silence say so instead of presenting a busy timer.
+export const STALE_BUSY_SECS = 3600;
+
+export function terminalTimer(row, now) {
+  const word = terminalStatusWord(row && row.status).toLowerCase();
+  if (row && row.status === 'busy') {
+    const quiet = secondsSince(row.lastActivityAt || null, now);
+    if (quiet != null && quiet >= STALE_BUSY_SECS) return 'busy, no activity ' + formatDuration(quiet);
+  }
+  const secs = secondsSince((row && row.statusSince) || null, now);
+  return secs == null ? word : word + ' ' + formatDuration(secs);
+}
+
+function lastSegment(path) {
+  const parts = String(path || '').split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+
+export function formatTerminalRow(row, now) {
+  const status = Object.hasOwn(STATUS_WORDS, row.status) ? row.status : 'idle';
+  return {
+    id: row.id,
+    title: truncateTitle(row.name || lastSegment(row.cwd)),
+    fullTitle: row.cwd || '',
+    status: terminalStatusWord(status),
+    busy: status === 'busy',
+    waiting: status === 'waiting',
+    timer: terminalTimer(row, now),
+    step: row.step || '',
+    context: contextLabel(row.contextTokens, row.contextWindow),
+    model: row.model || '',
+  };
+}
+
+// Waiting (needs you) first, then busy, then idle; ties by title so the list does not jump.
+export function orderTerminalSessions(rows) {
+  const rank = { waiting: 0, busy: 1, idle: 2 };
+  const key = (r) => (Object.hasOwn(rank, r.status) ? rank[r.status] : 2);
+  return [...rows].sort((a, b) => key(a) - key(b) || String(a.name || '').localeCompare(String(b.name || '')));
+}
+
+// SSE reducer: 'session.updated' upserts a full row, 'session.removed' drops it; anything
+// else (e.g. 'transcript.append') leaves the rows alone. Never mutates its input.
+export function applyTerminalEvent(rows, event, data) {
+  if (!data || typeof data.id !== 'string') return rows;
+  if (event === 'session.removed') return rows.filter((r) => r.id !== data.id);
+  if (event !== 'session.updated') return rows;
+  const i = rows.findIndex((r) => r.id === data.id);
+  if (i === -1) return [...rows, data];
+  const next = [...rows];
+  next[i] = data;
+  return next;
+}
