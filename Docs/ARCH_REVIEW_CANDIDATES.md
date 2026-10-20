@@ -197,3 +197,19 @@ Add a one-line comment at each `try/except` site explaining the intent (e.g., "R
 
 Benefits:
 The severity distinction becomes self-documenting and resistant to accidental "fixes." Reviewers can verify at a glance that a change preserves the intended fatal/non-fatal contract, and new contributors understand the design rationale without archaeology.
+
+### AC-26 · ~~Duplicated SSE block-parsing logic between client and test~~
+Strength: Strong
+
+**Retracted.**
+
+The original draft asserted that `test_filter_events_reassembles_split_blocks` re-implements the SSE parsing state machine (partial-line buffers, delimiter tracking, block-boundary logic) to construct its expected output. The provided source for `test_agent_client.py` does not support this claim. The test:
+
+1. Defines a single hardcoded byte string containing a few SSE blocks.
+2. Splits it into fixed-size (7-byte) chunks.
+3. Feeds those chunks to `agent_client.filter_events`.
+4. Asserts that the returned value equals a hardcoded expected byte string.
+
+There is no duplicated parsing logic, no re-derivation of intermediate buffer state, and no coupling to internal delimiter-handling mechanics. The test is already a black-box exercise of `filter_events`'s observable contract. Because the stated problem does not exist, the proposed rewrite is unnecessary and the finding is withdrawn in its entirety.
+
+NOTE: Flag 1 was applied in full; the finding is retracted because its core premise (that the test re-implements the parsing state machine) is contradicted by the actual source code, making the entire problem/solution/benefits chain inapplicable.
