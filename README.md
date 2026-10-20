@@ -93,3 +93,11 @@ python3 session_agent.py [--bind 127.0.0.1] [--port 7450] [--token T | AM_AGENT_
   undocumented, so the payload is an unverified placeholder (see the `TODO(peer-message)`
   block in `session_agent.py`). Peer messages are "not from the user" and cannot approve
   permission prompts.
+
+### Showing terminal sessions in the chat panel
+
+Set `AGENT_MANAGER_SESSION_AGENT_URL` (e.g. `http://127.0.0.1:7450`) and, if the agent uses a
+token, `AGENT_MANAGER_SESSION_AGENT_TOKEN` in the plugin's environment. The session switcher then
+gets a read-only "Terminal sessions" group (status, timer, current step, context size) fed by
+`GET api/chat/terminal-sessions` and the SSE passthrough `GET api/chat/terminal-sessions/events`
+(the token stays server-side). Unset URL = feature off; agent down = "Session agent unreachable".

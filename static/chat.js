@@ -23,7 +23,8 @@
 // markdown they're asking to be formatted, and rendering it would just be a bigger HTML
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
-import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow } from "./sessions-view.js";
+import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
+  formatTerminalRow, orderTerminalSessions, applyTerminalEvent } from "./sessions-view.js";
 
 let toastHideTimer = null;
 
@@ -500,6 +501,9 @@ class SessionSwitcher {
     this.onClose = onClose;
     this.getRoots = getRoots || (() => []);
     this.rows = [];
+    // Read-only terminal sessions from the optional session agent (see agent_client.py).
+    this.terminal = { enabled: false, reachable: false, rows: [] };
+    this.events = null;
     this.open = false;
     this.pollTimer = null;
     this.slot.innerHTML = `
@@ -520,10 +524,31 @@ class SessionSwitcher {
     this.btn.setAttribute('aria-expanded', String(open));
     clearInterval(this.pollTimer);
     this.pollTimer = null;
+    this.stopEvents();
     if (open) {
-      this.refresh();
+      this.refresh().then(() => { if (this.open) this.startEvents(); });
       this.pollTimer = setInterval(() => this.refresh(), 5000);
     }
+  }
+
+  // Live terminal-session updates while the dropdown is open. EventSource reconnects by
+  // itself; the 5s refresh() above is the fallback when the stream is down.
+  startEvents() {
+    if (this.events || !this.terminal.enabled || !this.terminal.reachable || typeof EventSource === 'undefined') return;
+    this.events = new EventSource('api/chat/terminal-sessions/events');
+    for (const name of ['session.updated', 'session.removed']) {
+      this.events.addEventListener(name, (e) => {
+        let data = null;
+        try { data = JSON.parse(e.data); } catch (err) { return; }
+        this.terminal.rows = applyTerminalEvent(this.terminal.rows, name, data);
+        this.render();
+      });
+    }
+  }
+
+  stopEvents() {
+    if (this.events) this.events.close();
+    this.events = null;
   }
 
   async refresh() {
@@ -531,6 +556,12 @@ class SessionSwitcher {
       this.rows = orderSessions(await fetchJson('api/chat/sessions'));
     } catch (e) {
       // Keep the last known rows; the dropdown just goes stale until the next tick.
+    }
+    try {
+      const t = await fetchJson('api/chat/terminal-sessions');
+      this.terminal = { enabled: !!t.enabled, reachable: !!t.reachable, rows: Array.isArray(t.sessions) ? t.sessions : [] };
+    } catch (e) {
+      // Same: keep what we had.
     }
     this.render();
     return this.rows;
@@ -564,12 +595,36 @@ class SessionSwitcher {
     </div>`;
   }
 
+  // A terminal session row: display only (no select, no close) until a handoff exists.
+  renderTerminalRow(fmt) {
+    const ctx = fmt.context ? `<span class="chat-switcher-context">${escapeHtml(fmt.context)}</span>` : '';
+    const step = fmt.step ? `<div class="chat-switcher-step">${escapeHtml(fmt.step)}</div>` : '';
+    return `<div class="chat-switcher-trow" title="${escapeHtml(fmt.fullTitle)}">
+      <div class="chat-switcher-title">${escapeHtml(fmt.title)}</div>
+      <div class="chat-switcher-meta">
+        <span class="chat-switcher-status${fmt.busy ? ' busy' : ''}${fmt.waiting ? ' waiting' : ''}">${escapeHtml(fmt.status)}</span>
+        <span>${escapeHtml(fmt.timer)}</span>${ctx}
+      </div>${step}
+    </div>`;
+  }
+
+  renderTerminalSection(now) {
+    const t = this.terminal;
+    if (!t.enabled) return '';
+    let body;
+    if (!t.reachable) body = '<div class="chat-switcher-empty">Session agent unreachable</div>';
+    else if (!t.rows.length) body = '<div class="chat-switcher-empty">No terminal sessions</div>';
+    else body = orderTerminalSessions(t.rows).map((r) => this.renderTerminalRow(formatTerminalRow(r, now))).join('');
+    return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${body}`;
+  }
+
   render() {
     this.renderButton();
     const now = Date.now();
     const selectedId = this.getSelectedId();
     this.menu.innerHTML = `<div class="chat-switcher-new" role="option">+ New chat</div>`
-      + this.rows.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('');
+      + this.rows.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('')
+      + this.renderTerminalSection(now);
   }
 
   async onMenuClick(e) {

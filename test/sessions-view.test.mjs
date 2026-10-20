@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   truncateTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
   orderSessions, nextSelectionAfterClose, formatRow,
+  formatTokens, contextLabel, terminalTimer, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
 } from '../static/sessions-view.js';
 
 const NOW = Date.parse('2026-10-19T12:00:00Z');
@@ -83,4 +84,44 @@ test('formatRow', () => {
   assert.equal(r.turns, '1 turn');
   assert.equal(r.context, null);
   assert.equal(formatRow({ id: 'y', turnCount: 0, busy: true }, NOW).turns, '0 turns');
+});
+
+test('formatTokens / contextLabel: window null shows tokens alone', () => {
+  assert.equal(formatTokens(999), '999');
+  assert.equal(formatTokens(138028), '138k');
+  assert.equal(formatTokens(1500000), '1.5M');
+  assert.equal(formatTokens(null), null);
+  assert.equal(contextLabel(138028, null), '138k tokens');
+  assert.equal(contextLabel(50000, 200000), '50k / 200k (25%)');
+  assert.equal(contextLabel(null, 200000), null);
+  assert.equal(contextLabel(5, 0), '5 tokens');
+});
+
+test('terminalTimer / formatTerminalRow', () => {
+  const row = { id: 'a', name: 'proj-1', cwd: '/x/y/proj', status: 'busy', statusSince: '2026-10-19T11:57:00Z',
+    step: 'Bash: ls', contextTokens: 2000, contextWindow: null, model: 'm' };
+  assert.equal(terminalTimer(row, NOW), 'busy 3m');
+  assert.equal(terminalTimer({ status: 'waiting' }, NOW), 'waiting');
+  const fmt = formatTerminalRow(row, NOW);
+  assert.deepEqual([fmt.title, fmt.status, fmt.busy, fmt.waiting, fmt.step, fmt.context],
+    ['proj-1', 'Busy', true, false, 'Bash: ls', '2k tokens']);
+  assert.equal(formatTerminalRow({ id: 'b', cwd: '/x/y/proj', status: 'weird' }, NOW).title, 'proj');
+  assert.equal(formatTerminalRow({ id: 'b', status: 'weird' }, NOW).status, 'Idle');
+});
+
+test('orderTerminalSessions: waiting, busy, idle', () => {
+  const rows = [{ id: '1', name: 'b', status: 'idle' }, { id: '2', name: 'a', status: 'busy' },
+    { id: '3', name: 'c', status: 'waiting' }, { id: '4', name: 'a', status: 'idle' }];
+  assert.deepEqual(orderTerminalSessions(rows).map((r) => r.id), ['3', '2', '4', '1']);
+});
+
+test('applyTerminalEvent', () => {
+  const a = { id: 'a', status: 'idle' };
+  let rows = applyTerminalEvent([], 'session.updated', a);
+  assert.deepEqual(rows, [a]);
+  rows = applyTerminalEvent(rows, 'session.updated', { id: 'a', status: 'busy' });
+  assert.deepEqual(rows, [{ id: 'a', status: 'busy' }]);
+  assert.equal(applyTerminalEvent(rows, 'transcript.append', { id: 'a', entries: [] }), rows);
+  assert.equal(applyTerminalEvent(rows, 'session.updated', {}), rows);
+  assert.deepEqual(applyTerminalEvent(rows, 'session.removed', { id: 'a' }), []);
 });
