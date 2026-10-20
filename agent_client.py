@@ -1,7 +1,8 @@
 """Client for the local session agent (session_agent.py), which lists the developer's
 Claude Code terminal sessions. Entirely optional: the feature is off unless
-AGENT_MANAGER_SESSION_AGENT_URL is set. AGENT_MANAGER_SESSION_AGENT_TOKEN, if set, is sent
-as a Bearer token on every call; it is added server-side here and never reaches the browser.
+AGENT_MANAGER_SESSION_AGENT_URL is set. AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE (a file holding
+the token, e.g. from `session_agent.py --token auto`) or AGENT_MANAGER_SESSION_AGENT_TOKEN, if
+set, is sent as a Bearer token on every call; it is added server-side here and never reaches the browser.
 Env vars are read per call so tests (and a restarted agent) need no re-import.
 """
 import os
@@ -21,8 +22,21 @@ def enabled() -> bool:
     return bool(base_url())
 
 
+def _token():
+    """AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE (read on every call, so an agent restarted with
+    `--token auto` is picked up) wins over AGENT_MANAGER_SESSION_AGENT_TOKEN."""
+    token_file = os.environ.get("AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE", "").strip()
+    if token_file:
+        try:
+            with open(token_file, encoding="utf-8") as f:
+                return f.read().strip() or None
+        except OSError:
+            return None
+    return os.environ.get("AGENT_MANAGER_SESSION_AGENT_TOKEN")
+
+
 def _headers() -> dict:
-    token = os.environ.get("AGENT_MANAGER_SESSION_AGENT_TOKEN")
+    token = _token()
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 

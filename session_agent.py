@@ -16,8 +16,10 @@ import json
 import os
 import queue
 import re
+import secrets
 import socket
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -70,9 +72,10 @@ def pid_alive(pid):
     return True
 
 
-def read_statusline_window(directory, session_id, max_age, now=None):
-    """contextWindowSize from <dir>/<sessionId>.json (written by a status line command), or
-    None if absent, malformed or older than max_age seconds (observedAt: ISO string or epoch)."""
+def read_statusline_window(directory, session_id, model=None):
+    """contextWindowSize from <dir>/<sessionId>.json (written by a status line command). A
+    window never changes within a session, so the file does not expire; it is ignored only when
+    malformed or when its recorded model differs from the transcript's latest model."""
     if not directory or not SESSION_ID_RE.match(session_id):
         return None
     try:
@@ -80,19 +83,14 @@ def read_statusline_window(directory, session_id, max_age, now=None):
             data = json.loads(f.read(4096))
     except (OSError, ValueError):
         return None
-    size, seen = (data.get("contextWindowSize"), data.get("observedAt")) if isinstance(data, dict) else (None, None)
+    if not isinstance(data, dict):
+        return None
+    size = data.get("contextWindowSize")
     if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
         return None
-    if isinstance(seen, str):
-        try:
-            seen = datetime.fromisoformat(seen.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return None
-    elif isinstance(seen, (int, float)) and not isinstance(seen, bool):
-        seen = seen / 1000 if seen > 1e11 else seen
-    else:
-        return None
-    return size if -60 <= (now or time.time()) - seen <= max_age else None
+    if isinstance(data.get("model"), str) and isinstance(model, str) and data["model"] != model:
+        return None  # the model was switched since the file was written
+    return size
 
 
 def load_windows(path):
@@ -344,14 +342,14 @@ class Hub:
 class Agent:
     def __init__(self, home, windows=None, token=None, host=None, lister=run_claude_agents,
                  alive=pid_alive, cli_ttl=10.0, allow_send=False, allowed_hosts=(),
-                 statusline_dir=None, statusline_max_age=600.0):
+                 statusline_dir=None):
         self.home, self.windows, self.token = Path(home), windows or {}, token
         self.host = host or socket.gethostname()
         self.lister, self.alive, self.cli_ttl = lister, alive, cli_ttl
         self.hub, self.lock, self.stop = Hub(), threading.Lock(), threading.Event()
         self.rows, self.states, self.metas = {}, {}, {}
         self.allow_send = allow_send
-        self.statusline_dir, self.statusline_max_age = statusline_dir, statusline_max_age
+        self.statusline_dir = statusline_dir
         # DNS-rebinding guard: only these Host/Origin names are served (no CORS headers either).
         self.allowed_hosts = {"localhost", "127.0.0.1", "::1"} | {h.lower() for h in allowed_hosts}
         self._cli, self._cli_at = None, 0.0
@@ -391,10 +389,10 @@ class Agent:
             "status": status,
             "waitingFor": waiting_for,
             "statusSince": since,
+            "lastActivityAt": st.last_ts,
             "step": step,
             "contextTokens": st.context,
-            "contextWindow": read_statusline_window(self.statusline_dir, meta["sessionId"],
-                                                    self.statusline_max_age)
+            "contextWindow": read_statusline_window(self.statusline_dir, meta["sessionId"], st.model)
                              or window_for(st.model, self.windows),
             "model": st.model,
             "startedAt": iso_from_ms(meta.get("startedAt")),
@@ -523,6 +521,19 @@ def host_only(value):
         return urlsplit(value if "://" in value else "//" + value).hostname
     except ValueError:
         return None
+
+
+def write_token_file(path):
+    """New random token, written atomically with mode 0600 (dir 0700); returns the token."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    os.replace(tmp, path)
+    return token
 
 
 def is_loopback(host):
@@ -671,12 +682,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7450)
-    ap.add_argument("--token", default=os.environ.get("AM_AGENT_TOKEN"))
+    ap.add_argument("--token", default=os.environ.get("AM_AGENT_TOKEN"),
+                    help="bearer token required on every request; 'auto' generates one into --token-file")
+    ap.add_argument("--token-file", default=str(Path.home() / ".local/state/agent-manager/session-agent.token"),
+                    help="where --token auto writes the token (mode 0600, new token each start)")
     ap.add_argument("--claude-home", default=str(Path.home() / ".claude"),
                     help="registry/transcript directory; does NOT redirect the `claude agents` listing")
     ap.add_argument("--statusline-dir", default=str(Path.home() / ".local/state/agent-manager/statusline"),
-                    help="optional <sessionId>.json files {contextWindowSize, observedAt} from a status "
-                         "line command; a fresh one overrides --windows")
+                    help="optional <sessionId>.json files {contextWindowSize, model} from a status line "
+                         "command (see statusline_writer.py); overrides --windows unless the model changed")
     ap.add_argument("--allow-host", action="append", default=[], metavar="NAME",
                     help="extra Host/Origin hostname to accept (repeatable); localhost/127.0.0.1/::1 always are")
     ap.add_argument("--windows", help="JSON file: model-id substring -> context window size")
@@ -690,6 +704,9 @@ def main(argv=None):
         print(json.dumps(probe(args.claude_home), indent=2))
         return
     windows = load_windows(args.windows) if args.windows else {}
+    if args.token == "auto":
+        args.token = write_token_file(args.token_file)
+        print(f"session agent: token written to {args.token_file}", file=sys.stderr)
     extra = list(args.allow_host)
     if args.bind not in ("0.0.0.0", "::"):
         extra.append(args.bind)

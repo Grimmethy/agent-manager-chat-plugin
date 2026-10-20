@@ -87,11 +87,14 @@ python3 session_agent.py [--bind 127.0.0.1] [--port 7450] [--token T | AM_AGENT_
   sonnet and opus entries are confirmed inside Claude Code (contexts above 900k seen), fable and
   haiku are not. The status line's `context_window.context_window_size` is the better source
   (200000 default, 1000000 extended) is read from optional `<sessionId>.json` files
-  (`{"contextWindowSize": int, "observedAt": ISO string or epoch}`) in `--statusline-dir`
-  (default `~/.local/state/agent-manager/statusline`), written by a status line command from
-  `context_window.context_window_size`. A file older than 10 minutes (`observedAt`) is ignored and
-  `--windows` applies. Nothing writes those files yet; installing a `statusLine` command in
-  `~/.claude/settings.json` is the user's call.
+  (`{"contextWindowSize": int, "model": str, ...}`) in `--statusline-dir` (default
+  `~/.local/state/agent-manager/statusline`). The file never expires (a window does not change
+  within a session) but is ignored if its `model` differs from the transcript's latest model, and
+  then `--windows` applies. `statusline_writer.py` is an opt-in status line command that writes them
+  (fast, atomic, mode 0600, only when the window or model changed, prints e.g. `Model 14%`); it never
+  touches settings. To use it, add this yourself to `~/.claude/settings.json`:
+  `"statusLine": {"type": "command", "command": "python3 /path/to/statusline_writer.py"}`.
+  The file's `usedPercentage`/`observedAt` are a snapshot as of the last write and are not used.
 - `claude agents` is polled at most every 10 s (it costs ~0.2 s CPU per call); registry files fill
   the gaps. `GET /events?types=session` omits `transcript.append`, and the plugin's passthrough
   additionally drops everything except `session.updated`/`session.removed`, so transcript text never
@@ -105,6 +108,12 @@ python3 session_agent.py [--bind 127.0.0.1] [--port 7450] [--token T | AM_AGENT_
 - Only Host/Origin names `localhost`, `127.0.0.1`, `::1` (plus the bind address and any
   `--allow-host NAME`) are served, against DNS rebinding; no CORS headers are sent. If the
   plugin reaches the agent by another hostname, pass `--allow-host` for it.
+- `--token auto` generates a random token into `--token-file` (default
+  `~/.local/state/agent-manager/session-agent.token`, mode 0600, a new token on every start). The
+  plugin reads it per request from `AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE`, so restarts need no
+  reconfiguration. (Loopback with no token lets any local OS user read transcripts; prefer `auto`.)
+- Rows carry `lastActivityAt` (last transcript timestamp). The switcher shows a busy session with no
+  activity for an hour or more as `busy, no activity 29h` instead of a busy timer.
 - Transcripts are private: loopback bind by default; a non-loopback `--bind` refuses to start
   without a token, and with a token every request needs `Authorization: Bearer <token>`.
   Message text is never logged.
@@ -119,7 +128,8 @@ python3 session_agent.py [--bind 127.0.0.1] [--port 7450] [--token T | AM_AGENT_
 ### Showing terminal sessions in the chat panel
 
 Set `AGENT_MANAGER_SESSION_AGENT_URL` (e.g. `http://127.0.0.1:7450`) and, if the agent uses a
-token, `AGENT_MANAGER_SESSION_AGENT_TOKEN` in the plugin's environment. The session switcher then
+token, `AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE` (or `AGENT_MANAGER_SESSION_AGENT_TOKEN`) in the plugin's
+environment. The session switcher then
 gets a read-only "Terminal sessions" group (status, timer, current step, context size) fed by
 `GET api/chat/terminal-sessions` and the SSE passthrough `GET api/chat/terminal-sessions/events`
 (the token stays server-side). Unset URL = feature off; agent down = "Session agent unreachable".

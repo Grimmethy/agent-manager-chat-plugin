@@ -105,8 +105,17 @@ export function terminalStatusWord(status) {
 }
 
 // 'busy 3m' / 'waiting 12s' / 'idle 2h' from statusSince; the bare word if it is unknown.
+// A busy row with no transcript activity for STALE_BUSY_SECS reads 'busy, no activity 29h'.
+// A session can show 'busy' for a day with nothing written to its transcript (hung, or its
+// process was suspended): past this much silence say so instead of presenting a busy timer.
+export const STALE_BUSY_SECS = 3600;
+
 export function terminalTimer(row, now) {
   const word = terminalStatusWord(row && row.status).toLowerCase();
+  if (row && row.status === 'busy') {
+    const quiet = secondsSince(row.lastActivityAt || null, now);
+    if (quiet != null && quiet >= STALE_BUSY_SECS) return 'busy, no activity ' + formatDuration(quiet);
+  }
   const secs = secondsSince((row && row.statusSince) || null, now);
   return secs == null ? word : word + ' ' + formatDuration(secs);
 }

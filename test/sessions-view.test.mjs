@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   truncateTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
   orderSessions, nextSelectionAfterClose, formatRow,
-  formatTokens, contextLabel, terminalTimer, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
+  formatTokens, contextLabel, terminalTimer, STALE_BUSY_SECS, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
 } from '../static/sessions-view.js';
 
 const NOW = Date.parse('2026-10-19T12:00:00Z');
@@ -131,4 +131,14 @@ test('prototype keys are not statuses', () => {
   assert.equal(formatTerminalRow({ id: 'p', status: 'toString' }, NOW).busy, false);
   assert.deepEqual(orderTerminalSessions([{ id: '1', name: 'a', status: 'constructor' },
     { id: '2', name: 'b', status: 'busy' }]).map((r) => r.id), ['2', '1']);
+});
+
+test('busy with no transcript activity for a long time is flagged, not timed', () => {
+  const base = { status: 'busy', statusSince: '2026-10-18T07:00:00Z' };
+  assert.equal(terminalTimer({ ...base, lastActivityAt: '2026-10-19T06:00:00Z' }, NOW), 'busy, no activity 6h');
+  assert.equal(terminalTimer({ ...base, lastActivityAt: '2026-10-19T11:59:00Z' }, NOW), 'busy 1d');
+  assert.equal(terminalTimer({ ...base }, NOW), 'busy 1d'); // unknown activity: plain timer
+  assert.equal(terminalTimer({ status: 'idle', statusSince: '2026-10-19T00:00:00Z',
+    lastActivityAt: '2026-10-19T00:00:00Z' }, NOW), 'idle 12h'); // only busy rows are flagged
+  assert.equal(STALE_BUSY_SECS, 3600);
 });

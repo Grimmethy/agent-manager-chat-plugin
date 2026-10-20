@@ -101,6 +101,19 @@ class AgentRouteTests(unittest.TestCase):
         self.assertNotIn(b"private-text", text)
         self.assertNotIn(b"transcript.append", text)
 
+    def test_token_file_wins_and_is_read_per_call(self):
+        tf = Path(tempfile.mkdtemp()) / "tok"
+        self.addCleanup(shutil.rmtree, tf.parent, True)
+        values = {"AGENT_MANAGER_SESSION_AGENT_URL": self.url, "AGENT_MANAGER_SESSION_AGENT_TOKEN": "wrong",
+                  "AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE": str(tf)}
+        with mock.patch.dict(os.environ, values):
+            tf.write_text("not-the-token\n")
+            self.assertFalse(self.client.get("/api/chat/terminal-sessions").get_json()["reachable"])
+            tf.write_text(TOKEN + "\n")  # e.g. the agent restarted with --token auto
+            self.assertTrue(self.client.get("/api/chat/terminal-sessions").get_json()["reachable"])
+            tf.unlink()  # unreadable file -> no header -> unreachable, not an error
+            self.assertFalse(self.client.get("/api/chat/terminal-sessions").get_json()["reachable"])
+
     def test_filter_events_reassembles_split_blocks(self):
         blocks = (b"event: transcript.append\ndata: {\"a\": 1}\n\n: keepalive\n\n"
                   b"event: session.updated\ndata: {\"id\": \"s\"}\n\nevent: other\ndata: 1\n\n")

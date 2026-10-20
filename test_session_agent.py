@@ -90,7 +90,7 @@ class RowTests(AgentCase):
         self.assertEqual(row["host"], "testhost")
         self.assertIsNone(row["contextWindow"])
         self.assertEqual(set(row), {"id", "name", "cwd", "kind", "pid", "status", "waitingFor",
-                                    "statusSince", "step", "contextTokens", "contextWindow",
+                                    "statusSince", "lastActivityAt", "step", "contextTokens", "contextWindow",
                                     "model", "startedAt", "host"})
 
     def test_window_from_table(self):
@@ -134,35 +134,51 @@ class RowTests(AgentCase):
         row = self.row(agent, "sess-busy")
         self.assertEqual((row["contextTokens"], row["model"]), (1205, "claude-sonnet-5-5"))
 
-    def test_statusline_window_preferred_when_fresh(self):
+    def test_statusline_window_preferred_and_never_expires(self):
         sl = Path(self.tmp) / "statusline"
         sl.mkdir()
-        now = time.time()
-        (sl / "sess-busy.json").write_text(json.dumps({"contextWindowSize": 777, "observedAt": now}))
-        (sl / "sess-wait.json").write_text(json.dumps({"contextWindowSize": 888, "observedAt": now - 5000}))  # stale
+        # observedAt is ancient on purpose: a window does not change within a session
+        (sl / "sess-busy.json").write_text(json.dumps({"contextWindowSize": 777, "observedAt": 1,
+                                                       "model": "claude-sonnet-5-5"}))
+        (sl / "sess-wait.json").write_text(json.dumps({"contextWindowSize": 888, "model": "some-other-model"}))
         (sl / "sess-idle.json").write_text("{nope")
         agent = self.make_agent(statusline_dir=sl, windows={"sonnet": 5})
         self.assertEqual(self.row(agent, "sess-busy")["contextWindow"], 777)
-        self.assertEqual(self.row(agent, "sess-wait")["contextWindow"], 5)  # stale -> falls back to the table
+        # recorded model differs from the transcript's latest model -> ignored, table applies
+        self.assertEqual(self.row(agent, "sess-wait")["contextWindow"], 5)
         self.assertIsNone(self.row(agent, "sess-idle")["contextWindow"])
 
     def test_statusline_reader_validation(self):
         sl = Path(self.tmp)
-        iso = "2026-01-01T00:00:00Z"
-        base = datetime_ts = 1767225600.0  # 2026-01-01T00:00:00Z
-        cases = {"a": {"contextWindowSize": 10, "observedAt": iso},
-                 "b": {"contextWindowSize": 10, "observedAt": int(base * 1000)},
-                 "c": {"contextWindowSize": "10", "observedAt": iso},
-                 "d": {"contextWindowSize": True, "observedAt": iso},
-                 "e": {"contextWindowSize": 10},
-                 "f": {"contextWindowSize": 10, "observedAt": "garbage"}}
+        cases = {"a": {"contextWindowSize": 10},
+                 "b": {"contextWindowSize": 10, "model": "m"},
+                 "c": {"contextWindowSize": "10"},
+                 "d": {"contextWindowSize": True},
+                 "e": {"contextWindowSize": -5},
+                 "f": [1]}
         for name, body in cases.items():
             (sl / f"{name}.json").write_text(json.dumps(body))
-        got = {n: sa.read_statusline_window(sl, n, 600, now=base + 10) for n in cases}
+        got = {n: sa.read_statusline_window(sl, n, "m") for n in cases}
         self.assertEqual(got, {"a": 10, "b": 10, "c": None, "d": None, "e": None, "f": None})
-        self.assertIsNone(sa.read_statusline_window(sl, "a", 600, now=base + 10_000))
-        self.assertIsNone(sa.read_statusline_window(sl, "../a", 600, now=base))
-        self.assertIsNone(sa.read_statusline_window(None, "a", 600))
+        self.assertIsNone(sa.read_statusline_window(sl, "b", "other"))
+        self.assertEqual(sa.read_statusline_window(sl, "b", None), 10)  # transcript model unknown
+        self.assertIsNone(sa.read_statusline_window(sl, "../a", "m"))
+        self.assertIsNone(sa.read_statusline_window(None, "a", "m"))
+
+    def test_last_activity_reported(self):
+        self.assertEqual(self.row(self.make_agent(), "sess-busy")["lastActivityAt"], "2026-01-01T00:00:04Z")
+
+    def test_token_file_is_private_and_rotates(self):
+        path = Path(self.tmp) / "state" / "agent.token"
+        first = sa.write_token_file(path)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(path.read_text().strip(), first)
+        self.assertGreaterEqual(len(first), 32)
+        second = sa.write_token_file(path)
+        self.assertNotEqual(first, second)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([p.name for p in path.parent.iterdir()], ["agent.token"])  # no temp leftovers
 
     def test_busy_without_tool_use_is_thinking(self):
         reg = self.home / "sessions" / "1004.json"
