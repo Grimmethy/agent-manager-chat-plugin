@@ -650,8 +650,23 @@ class SessionSwitcher {
 }
 
 function mountChat() {
+  // #chat-panel (in templates/chat.html) is the sole id-based contract between
+  // this file and the template; every other selector here is class-based.
   const root = document.getElementById('chat-panel');
-  if (!root) return;
+  if (!root) {
+    const msg = 'Chat failed to mount: #chat-panel not found in the template';
+    console.error(msg);
+    const err = document.createElement('div');
+    err.className = 'chat-mount-error';
+    err.textContent = msg;
+    // Minimal inline styling so the message is readable even if chat.css never loads.
+    err.style.cssText =
+      'padding:16px 24px;margin:24px auto;max-width:480px;' +
+      'border:2px solid #c00;border-radius:6px;background:#fff0f0;' +
+      'color:#900;font:14px/1.5 system-ui,sans-serif;text-align:center;';
+    document.body.appendChild(err);
+    return;
+  }
   let switcher = null;
   const pane = new ChatPane(root, { onSessionChange: () => { if (switcher) switcher.refresh(); } });
   switcher = new SessionSwitcher(pane.switcherSlot, {
