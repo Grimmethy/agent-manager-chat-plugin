@@ -395,6 +395,85 @@ class Agent:
                 pass
 
 
+def _add_types(d, acc):
+    for k, v in d.items():
+        acc.setdefault(str(k)[:40], set()).add(type(v).__name__)
+
+
+def _enum(dicts, key):
+    return sorted({str(d[key])[:30] for d in dicts if isinstance(d.get(key), str)})[:20]
+
+
+def _jsonable(x):
+    if isinstance(x, dict):
+        return {k: _jsonable(v) for k, v in sorted(x.items())}
+    return sorted(x) if isinstance(x, set) else x
+
+
+def probe(home, lister=run_claude_agents, alive=pid_alive):
+    """Shapes-only report for checking the format assumptions against a real install.
+    Emits key names, value TYPES, counts and small enums (status/kind); never text, ids,
+    paths or other values. Sessions are numbered, not named."""
+    home = Path(home)
+    cli = lister()
+    reg = read_registry(home)
+    report = {"cli": None, "registry": {"files": len(reg), "keys": {}, "pidAlive": 0,
+                                        "status": _enum(reg, "status"), "kind": _enum(reg, "kind"),
+                                        "entrypoint": _enum(reg, "entrypoint")}, "transcripts": []}
+    if cli is not None:
+        keys = {}
+        for d in cli:
+            _add_types(d, keys)
+        report["cli"] = {"entries": len(cli), "keys": _jsonable(keys), "status": _enum(cli, "status"),
+                         "state": _enum(cli, "state"), "kind": _enum(cli, "kind")}
+    for d in reg:
+        _add_types(d, report["registry"]["keys"])
+        report["registry"]["pidAlive"] += bool(alive(d.get("pid")))
+    report["registry"]["keys"] = _jsonable(report["registry"]["keys"])
+    live = [d for d in reg if alive(d.get("pid")) and isinstance(d.get("sessionId"), str)
+            and SESSION_ID_RE.match(d["sessionId"])]
+    live.sort(key=lambda d: d.get("startedAt") if isinstance(d.get("startedAt"), (int, float)) else 0)
+    for n, d in enumerate(live, 1):
+        st = TranscriptState(home, d["sessionId"])
+        st.poll()
+        t = {"n": n, "found": st.path is not None, "contextTokens": st.context, "model": st.model}
+        if st.path is not None:
+            types, top, msgk, usagek, blocks = {}, {}, {}, {}, {}
+            lines = bad = big = side = 0
+            with open(st.path, "rb") as f:
+                for raw in f:
+                    lines += 1
+                    if len(raw) > MAX_LINE:
+                        big += 1
+                        continue
+                    try:
+                        o = json.loads(raw)
+                    except ValueError:
+                        bad += 1
+                        continue
+                    if not isinstance(o, dict):
+                        continue
+                    key = str(o.get("type"))[:40]
+                    types[key] = types.get(key, 0) + 1
+                    if o.get("type") != "assistant":
+                        continue
+                    side += o.get("isSidechain") is True
+                    _add_types(o, top)
+                    m = o.get("message") if isinstance(o.get("message"), dict) else {}
+                    _add_types(m, msgk)
+                    if isinstance(m.get("usage"), dict):
+                        _add_types(m["usage"], usagek)
+                    for b in m.get("content") if isinstance(m.get("content"), list) else []:
+                        if isinstance(b, dict):
+                            blocks.setdefault(str(b.get("type"))[:40], set()).update(
+                                str(k)[:40] for k in b)
+            t.update(lines=lines, corrupt=bad, oversized=big, lineTypes=types, sidechainAssistantLines=side,
+                     assistantKeys=_jsonable(top), messageKeys=_jsonable(msgk),
+                     usageKeys=_jsonable(usagek), blockKeys=_jsonable(blocks))
+        report["transcripts"].append(t)
+    return report
+
+
 def is_loopback(host):
     if host == "localhost":
         return True
@@ -530,7 +609,12 @@ def main(argv=None):
     ap.add_argument("--interval", type=float, default=1.0, help="poll interval, seconds")
     ap.add_argument("--allow-send", action="store_true",
                     help="enable POST /sessions/<id>/peer-message (experimental, wire format unverified)")
+    ap.add_argument("--probe", action="store_true",
+                    help="print a shapes-only report of the local Claude Code data and exit")
     args = ap.parse_args(argv)
+    if args.probe:
+        print(json.dumps(probe(args.claude_home), indent=2))
+        return
     windows = load_windows(args.windows) if args.windows else {}
     agent = Agent(args.claude_home, windows, args.token, allow_send=args.allow_send)
     try:

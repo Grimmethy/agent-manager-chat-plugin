@@ -86,6 +86,7 @@ python3 session_agent.py [--bind 127.0.0.1] [--port 7450] [--token T | AM_AGENT_
 - Transcripts are private: loopback bind by default; a non-loopback `--bind` refuses to start
   without a token, and with a token every request needs `Authorization: Bearer <token>`.
   Message text is never logged.
+- `--probe` prints a shapes-only report of the local data (no values) for format checks; see `VERIFY.md`.
 - systemd template: `deploy/session-agent.service`.
 - Experimental: `--allow-send` enables `POST /sessions/<id>/peer-message {"text": ...}`, which
   writes one line to the session's inbox Unix socket. The socket's wire format is

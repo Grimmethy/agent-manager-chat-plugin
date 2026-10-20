@@ -156,6 +156,23 @@ class RowTests(AgentCase):
         self.assertEqual(self.row(agent, "sess-busy")["contextTokens"], 7)
 
 
+class ProbeTests(AgentCase):
+    def test_probe_reports_shapes_only(self):
+        rep = sa.probe(self.home, lister=lambda: [{"pid": 1001, "status": "busy", "name": "secret-name"}],
+                       alive=alive)
+        self.assertEqual(rep["cli"]["status"], ["busy"])
+        self.assertEqual(rep["registry"]["files"], 4)
+        self.assertEqual(rep["registry"]["pidAlive"], 3)
+        busy = [t for t in rep["transcripts"] if t["contextTokens"] == 1205][0]
+        self.assertEqual((busy["corrupt"], busy["sidechainAssistantLines"]), (1, 1))
+        self.assertEqual(busy["lineTypes"]["assistant"], 3)
+        self.assertIn("input_tokens", busy["usageKeys"])
+        self.assertEqual(busy["blockKeys"]["tool_use"], ["input", "name", "type"])
+        dumped = json.dumps(rep)
+        for private in ("sess-busy", "secret-name", "hello synthetic", "/home/user", "first reply"):
+            self.assertNotIn(private, dumped)
+
+
 class TranscriptTests(AgentCase):
     def test_entries_are_summaries_without_sidechain(self):
         entries, nxt = sa.read_transcript(self.transcript("sess-busy"), 0, 200)
