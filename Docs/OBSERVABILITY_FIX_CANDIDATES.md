@@ -91,3 +91,26 @@ Inside the existing `catch (e)` block, first check whether the error represents 
 
 Benefits:
 A 500, network timeout, or parse failure is now visually and textually distinct from the expected empty state, so the user is not told "everything is fine" when the service is actually broken. The `console.error` call gives a developer an immediate, searchable log line carrying the full exception object, eliminating the need to guess from the Network tab. The 404 path is unchanged, so the common "short session, no note yet" case still displays the same friendly message with zero UX regression.
+
+### AC-5 · Silently swallowed OSError on statusline snapshot write
+Strength: Strong
+Files: statusline_writer.py
+Snippet:
+```
+    directory = (argv[0] if argv else None) or os.environ.get("AM_STATUSLINE_DIR") or DEFAULT_DIR
+    try:
+        payload = json.loads((stdin or sys.stdin).read(65536))
+    except ValueError:
+        payload = None
+    try:
+        write_snapshot(directory, extract(payload))
+```
+
+Problem:
+In `main`, the call `write_snapshot(directory, extract(payload))` is wrapped in `try / except OSError: pass`. If the target directory (sourced from argv, `AM_STATUSLINE_DIR`, or `DEFAULT_DIR`) is missing, read-only, or over quota, the `OSError` is discarded with a bare `pass`. The function then falls through to `print(status_text(payload))` and `return 0`, so the caller sees a successful exit, nothing reaches `stderr` or any log sink, and the on-disk snapshot is either stale or absent. Any downstream consumer that reads that snapshot file will silently operate on outdated data with no operator-visible signal that the write failed.
+
+Solution:
+Replace the bare `except OSError: pass` with `except OSError as exc:` and emit a single `logging.getLogger(__name__).warning("statusline snapshot write to %r failed: %s", directory, exc)` before falling through to the existing `print(status_text(payload))` and `return 0`. Add `import logging` at the top of the module if it is not already present. This keeps the intended "best-effort persistence, still print the status text" contract intact while making the failure visible to any operator who has a log sink or `stderr` attached. No new dependency is introduced; `logging` is stdlib and is already the project's Python logging primitive.
+
+Benefits:
+An operator (or CI log collector, cron mail spool, or agent-manager shell that captures `stderr`) will see a single, context-rich warning line naming the exact directory and the OS-level reason the write failed, instead of a silent `0` exit with a stale snapshot. The statusline display path is unaffected—`print(status_text(payload))` still executes unconditionally—so the primary user-facing output is never blocked by a persistence hiccup. The fix is a two-line change (plus the import) and introduces no new dependency or behavioral contract beyond surfacing an error that was previously invisible.
