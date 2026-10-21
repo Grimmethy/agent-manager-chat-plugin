@@ -531,3 +531,32 @@ In both cases, the public function signatures and the module's public surface re
 
 Benefits:
 The initial-connection error-handling contract (exception type, message format, logging) lives in exactly one place for all four functions, making it trivial to audit and to evolve (add status codes, structured logging, circuit-breaker logic) without hunting through four functions. New internal API endpoints added to the module automatically inherit the correct connection-level error behavior by calling `_request`. The three non-streaming functions become shorter and more readable, each focusing on its unique payload/response logic. The streaming function's iteration logic remains explicit and generator-appropriate, avoiding a forced abstraction that would obscure the yield contract. Cross-cutting concerns that apply to all four (connection timeout, retry policy, metrics) are centralized in `_request`; streaming-specific concerns (chunk framing, mid-stream error reporting) stay where they logically belong.
+
+### AC-41 · Resolve model name inside reserve() so callers need not supply it
+Strength: Strong
+Split-Depth: 1
+Files: internal_api_client.py
+
+Problem:
+reserve(reservation_id, model, on) requires the caller to pass the model name explicitly. The only callers in routes/chat.py obtain it via a local `import ollama_client` + `ollama_client.MODEL`, which is itself just `os.environ.get("LOCAL_MODEL")`. This forces the routing layer to import the Ollama provider module solely to read an environment variable, coupling routes to a specific provider implementation.
+
+Solution:
+Change the `reserve()` signature to `def reserve(reservation_id: str, model: str = None, on: bool = True) -> dict:`. At the top of the function body, add: `if model is None: model = os.environ.get("LOCAL_MODEL")`. The existing `if model:` guard before adding it to the JSON body already handles the falsy case correctly (omits the key), so no further body changes are needed. This makes the model argument truly optional and resolves it from the same env var `ollama_client.MODEL` reads, without importing that module.
+
+Benefits:
+Callers can omit the model argument entirely. The routing layer no longer needs to know where the model name originates. The env-var read is co-located with the HTTP call that actually consumes the value, making the dependency explicit in one place rather than scattered across route handlers.
+
+### AC-42 · Remove ollama_client import from chat route handlers
+Strength: Strong
+Split-Depth: 1
+Files: routes/chat.py
+Depends-On: AC-41
+
+Problem:
+Each of the three handlers that release or acquire a reservation (api_chat_close, api_chat_message, api_chat_reserve) performs a local `import ollama_client` and passes `ollama_client.MODEL` as the second positional argument to `internal_api_client.reserve()`. This is the only reference to `ollama_client` in the routing layer, and it exists purely to supply a value that `reserve()` can now resolve on its own (see the internal_api_client.py change).
+
+Solution:
+In each of the three handlers, delete the `import ollama_client` line and change the `reserve()` call to omit the model argument. For example, in api_chat_close the current line `internal_reserve(session_id, ollama_client.MODEL, False)` becomes `internal_reserve(session_id, None, False)` (or equivalently `internal_reserve(session_id, on=False)` using the keyword). Repeat the same two-line edit in api_chat_message and api_chat_reserve. After the edits, confirm no `ollama_client` identifier remains anywhere in routes/chat.py.
+
+Benefits:
+The routing layer is now provider-agnostic: it depends only on internal_api_client and the shared app helpers, not on a specific model-client module. Adding or swapping the local model provider later requires no changes to route files.
