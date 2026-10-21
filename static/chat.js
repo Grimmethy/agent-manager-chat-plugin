@@ -339,8 +339,16 @@ class ChatPane {
     } catch (e) {
       // A 404 here just means nothing has been swept into this session's note yet -- a
       // normal, expected state for a short or brand-new conversation, not an error worth
-      // alarming over.
-      this.logContent.textContent = 'No context log entries yet for this session.';
+      // alarming over. Non-404 failures (500, network error, etc.) are logged and shown
+      // with a distinct message so the user knows the service is actually broken.
+      const is404 = (e && e.status === 404) ||
+                    (e && typeof e.message === 'string' && /\b404\b/.test(e.message));
+      if (is404) {
+        this.logContent.textContent = 'No context log entries yet for this session.';
+      } else {
+        console.error('showContextLog: failed to load context log', e);
+        this.logContent.textContent = 'Failed to load context log. Please try again.';
+      }
     }
   }
 
