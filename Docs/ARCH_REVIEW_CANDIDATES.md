@@ -383,3 +383,33 @@ Introduce a shared utility function—e.g. `run_node_script(script_path, payload
 
 Benefits:
 The temp-file lifecycle, timeout handling, and error-reporting logic live in exactly one place, eliminating the risk of the two implementations drifting apart. A future change to the invocation mechanism (pipes, a different runtime, structured error codes) is a single-file edit. The client modules become shorter and more readable, and the shared utility is trivially unit-testable in isolation using `unittest` (mocking `subprocess.run`) without importing either client or the Flask app.
+
+### AC-39 · Route handlers directly import model client to satisfy reserve() parameter
+Strength: Strong
+Files: routes/chat.py, internal_api_client.py, ollama_client.py
+
+Problem:
+In routes/chat.py, the api_chat_close, api_chat_message, and api_chat_reserve handlers each execute a local import of ollama_client solely to pass ollama_client.MODEL into internal_api_client.reserve(). This forces the routing layer to know which specific model provider is active and to resolve the model name itself, creating a hidden coupling between the chat routes and the provider configuration module. If the model source changes (different provider, config-driven selection, or a renamed constant), every handler in chat.py that calls reserve() must be updated, even though "which model is active" is a concern of the provider/client layer, not the routing layer. The principle of least knowledge is violated: the route handler should not need to dereference a constant from a sibling client module to fulfill a parameter that the internal API client expects.
+
+Solution:
+Move model-name resolution out of the route handlers. Either have internal_api_client.reserve() resolve the model internally by importing or receiving the provider configuration, or inject the active model name into the route context (e.g., via a dependency-injection container or a request-scoped config object) so that reserve() receives it without the handler reaching into ollama_client. In either case, routes/chat.py calls reserve() with a value obtained from the application's configuration layer rather than from a specific client module, and the coupling to ollama_client is eliminated from the routing code.
+
+Benefits:
+The routing layer becomes provider-agnostic: swapping ollama for another local model backend, or moving the model name into a central config, requires no changes in routes/chat.py. The reserve() call site reads as a simple API invocation rather than a hidden cross-module lookup. Future refactors of the provider layer (renaming the constant, making it dynamic, supporting multiple models) are contained within the provider/client modules, reducing the blast radius of configuration changes and making the dependency graph between routing and provider layers explicit and auditable.
+
+### AC-40 · Duplicated HTTP error-handling pattern across internal_api_client functions
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+internal_api_client.py defines four public functions—get_roots, preempt, reserve, and stream_local_turn—that each independently construct a URL, issue a requests call, catch requests.RequestException, and raise InternalApiError from the caught exception. The try/except/raise block and the URL-construction idiom are repeated across all four functions. This is a missing-locality defect: the error-reporting contract (exception type, message format, whether the HTTP status code is included, whether a log line is emitted) is defined in four places rather than one. If the error format needs to change—for example, to include the response status code, to add structured logging, or to switch to a different exception hierarchy—all four functions must be updated in lockstep, and any missed update silently produces inconsistent error reporting to callers.
+
+Solution:
+Introduce a private helper, e.g. `_request(method, url, **kwargs)`, that encapsulates the requests call, the try/except requests.RequestException block, and the raise InternalApiError(...) from e normalization, then returns the raw Response object. The three request-response functions (get_roots, preempt, reserve) reduce to constructing their URL and payload, calling `_request`, and parsing the returned response (e.g. `r.json()`).
+
+For stream_local_turn, the initial POST call (with `stream=True`) shares the same connection-level error contract and can call the same `_request` helper to obtain the open Response object. However, the subsequent iteration over `r.iter_lines()` and the per-chunk `yield` logic are structurally different from the request-response pattern: the function must remain a generator, and mid-stream read errors (broken pipe, timeout during transfer) occur after the helper has returned. Therefore stream_local_turn retains its own try/except around the iteration loop (or wraps it in a small `_iter_stream(r)` generator helper if the mid-stream error contract also needs centralizing), while the initial-connection error handling is unified with the other three functions via `_request`.
+
+In both cases, the public function signatures and the module's public surface remain unchanged; no caller code needs modification.
+
+Benefits:
+The initial-connection error-handling contract (exception type, message format, logging) lives in exactly one place for all four functions, making it trivial to audit and to evolve (add status codes, structured logging, circuit-breaker logic) without hunting through four functions. New internal API endpoints added to the module automatically inherit the correct connection-level error behavior by calling `_request`. The three non-streaming functions become shorter and more readable, each focusing on its unique payload/response logic. The streaming function's iteration logic remains explicit and generator-appropriate, avoiding a forced abstraction that would obscure the yield contract. Cross-cutting concerns that apply to all four (connection timeout, retry policy, metrics) are centralized in `_request`; streaming-specific concerns (chunk framing, mid-stream error reporting) stay where they logically belong.
