@@ -312,3 +312,32 @@ Rewrite test_agent_client.py to contain only: an updated module docstring ('Unit
 
 Benefits:
 The unit-test file has a clean, minimal import surface (agent_client + stdlib only), so it can be collected and executed in any environment that has agent_client.py but not the full server stack. Running the unit tests no longer starts a threaded HTTP server, reducing test time from the server-startup baseline to milliseconds. The file name test_agent_client.py now accurately reflects its content: pure unit tests of the agent_client module.
+
+### AC-22 · Extract _safe_internal_call helper for best-effort internal-API failures
+Strength: Strong
+Split-Depth: 1
+Files: routes/chat.py
+
+Problem:
+Three chat view functions contain near-identical try/except blocks that catch InternalApiError, log a non-fatal message to sys.stderr, and swallow the exception so the main request path is never blocked. In api_chat_close the block wraps internal_reserve(session_id, ollama_client.MODEL, False); in api_chat_message it wraps internal_preempt() (twice: once for the preempt step and once for the reserved-session refresh). The duplication is mechanical and each site carries its own local import of InternalApiError and the internal call function, making the 'never block the chat on this' policy hard to audit in one place.
+
+Solution:
+Add a module-level helper _safe_internal_call(fn, *args, log_prefix, **kwargs) in routes/chat.py that executes fn(*args, **kwargs) inside a try/except InternalApiError, prints f"[{log_prefix}] ..." to sys.stderr with flush=True, and returns None on failure. Move the InternalApiError import to module level. Refactor the three best-effort call sites (api_chat_close's release, api_chat_message's preempt, and api_chat_message's reserved-refresh) to call the helper, passing the existing log prefix ('chat-close', 'chat-preempt', 'chat-reserve') and the exact call arguments. Preserve each site's existing success-path behavior: api_chat_close ignores the return value; api_chat_message assigns the preempt result to preempted and the refresh result is discarded. Leave api_chat_reserve untouched because it aborts(502) on InternalApiError rather than swallowing it, so it does not fit the 'safe' contract.
+
+Benefits:
+Single, auditable implementation of the 'best-effort internal API call' policy; removes three duplicated try/except blocks and their local imports; makes it impossible for a future edit to accidentally let an InternalApiError from one of these sites propagate and block a chat turn; keeps the log format and stderr flush behavior identical to the current code.
+
+### AC-23 · Unify local-provider model import and reserved-flag check across chat views
+Strength: Strong
+Split-Depth: 1
+Files: routes/chat.py
+Depends-On: AC-22
+
+Problem:
+The local-provider model identifier is imported as import ollama_client and referenced as ollama_client.MODEL independently inside api_chat_close, api_chat_message, and api_chat_reserve, so the coupling to ollama_client is scattered across three functions. Separately, the 'is this session reserved?' check is duplicated: api_chat_close uses if session.get("reserved") and api_chat_message uses if existing.get("reserved"). If the reserved flag's name or shape ever changes, both sites must be updated in lockstep.
+
+Solution:
+Introduce a single module-level import of ollama_client (or a small _local_model() accessor) and replace the three local import ollama_client statements with references to it. Extract a tiny _is_reserved(session) helper (or inline constant check) used by both api_chat_close and api_chat_message for the reserved-flag test. Do not change any HTTP semantics, log messages, or the abort(502) behavior of api_chat_reserve.
+
+Benefits:
+One place defines the local-provider model source, reducing the risk of a stale or divergent import; the reserved-flag check is centralized so a schema change is a one-line fix; both changes are behavior-preserving and keep the diff small and reviewable.
