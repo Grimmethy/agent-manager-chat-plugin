@@ -8,6 +8,7 @@ line: bad input or an unwritable directory just prints a plain text and exits 0.
 Stdlib only, no heavy imports: it runs on every status line refresh.
 """
 import json
+import logging
 import os
 import re
 import sys
@@ -15,6 +16,7 @@ import time
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), ".local/state/agent-manager/statusline")
+logger = logging.getLogger(__name__)
 
 
 def _num(x):
@@ -83,8 +85,8 @@ def main(argv=None, stdin=None):
         payload = None
     try:
         write_snapshot(directory, extract(payload))
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning("statusline snapshot write to %r failed: %s", directory, exc)
     print(status_text(payload))
     return 0
 
