@@ -442,3 +442,62 @@ Change the single import line `from app import CORE_REPO_ROOT` to `from config i
 
 Benefits:
 model_stats_client.py no longer depends on the Flask entry-point module. It can be imported in isolation without Flask. The dependency graph becomes: model_stats_client → config (stdlib only), not model_stats_client → app → Flask. Together with AC-27c, both clients are now decoupled from the Flask app for their sole shared dependency.
+
+### AC-35 · Create node_client_util.py with shared temp-file subprocess helper
+Strength: Strong
+Split-Depth: 1
+Files: node_client_util.py
+
+Problem:
+claude_client.py's generate() and model_stats_client.py's _run_event() each independently implement the same mechanical pattern: generate a unique temp-file path via tempfile.gettempdir() + uuid4, serialize a dict as JSON into it, invoke node <script> [extra-args] <temp-file> via subprocess.run with a timeout, and unlink the temp file in a finally block. Any fix to the temp-file lifecycle (encoding, race on cleanup, missing kwarg) must be made in two places. The two implementations also differ in subtle ways (claude_client passes text=True and no extra args; model_stats passes an event string as an extra arg and omits text=True), making a blind copy-paste refactor unsafe without a single parameterized function.
+
+Solution:
+Create node_client_util.py at the project root (same directory as the two client modules). Expose one public function: run_node_with_tempfile(script_path: str, extra_args: list[str], payload: dict, timeout: float, *, text: bool = False) -> subprocess.CompletedProcess. The function body: (1) build a unique temp path as Path(tempfile.gettempdir()) / f"node-req-{uuid.uuid4().hex}.json"; (2) write json.dumps(payload) to it with encoding="utf-8"; (3) call subprocess.run(["node", str(script_path), *extra_args, str(tmp_path)], capture_output=True, text=text, timeout=timeout); (4) in a finally block, unlink the temp file suppressing OSError. The function does NOT catch TimeoutExpired, does NOT check returncode, and does NOT parse stdout — those remain caller responsibilities so each module keeps its own error contract (ClaudeClientError vs. log-and-swallow). Add a module docstring stating the contract.
+
+Benefits:
+Single implementation of the temp-file create/write/invoke/cleanup lifecycle; both callers become thinner; a future change to the invocation mechanism (e.g. stdin pipes) touches one function instead of two; the parameterized extra_args and text kwargs capture the real differences between the two call sites without forcing them into a false common shape.
+
+### AC-36 · Refactor claude_client.py to use run_node_with_tempfile
+Strength: Strong
+Split-Depth: 1
+Files: claude_client.py
+Depends-On: AC-35
+
+Problem:
+generate() inlines the full temp-file → subprocess → cleanup block: it builds tmp_path via tempfile.gettempdir() + uuid4, writes json.dumps(request), calls subprocess.run(["node", str(CLAUDE_CLIENT_JS), str(tmp_path)], capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S), catches subprocess.TimeoutExpired to raise ClaudeClientError, and unlinks in a finally. This is the same mechanical pattern as model_stats_client.py and should be delegated to the shared utility.
+
+Solution:
+Replace the inline block (from tmp_path = Path(tempfile.gettempdir()) … through the finally: tmp_path.unlink() / except OSError: pass) with: result = run_node_with_tempfile(CLAUDE_CLIENT_JS, [], request, SUBPROCESS_TIMEOUT_S, text=True). Keep the surrounding logic exactly as-is: the try/except subprocess.TimeoutExpired → raise ClaudeClientError(...) from e wrapper, the if result.returncode != 0: raise ClaudeClientError(...) check, and the json.loads(result.stdout) parsing. Remove imports that are now unused in this file: tempfile and uuid (neither is referenced anywhere else in claude_client.py). Keep json (still used for json.dumps in payload construction and json.loads for result parsing), os (used for os.environ.get), subprocess (still needed for the TimeoutExpired exception type in the except clause), and Path (still used for CLAUDE_CLIENT_JS). Add from node_client_util import run_node_with_tempfile.
+
+Benefits:
+claude_client.py is shorter and no longer owns the temp-file lifecycle; the ClaudeClientError contract (timeout, non-zero exit, bad JSON) stays in the caller where it belongs; removing tempfile and uuid imports reduces the module's surface area for accidental misuse.
+
+### AC-37 · Refactor model_stats_client.py _run_event to use run_node_with_tempfile
+Strength: Strong
+Split-Depth: 1
+Files: model_stats_client.py
+Depends-On: AC-35
+
+Problem:
+_run_event() inlines the same temp-file → subprocess → cleanup block: it builds tmp_path via tempfile.gettempdir() + uuid4, writes json.dumps(payload), calls subprocess.run(["node", str(MODEL_STATS_DB_JS), event, str(tmp_path)], capture_output=True, timeout=15), catches (OSError, subprocess.SubprocessError) to log a warning, and unlinks in a finally. This duplicates the pattern in claude_client.py. Note: get_turns_summary() does NOT use a temp file (it passes no payload, just a subcommand) and must be left untouched.
+
+Solution:
+Replace the inline block in _run_event() (from tmp_path = Path(tempfile.gettempdir()) … through the finally: tmp_path.unlink() / except OSError: pass) with: run_node_with_tempfile(MODEL_STATS_DB_JS, [event], payload, 15). Keep the surrounding try/except (OSError, subprocess.SubprocessError) → logger.warning(...) wrapper in _run_event() itself. Remove the tempfile import (it is used only in _run_event). Keep subprocess (still used in get_turns_summary), uuid (still used in record_call for call_id), json (still used in get_turns_summary for json.loads), and Path (still used for MODEL_STATS_DB_JS). Add from node_client_util import run_node_with_tempfile.
+
+Benefits:
+model_stats_client.py's _run_event is shorter and no longer owns the temp-file lifecycle; the 'swallow all errors and log a warning' contract stays in the caller; removing the tempfile import reduces surface area; get_turns_summary is untouched since it uses a different (no-payload) invocation pattern.
+
+### AC-38 · Add unit tests for node_client_util.run_node_with_tempfile
+Strength: Strong
+Split-Depth: 1
+Files: test_node_client_util.py
+Depends-On: AC-35
+
+Problem:
+The new shared function run_node_with_tempfile in node_client_util.py has no test coverage. Both client modules now depend on it for their temp-file lifecycle, so a regression (wrong arg order, missing cleanup, lost encoding) would silently break both Claude and model-stats calls with no unit-level signal.
+
+Solution:
+Create test_node_client_util.py in the project's test directory using unittest (the project's existing Python test framework). Write tests that mock subprocess.run (via unittest.mock.patch) and verify: (a) the correct argument list ["node", script_path, *extra_args, temp_path] is passed to subprocess.run; (b) the JSON payload is written to the temp file before the subprocess call (assert file contents via a mock or a real temp dir); (c) on subprocess.TimeoutExpired the exception propagates to the caller (assertRaises); (d) the temp file is unlinked in all paths — success, TimeoutExpired, and a generic OSError from subprocess.run. These tests must import only node_client_util and standard-library modules; they must NOT import claude_client, model_stats_client, or the Flask app.
+
+Benefits:
+The shared utility is covered independently of either caller; regressions in the temp-file lifecycle (missing cleanup, wrong arg order, lost encoding) are caught at the unit level before they affect either client module.
