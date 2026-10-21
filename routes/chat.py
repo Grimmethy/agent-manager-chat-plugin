@@ -130,6 +130,46 @@ def api_chat_close(session_id):
     return jsonify(ended)
 
 
+@chat_bp.route("/api/chat/<session_id>/reserve/reconcile", methods=["POST"])
+def api_chat_reserve_reconcile(session_id):
+    """Operator-only reconciliation endpoint for AC4_DIVERGENCE events. Body:
+    {action: "force_local_reserved" | "force_local_unreserved"}.
+
+    force_local_reserved: sets the local reserved flag to True (idempotent, no
+    server-side call). force_local_unreserved: sets the local reserved flag to
+    False and makes a best-effort server-side release (same guarantee as
+    api_chat_close -- does NOT guarantee the reservation is actually released).
+
+    No authentication is applied, consistent with the rest of routes/chat.py."""
+    from app import CHAT_STORAGE_DIR
+    from chat_sessions import get_session, set_reserved
+
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    if action not in ("force_local_reserved", "force_local_unreserved"):
+        abort(400, description="action must be 'force_local_reserved' or 'force_local_unreserved'")
+
+    session = get_session(CHAT_STORAGE_DIR, session_id)
+    if not session or session.get("status") != "active":
+        abort(404)
+
+    if action == "force_local_reserved":
+        session = set_reserved(CHAT_STORAGE_DIR, session_id, True)
+    else:
+        session = set_reserved(CHAT_STORAGE_DIR, session_id, False)
+        from internal_api_client import InternalApiError, reserve as internal_reserve
+        import ollama_client
+        try:
+            internal_reserve(session_id, ollama_client.MODEL, False)
+        except InternalApiError as e:
+            logger.warning("reserve/reconcile: server-side release failed (non-fatal): %s", e)
+
+    logger.warning("reserve/reconcile: session=%s action=%s%s",
+                   session_id, action,
+                   " (server-side release was best-effort)" if action == "force_local_unreserved" else "")
+    return jsonify(session)
+
+
 @chat_bp.route("/api/chat/inject", methods=["POST"])
 def api_chat_inject():
     """Appends a chunk of text as a user message into a dashboard chat session for
