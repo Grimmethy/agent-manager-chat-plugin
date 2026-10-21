@@ -383,3 +383,62 @@ Introduce a shared utility function—e.g. `run_node_script(script_path, payload
 
 Benefits:
 The temp-file lifecycle, timeout handling, and error-reporting logic live in exactly one place, eliminating the risk of the two implementations drifting apart. A future change to the invocation mechanism (pipes, a different runtime, structured error codes) is a single-file edit. The client modules become shorter and more readable, and the shared utility is trivially unit-testable in isolation using `unittest` (mocking `subprocess.run`) without importing either client or the Flask app.
+
+### AC-31 · AC-27a – Create config.py with CORE_REPO_ROOT
+Strength: Strong
+Split-Depth: 1
+Files: .venv/lib/python3.12/site-packages/flask/config.py
+
+Problem:
+Both claude_client.py and model_stats_client.py import CORE_REPO_ROOT from app (the Flask entry-point module), which forces a dependency on the entire Flask application just to obtain a single path constant. app.py defines it as `CORE_REPO_ROOT = Path(os.environ.get("AGENT_MANAGER_CORE_REPO_ROOT", "/media/model-cache/github/agent-manager")).resolve()` at module level. There is no standalone module that holds this value, so any non-Flask consumer must pull in Flask transitively.
+
+Solution:
+Create a new file `config.py` at the repository root containing exactly: a one-line module docstring (e.g. `"""Shared path constants for the Chat plugin."""`), the two stdlib imports needed (`import os` and `from pathlib import Path`), and the single constant definition copied verbatim from app.py: `CORE_REPO_ROOT = Path(os.environ.get("AGENT_MANAGER_CORE_REPO_ROOT", "/media/model-cache/github/agent-manager")).resolve()`. The file must not import Flask, app, any client module, or any other project-internal module. No functions, no classes, no side effects beyond the Path.resolve() call.
+
+Benefits:
+Provides a zero-dependency (stdlib-only) module that any consumer can import without pulling in Flask or the rest of the application. Establishes the single source of truth for the core-repo path that the next two sub-candidates will point at.
+
+### AC-32 · AC-27b – app.py imports CORE_REPO_ROOT from config
+Strength: Strong
+Split-Depth: 1
+Files: app.py
+Depends-On: AC-31
+
+Problem:
+app.py currently defines `CORE_REPO_ROOT = Path(os.environ.get("AGENT_MANAGER_CORE_REPO_ROOT", "/media/model-cache/github/agent-manager")).resolve()` at module level (line ~30, after the Flask import). The derived constants `ENV_FILE_PATH` and `DASHBOARD_SETTINGS_PATH` are computed from it in the same module. Once config.py exists (AC-27a), app.py should import the constant rather than define it, so there is exactly one definition in the codebase.
+
+Solution:
+In app.py, replace the three-line `CORE_REPO_ROOT = Path(os.environ.get(...)).resolve()` statement with `from config import CORE_REPO_ROOT`. Place this import alongside the other top-level imports (after the stdlib imports, before or after the Flask import—either is fine since config has no Flask dependency). The subsequent lines `ENV_FILE_PATH = CORE_REPO_ROOT / "agent-manager.env"` and `DASHBOARD_SETTINGS_PATH = CORE_REPO_ROOT / "dashboard-settings.json"` remain unchanged; they now reference the imported name. Remove the now-redundant `import os` and `from pathlib import Path` ONLY if no other code in app.py uses them (os is still used by `_active_project_setting` and `_chat_roots`; Path is still used by `get_pipeline_dir`, `get_second_brain_dir`, `STATE_DIR`, etc.—so in practice both stay). No other line in app.py changes.
+
+Benefits:
+Eliminates the duplicate definition. app.py's namespace still exposes `CORE_REPO_ROOT` (via the from-import), so any existing `app.CORE_REPO_ROOT` access pattern or `__all__` export continues to work. The single source of truth now lives in config.py.
+
+### AC-33 · AC-27c – claude_client.py imports CORE_REPO_ROOT from config
+Strength: Strong
+Split-Depth: 1
+Files: claude_client.py
+Depends-On: AC-31
+
+Problem:
+claude_client.py has the line `from app import CORE_REPO_ROOT` (after the long comment block about claude-client.js not being vendored). This forces importing the entire Flask application module just to get a path constant. The only use is `CLAUDE_CLIENT_JS = CORE_REPO_ROOT / "src" / "claude-client.js"`. No other symbol is imported from app in this file.
+
+Solution:
+Change the single import line `from app import CORE_REPO_ROOT` to `from config import CORE_REPO_ROOT`. No other line in claude_client.py changes. The `CLAUDE_CLIENT_JS` assignment and all function bodies remain identical.
+
+Benefits:
+claude_client.py no longer depends on the Flask entry-point module. It can be imported in isolation (e.g. in a test or a standalone script) without Flask being installed or the Flask app object being constructed. The dependency graph becomes: claude_client → config (stdlib only), not claude_client → app → Flask.
+
+### AC-34 · AC-27d – model_stats_client.py imports CORE_REPO_ROOT from config
+Strength: Strong
+Split-Depth: 1
+Files: model_stats_client.py
+Depends-On: AC-31
+
+Problem:
+model_stats_client.py has the line `from app import CORE_REPO_ROOT` (after the module docstring and stdlib imports). This forces importing the entire Flask application module just to get a path constant. The only use is `MODEL_STATS_DB_JS = CORE_REPO_ROOT / "src" / "model-stats-db.js"`. No other symbol is imported from app in this file.
+
+Solution:
+Change the single import line `from app import CORE_REPO_ROOT` to `from config import CORE_REPO_ROOT`. No other line in model_stats_client.py changes. The `MODEL_STATS_DB_JS` assignment and all function bodies remain identical.
+
+Benefits:
+model_stats_client.py no longer depends on the Flask entry-point module. It can be imported in isolation without Flask. The dependency graph becomes: model_stats_client → config (stdlib only), not model_stats_client → app → Flask. Together with AC-27c, both clients are now decoupled from the Flask app for their sole shared dependency.
