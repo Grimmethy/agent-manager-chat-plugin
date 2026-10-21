@@ -341,3 +341,45 @@ Introduce a single module-level import of ollama_client (or a small _local_model
 
 Benefits:
 One place defines the local-provider model source, reducing the risk of a stale or divergent import; the reserved-flag check is centralized so a schema change is a one-line fix; both changes are behavior-preserving and keep the diff small and reviewable.
+
+### AC-26 · ~~Duplicated SSE block-parsing logic between client and test~~
+Strength: Strong
+
+**Retracted.**
+
+The original draft asserted that `test_filter_events_reassembles_split_blocks` re-implements the SSE parsing state machine (partial-line buffers, delimiter tracking, block-boundary logic) to construct its expected output. The provided source for `test_agent_client.py` does not support this claim. The test:
+
+1. Defines a single hardcoded byte string containing a few SSE blocks.
+2. Splits it into fixed-size (7-byte) chunks.
+3. Feeds those chunks to `agent_client.filter_events`.
+4. Asserts that the returned value equals a hardcoded expected byte string.
+
+There is no duplicated parsing logic, no re-derivation of intermediate buffer state, and no coupling to internal delimiter-handling mechanics. The test is already a black-box exercise of `filter_events`'s observable contract. Because the stated problem does not exist, the proposed rewrite is unnecessary and the finding is withdrawn in its entirety.
+
+NOTE: Flag 1 was applied in full; the finding is retracted because its core premise (that the test re-implements the parsing state machine) is contradicted by the actual source code, making the entire problem/solution/benefits chain inapplicable.
+
+### AC-27 · Clients import a config constant from the Flask entry-point module
+Strength: Strong
+Files: claude_client.py, model_stats_client.py, app.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` execute `from app import CORE_REPO_ROOT` at module level. Because `app.py` is the Flask application entry point, importing a single path constant forces the entire application module to be loaded and initialized. This inverts the expected dependency direction—leaf utility modules should not depend on the root entry point. It also creates a latent circular-import hazard: if `app.py` ever adds a top-level import of either client (today it uses lazy imports inside functions, which masks the coupling), the import cycle will crash at startup. The clients also cannot be imported independently in tests, scripts, or tooling without pulling in the full Flask app.
+
+Solution:
+Extract `CORE_REPO_ROOT` (and any other shared path constants such as `ENV_FILE_PATH`) into a new lightweight module, e.g. `config.py` or `paths.py`, that carries no dependency on `app.py`. Update `app.py` to import from this new module, and change `claude_client.py` and `model_stats_client.py` to import `CORE_REPO_ROOT` from the same neutral module. The new module should contain only constant definitions and, at most, a small `os.path` computation—no Flask, no business logic.
+
+Benefits:
+The dependency graph becomes acyclic and unidirectional: `config.py` ← `app.py`, `config.py` ← `claude_client.py`, `config.py` ← `model_stats_client.py`. The client modules become independently importable for unit tests, CLI scripts, and CI tooling without booting the Flask app. Adding or removing a top-level import in `app.py` can no longer trigger a circular-import crash, and the single source of truth for the repo-root path is obvious and easy to audit.
+
+### AC-28 · Duplicated Node.js temp-file subprocess invocation in two client modules
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` independently implement the same multi-step pattern: generate a unique temporary file path, serialize a JSON payload to that file, invoke `subprocess.run` with `node` and the target script, handle timeout and non-zero-exit errors, and remove the temp file in a `finally` block. The logic is nearly line-for-line identical. This is a missing-locality defect: if the invocation strategy must change (switch to stdin pipes, alter the cleanup mechanism, add retry logic, or change the error-reporting format), both modules must be updated in lockstep, and a missed update silently produces divergent behavior.
+
+Solution:
+Introduce a shared utility function—e.g. `run_node_script(script_path, payload, timeout)` in a new `node_client_util.py` (or alongside the config constants in `config.py`)—that encapsulates the full write-JSON-to-temp-file → `subprocess.run(node, …)` → cleanup-in-`finally` pattern, including timeout handling and error normalization. Both `claude_client.py` and `model_stats_client.py` then call this single function, passing their respective script path, JSON payload, and timeout. The utility owns the temp-file lifecycle and the subprocess contract, so the client modules focus solely on constructing their payloads and interpreting results.
+
+Benefits:
+The temp-file lifecycle, timeout handling, and error-reporting logic live in exactly one place, eliminating the risk of the two implementations drifting apart. A future change to the invocation mechanism (pipes, a different runtime, structured error codes) is a single-file edit. The client modules become shorter and more readable, and the shared utility is trivially unit-testable in isolation using `unittest` (mocking `subprocess.run`) without importing either client or the Flask app.
