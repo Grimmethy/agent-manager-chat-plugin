@@ -4,6 +4,9 @@ import json
 import sys
 
 import requests
+import logging
+
+logger = logging.getLogger(__name__)
 
 import agent_client
 
@@ -83,8 +86,8 @@ def api_terminal_sessions_events():
     def relay():
         try:
             yield from agent_client.filter_events(agent_client.iter_chunks(upstream))
-        except (requests.RequestException, OSError):
-            pass
+        except (requests.RequestException, OSError) as exc:
+            logger.warning("SSE relay stream ended abnormally: %s: %s", type(exc).__name__, exc)
         finally:
             upstream.close()
 
