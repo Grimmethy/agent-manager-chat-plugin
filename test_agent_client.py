@@ -129,5 +129,77 @@ class AgentRouteTests(unittest.TestCase):
                     agent_client.list_sessions()
 
 
+class MultiAgentTests(unittest.TestCase):
+    """Two session agents (one per machine, grimm and wok) configured via
+    AGENT_MANAGER_SESSION_AGENT_URLS: the dashboard must merge both /sessions
+    lists and tag every row with its host, and one dead agent must not hide the
+    other's sessions."""
+
+    def _agent_home(self, session_id, pid):
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, True)
+        (home / "sessions").mkdir()
+        (home / "projects").mkdir()
+        (home / "sessions" / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "sessionId": session_id, "cwd": "/home/user/proj",
+            "startedAt": 1792301206964, "version": "0.0.0", "kind": "interactive",
+            "entrypoint": "cli", "name": f"proj-{session_id}", "status": "idle",
+            "statusUpdatedAt": 1792301300000, "updatedAt": 1792301300000}))
+        return home
+
+    def setUp(self):
+        self.agents, self.urls = [], []
+        for name, session_id, pid in (("grimm", "sess-alive", 2001), ("wok", "sess-dead", 3001)):
+            agent = session_agent.Agent(self._agent_home(session_id, pid), token=TOKEN,
+                                        host=name, lister=None, alive=lambda pid: True)
+            agent.refresh()
+            srv = session_agent.make_server(agent, "127.0.0.1", 0)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.agents.append((agent, srv))
+            self.urls.append(f"http://127.0.0.1:{srv.server_address[1]}")
+        self.addCleanup(self._stop)
+        self.client = app.app.test_client()
+
+    def _stop(self):
+        for agent, srv in self.agents:
+            if agent.stop.is_set():
+                continue
+            agent.stop.set()
+            srv.shutdown()
+            srv.server_close()
+
+    def env(self, urls):
+        return mock.patch.dict(os.environ, {
+            "AGENT_MANAGER_SESSION_AGENT_URLS": json.dumps([
+                {"host": "grimm", "url": urls[0]}, {"host": "wok", "url": urls[1]}]),
+            "AGENT_MANAGER_SESSION_AGENT_TOKEN": TOKEN})
+
+    def test_second_agent_merges_and_tags_host(self):
+        with self.env(self.urls):
+            body = self.client.get("/api/chat/terminal-sessions").get_json()
+        self.assertTrue(body["enabled"] and body["reachable"])
+        self.assertEqual({(r["host"], r["id"]) for r in body["sessions"]},
+                         {("grimm", "sess-alive"), ("wok", "sess-dead")})
+
+    def test_one_agent_down_keeps_the_other(self):
+        self.agents[1][0].stop.set()  # wok goes down (grimm stays up)
+        self.agents[1][1].shutdown()
+        self.agents[1][1].server_close()
+        with self.env(self.urls):
+            body = self.client.get("/api/chat/terminal-sessions").get_json()
+        self.assertTrue(body["enabled"] and body["reachable"])
+        self.assertEqual({(r["host"], r["id"]) for r in body["sessions"]},
+                         {("grimm", "sess-alive")})
+
+    def test_singular_url_still_tags_a_host(self):
+        # no URLS key: the singular AGENT_MANAGER_SESSION_AGENT_URL is one "default" host
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_SESSION_AGENT_URL": self.urls[0],
+                                          "AGENT_MANAGER_SESSION_AGENT_TOKEN": TOKEN}):
+            body = self.client.get("/api/chat/terminal-sessions").get_json()
+        self.assertTrue(body["enabled"] and body["reachable"])
+        self.assertEqual({(r["host"], r["id"]) for r in body["sessions"]},
+                         {("default", "sess-alive")})
+
+
 if __name__ == "__main__":
     unittest.main()

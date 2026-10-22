@@ -5,9 +5,13 @@ the token, e.g. from `session_agent.py --token auto`) or AGENT_MANAGER_SESSION_A
 set, is sent as a Bearer token on every call; it is added server-side here and never reaches the browser.
 Env vars are read per call so tests (and a restarted agent) need no re-import.
 """
+import json
+import logging
 import os
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class AgentError(RuntimeError):
@@ -18,8 +22,42 @@ def base_url() -> str:
     return os.environ.get("AGENT_MANAGER_SESSION_AGENT_URL", "").strip().rstrip("/")
 
 
+def _urls() -> list:
+    """AGENT_MANAGER_SESSION_AGENT_URLS: a JSON list of {"host": ..., "url": ...}
+    objects, one per machine (e.g. grimm and wok) -- multiple host agents. Read per
+    call like the singular key; invalid JSON falls back to the singular key."""
+    raw = os.environ.get("AGENT_MANAGER_SESSION_AGENT_URLS", "").strip()
+    if not raw:
+        return []
+    try:
+        entries = json.loads(raw)
+    except ValueError:
+        logger.warning("AGENT_MANAGER_SESSION_AGENT_URLS is not valid JSON; ignoring it")
+        return []
+    if not isinstance(entries, list):
+        return []
+    out = []
+    for e in entries:
+        if isinstance(e, dict) and isinstance(e.get("url"), str) and e["url"].strip():
+            out.append({"host": str(e.get("host") or "default"),
+                        "url": e["url"].strip().rstrip("/")})
+    return out
+
+
+def configured_agents() -> list:
+    """Every configured session agent as {"host", "url"} dicts, in order.
+    AGENT_MANAGER_SESSION_AGENT_URLS (one entry per machine) wins; a singular
+    AGENT_MANAGER_SESSION_AGENT_URL becomes a single "default" host. Empty if
+    none is configured."""
+    urls = _urls()
+    if urls:
+        return urls
+    url = base_url()
+    return [{"host": "default", "url": url}] if url else []
+
+
 def enabled() -> bool:
-    return bool(base_url())
+    return bool(base_url() or _urls())
 
 
 def _token():
@@ -41,15 +79,35 @@ def _headers() -> dict:
 
 
 def list_sessions() -> list:
-    try:
-        r = requests.get(base_url() + "/sessions", headers=_headers(), timeout=3)
-        r.raise_for_status()
-        data = r.json()
-    except (requests.RequestException, ValueError) as e:
-        raise AgentError("session agent /sessions failed") from e
-    if not isinstance(data, list):
-        raise AgentError("session agent /sessions returned an unexpected shape")
-    return [row for row in data if isinstance(row, dict)]
+    """Sessions from EVERY configured agent (multiple host agents: grimm, wok),
+    each row tagged with the `host` name from the config. One agent failing is
+    recorded in `skipped` and logged, and never aborts the others; with a single
+    configured agent a failure still raises AgentError, exactly as before (the
+    route reports `reachable: False`)."""
+    agents = configured_agents()
+    if not agents:
+        raise AgentError("session agent is not configured")
+    merged = []
+    skipped = []
+    for agent in agents:
+        host, url = agent["host"], agent["url"]
+        try:
+            r = requests.get(url + "/sessions", headers=_headers(), timeout=3)
+            r.raise_for_status()
+            data = r.json()
+        except (requests.RequestException, ValueError) as e:
+            skipped.append({"host": host, "url": url, "error": str(e)})
+            logger.warning("session agent /sessions failed host=%s url=%s: %s", host, url, e)
+            continue
+        if not isinstance(data, list):
+            raise AgentError("session agent /sessions returned an unexpected shape")
+        for s in data:
+            if isinstance(s, dict):
+                s["host"] = host
+                merged.append(s)
+    if skipped and (len(agents) == 1 or not merged):
+        raise AgentError("session agent /sessions failed")
+    return merged
 
 
 def open_events():
