@@ -79,6 +79,10 @@ CHAT_LOCAL_MAX_TURNS = 100
 # callers that want all sessions, but _write_sessions can only touch the sessions it is
 # handed.
 SESSIONS_DIRNAME = ".agent-manager-chat-sessions"
+# 2026-10-19 (multi-chat workspace): the on-disk session schema version. v1 (master)
+# sessions have no schemaVersion/account/swaps/summary keys; _migrate_session() below
+# adds exactly those four with their defaults when a session reads in without them.
+SCHEMA_VERSION = 2
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _migrate_lock = threading.Lock()
 
@@ -124,6 +128,26 @@ def _migrate_legacy_store(storage_dir: Path):
         legacy.rename(legacy.with_name(legacy.name + ".migrated"))
 
 
+def _migrate_session(session: dict) -> dict:
+    """Lossless v1 -> v2 schema upgrade (2026-10-19, multi-chat workspace). A session
+    without a schemaVersion (or below SCHEMA_VERSION) gains exactly the four v2 fields
+    with their defaults -- nothing else is changed or dropped: the transcript is never
+    touched and any unknown extra keys are preserved. Pure: it returns the session and
+    does NOT rewrite the file on read (the next normal _write_session persists the new
+    shape). Idempotent -- a v2 (or newer) session is returned exactly as-is."""
+    if not isinstance(session, dict):
+        return session
+    if session.get("schemaVersion", 0) >= SCHEMA_VERSION:
+        return session
+    session.setdefault("schemaVersion", SCHEMA_VERSION)
+    # Label of a Claude account in accounts.json; None = the live account at turn time.
+    session.setdefault("account", None)
+    session.setdefault("swaps", [])
+    # Later shape: {'upToIndex': int, 'text': str, 'at': iso}
+    session.setdefault("summary", None)
+    return session
+
+
 def _read_session(storage_dir: Path, session_id: str):
     _migrate_legacy_store(storage_dir)
     try:
@@ -131,9 +155,10 @@ def _read_session(storage_dir: Path, session_id: str):
     except ValueError:
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        session = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    return _migrate_session(session)
 
 
 def _write_session(storage_dir: Path, session: dict):
@@ -221,6 +246,13 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
         # registry (app.py), NOT here -- an open file object isn't JSON-serializable and
         # wouldn't survive a process restart meaningfully anyway.
         "reserved": False,
+        # --- schema v2 fields (see _migrate_session, which adds the same four to v1 files) ---
+        "schemaVersion": SCHEMA_VERSION,
+        # Label of a Claude account in accounts.json; None = the live account at turn time.
+        "account": None,
+        "swaps": [],
+        # Later shape: {'upToIndex': int, 'text': str, 'at': iso}
+        "summary": None,
     }
 
 
