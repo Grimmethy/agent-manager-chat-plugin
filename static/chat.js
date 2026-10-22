@@ -720,3 +720,5 @@ function mountChat() {
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mountChat);
 else mountChat();
+
+export { ChatPane, SessionSwitcher, showToast };
