@@ -9,14 +9,21 @@ the fake claudeSessionId is an obviously-not-real id.
 
 Run: python -m unittest test_chat_sessions_swap test_chat_sessions -v
 """
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import accounts  # noqa: E402
 import chat_sessions  # noqa: E402
+import claude_client  # noqa: E402
+import handoff  # noqa: E402
+import model_stats_client  # noqa: E402
+import ollama_client  # noqa: E402
 
 
 class SwapSessionTest(unittest.TestCase):
@@ -174,6 +181,204 @@ class SwapSessionTest(unittest.TestCase):
         body = messages[1:-1]
         self.assertEqual(len(body), len(self.originals))
         self.assertNotIn("Switched from", [m["content"] for m in body])
+
+
+class HandOffFirstTurnTests(unittest.TestCase):
+    """HUB0008 6/11 -- _send_claude's first turn after a swap carries a hand-off;
+    a fresh session's first turn and later (resumed) turns are unchanged.
+    claude_client.generate is replaced by a prompt-capturing fake; no tokens."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.storage_dir = Path(self._tmp.name)
+        self.root = str(self.storage_dir)
+        session = chat_sessions.start_new_conversation(
+            self.storage_dir, [self.root], None,
+            provider="claude", model="opus")
+        self.sid = session["id"]
+
+    def _session(self):
+        return chat_sessions.get_session(self.storage_dir, self.sid)
+
+    def _two_rows(self):
+        return [
+            {"role": "user", "text": "please rename foo.py to bar.py",
+             "timestamp": "2026-10-19T00:00:00Z"},
+            {"role": "assistant", "text": "done, renamed it",
+             "timestamp": "2026-10-19T00:01:00Z"},
+        ]
+
+    def _send_captured(self, session, message):
+        """One _send_claude turn with canned registry and a prompt-capturing fake."""
+        calls = []
+
+        def fake_generate(m, **kwargs):
+            calls.append(m)
+            return {"sessionId": "sess-new", "model": "opus", "response": "ok"}
+
+        with mock.patch.object(claude_client, "generate", side_effect=fake_generate), \
+             mock.patch.object(accounts, "load", return_value=[]), \
+             mock.patch.object(accounts, "live_label", return_value=None), \
+             mock.patch.object(model_stats_client, "record_call"):
+            chat_sessions._send_claude(session, message, self.storage_dir)
+        self.assertEqual(len(calls), 1)
+        return calls[0]
+
+    def test_swapped_first_claude_turn_has_handoff_then_new_message(self):
+        s = self._session()
+        s["transcript"] = [dict(r) for r in self._two_rows()]
+        s["provider"] = "claude"
+        s["claudeSessionId"] = None
+        chat_sessions._write_session(self.storage_dir, s)
+        out = self._send_captured(self._session(), "and now delete bar.py")
+        # The hand-off (handoff.py's header + both earlier rows) is present...
+        self.assertIn("HANDOFF: this conversation is continuing", out)
+        self.assertIn("User: please rename foo.py to bar.py", out)
+        self.assertIn("Assistant: done, renamed it", out)
+        # ...comes BEFORE the new message, which stays the message's tail.
+        self.assertLess(out.index("HANDOFF:"), out.index("and now delete bar.py"))
+        self.assertTrue(out.endswith("and now delete bar.py"))
+        # A separator line sits between them.
+        self.assertIn("\n\n---\n\n", out)
+        # The current turn's own rows are not replayed inside the hand-off.
+        self.assertNotIn("User: and now delete bar.py", out)
+
+    def test_fresh_session_first_turn_is_unchanged(self):
+        # No earlier rows at all: the prompt is exactly the new message.
+        out = self._send_captured(self._session(), "hello world")
+        self.assertEqual(out, "hello world")
+
+    def test_later_turn_with_resume_id_has_no_handoff(self):
+        s = self._session()
+        s["transcript"] = [dict(r) for r in self._two_rows()]
+        s["claudeSessionId"] = "sess-existing"  # the CLI already knows the conversation
+        chat_sessions._write_session(self.storage_dir, s)
+        out = self._send_captured(self._session(), "second question")
+        self.assertEqual(out, "second question")
+
+    def test_stored_summary_text_reaches_the_next_handoff(self):
+        s = self._session()
+        s["transcript"] = [dict(r) for r in self._two_rows()]
+        s["claudeSessionId"] = None
+        s["summary"] = {"upToIndex": 2, "text": "STORED-SUMMARY-TEXT",
+                        "at": "2026-10-19T00:02:00Z"}
+        chat_sessions._write_session(self.storage_dir, s)
+        out = self._send_captured(self._session(), "carry on")
+        self.assertIn("STORED-SUMMARY-TEXT", out)
+        self.assertLess(out.index("STORED-SUMMARY-TEXT"), out.index("carry on"))
+
+
+class SummarizeOlderTests(unittest.TestCase):
+    """HUB0008 6/11 -- summarize_older(): writes session["summary"], never touches
+    transcript rows, skips when unneeded, and re-raises a summarizer error with
+    state untouched. All summarizers/generates here are fakes."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.storage_dir = Path(self._tmp.name)
+        session = chat_sessions.start_new_conversation(
+            self.storage_dir, [str(self.storage_dir)], None,
+            provider="claude", model="opus")
+        self.sid = session["id"]
+        # 25 rows -> 5 are "older" than the last CHAT_RECENT_TURNS_KEPT (20).
+        self.rows = [
+            {"role": "user" if i % 2 else "assistant",
+             "text": "row %d about the work" % i,
+             "timestamp": "2026-10-19T00:%02d:00Z" % i}
+            for i in range(1, 26)
+        ]
+        s = chat_sessions.get_session(self.storage_dir, self.sid)
+        s["transcript"] = [dict(r) for r in self.rows]
+        chat_sessions._write_session(self.storage_dir, s)
+
+    def _session(self):
+        return chat_sessions.get_session(self.storage_dir, self.sid)
+
+    def _small_claude_window(self):
+        # 1000-token window -> needs_summary threshold 500 tokens (~2000 chars);
+        # 25 rows x ~20 chars (~130 tokens) -- make rows long enough to cross it.
+        return mock.patch.dict(os.environ,
+                               {"AGENT_MANAGER_CHAT_CLAUDE_WINDOW_TOKENS": "64"})
+
+    def test_writes_summary_and_keeps_every_row(self):
+        captured = []
+
+        def fake_sum(text):
+            captured.append(text)
+            return "SUMMARY-TEXT"
+
+        with self._small_claude_window():
+            out = chat_sessions.summarize_older(
+                self.storage_dir, self.sid, summarizer=fake_sum)
+        self.assertIsNotNone(out)
+        self.assertEqual(out["summary"]["text"], "SUMMARY-TEXT")
+        self.assertEqual(out["summary"]["upToIndex"],
+                         len(self.rows) - chat_sessions.CHAT_RECENT_TURNS_KEPT)
+        self.assertIn("at", out["summary"])
+        # Only the OLDER rows reached the summarizer; recent ones did not.
+        self.assertEqual(len(captured), 1)
+        self.assertIn("row 1", captured[0])
+        self.assertNotIn("row 6", captured[0])
+        # Persisted: every transcript row kept verbatim, summary on disk too.
+        disk = self._session()
+        self.assertEqual(disk["transcript"], [dict(r) for r in self.rows])
+        self.assertEqual(disk["summary"]["text"], "SUMMARY-TEXT")
+
+    def test_skips_when_needs_summary_is_false(self):
+        calls = []
+        # Large window -> the transcript fits comfortably: no summary, no call.
+        with mock.patch.dict(os.environ,
+                             {"AGENT_MANAGER_CHAT_CLAUDE_WINDOW_TOKENS": "200000"}):
+            out = chat_sessions.summarize_older(
+                self.storage_dir, self.sid,
+                summarizer=lambda t: calls.append(t) or "X")
+        self.assertIsNone(out["summary"])
+        self.assertEqual(calls, [])
+
+    def test_no_older_rows_is_a_noop(self):
+        s = self._session()
+        s["transcript"] = [dict(r) for r in self.rows[:5]]  # fewer than 20 rows
+        chat_sessions._write_session(self.storage_dir, s)
+        calls = []
+        with self._small_claude_window():
+            out = chat_sessions.summarize_older(
+                self.storage_dir, self.sid,
+                summarizer=lambda t: calls.append(t) or "X")
+        self.assertIsNone(out["summary"])
+        self.assertEqual(calls, [])
+
+    def test_summarizer_error_leaves_state_unchanged_and_reraises(self):
+        def boom(text):
+            raise RuntimeError("summarizer down")
+
+        with self._small_claude_window():
+            with self.assertRaises(RuntimeError):
+                chat_sessions.summarize_older(
+                    self.storage_dir, self.sid, summarizer=boom)
+        disk = self._session()
+        self.assertIsNone(disk["summary"])
+        self.assertEqual(disk["transcript"], [dict(r) for r in self.rows])
+
+    def test_default_summarizer_calls_ollama_generate_with_600(self):
+        calls = []
+
+        def fake_generate(prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            return {"response": "FROM-OLLAMA", "thinking": ""}
+
+        with self._small_claude_window(), \
+             mock.patch.object(ollama_client, "generate", side_effect=fake_generate):
+            out = chat_sessions.summarize_older(self.storage_dir, self.sid)
+        self.assertEqual(out["summary"]["text"], "FROM-OLLAMA")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["num_predict"], 600)
+        self.assertIn("row 1", calls[0][0])
+
+    def test_missing_session_returns_none(self):
+        self.assertIsNone(chat_sessions.summarize_older(
+            self.storage_dir, "chat-does-not-exist", summarizer=lambda t: "X"))
 
 
 if __name__ == "__main__":
