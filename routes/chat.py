@@ -220,7 +220,7 @@ def api_chat_message(session_id):
     # streamed as SSE: one `data:` frame per {"type":"chunk"} as text arrives, then one
     # {"type":"final","session":{...}} carrying the same shape this route used to return
     # in one shot, so the frontend still ends up with the same authoritative session.
-    from chat_sessions import stream_message, PROVIDER_LOCAL
+    from chat_sessions import stream_message, PROVIDER_LOCAL, PROVIDER_CLAUDE
     from claude_client import ClaudeClientError
     from local_tool_client import LocalToolClientError
     from internal_api_client import InternalApiError, preempt as internal_preempt
@@ -254,7 +254,31 @@ def api_chat_message(session_id):
                 record_turn_error(CHAT_STORAGE_DIR, session_id, msg)
             except Exception as werr:  # noqa: BLE001 -- never mask the original error
                 print(f"[chat-error-record] failed: {werr}", file=sys.stderr, flush=True)
-            return f"data: {json.dumps({'type': 'error', 'error': msg})}\n\n"
+            event = {'type': 'error', 'error': msg}
+            # HUB0008 8/11: a failed CLAUDE-provider turn whose error looks like a
+            # limit error (ASSUMED phrases -- see limit_errors.py) gets a swapOffer on
+            # the SSE error event and the error text is sampled so the owner can turn
+            # real errors into fixtures. Local-provider errors and unclassified Claude
+            # errors are untouched. Only account LABELS go into the event -- never a
+            # token or a tokenFile (accounts.load entries carry both).
+            if existing.get("provider") == PROVIDER_CLAUDE:
+                from limit_errors import classify, record_sample
+                kind = classify(msg)["kind"]
+                if kind is not None:
+                    try:
+                        record_sample(CHAT_STORAGE_DIR, msg)
+                    except Exception as serr:  # noqa: BLE001 -- the offer must not die
+                        print(f"[chat-error-sample] failed: {serr}", file=sys.stderr, flush=True)
+                    import accounts
+                    # The account used for the turn: the chat's pinned account, else
+                    # the live one (same resolution as chat_sessions's turn path).
+                    used = existing.get("account") or accounts.live_label(CHAT_STORAGE_DIR)
+                    options = [{"provider": "claude", "account": a["label"]}
+                               for a in accounts.load(CHAT_STORAGE_DIR)
+                               if a.get("label") != used]
+                    options.append({"provider": "local"})
+                    event["swapOffer"] = {"kind": kind, "options": options}
+            return f"data: {json.dumps(event)}\n\n"
 
         if preempted:
             yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
