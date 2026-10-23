@@ -44,6 +44,19 @@ body {
 .chat-switcher-step { font-size: 11px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-switcher-empty { padding: 8px 12px; font-size: 12px; color: var(--muted); }
 .chat-switcher-status.waiting { color: var(--accent); }
+
+/* Piece 2/10: "needs you" amber highlight for waiting terminal rows. A row that is
+   waiting is steady-amber (.waiting); a row that *newly* became waiting additionally
+   flashes amber for 10s (.waiting-flash, driven by chat.js from attention-view.js).
+   The flash animation ends back on the steady amber, so waiting rows stay amber after
+   the 10s. Uses the existing --warn (amber) token. */
+.chat-switcher-trow.waiting { background: color-mix(in srgb, var(--warn) 14%, transparent); border-left: 3px solid var(--warn); padding-left: 9px; }
+.chat-switcher-trow.waiting-flash { animation: chat-amber-flash 10s ease-in-out; }
+@keyframes chat-amber-flash {
+  0%   { background: var(--warn); color: #1a1300; }
+  50%  { background: color-mix(in srgb, var(--warn) 40%, transparent); }
+  100% { background: color-mix(in srgb, var(--warn) 14%, transparent); }
+}
 .chat-switcher-close { padding: 2px 8px; line-height: 1.2; }
 
 /* Same flexbox-trap fix the in-tree version's own CSS comment documents: min-height:0 on

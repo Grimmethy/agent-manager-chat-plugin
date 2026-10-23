@@ -40,3 +40,19 @@ session). Please re-check them on your machine; items 4-6 and 8 have never been 
 
 Also report: the `claude --version`, how many sessions were open, and any `status` or `kind`
 value that is not `busy|idle|waiting` / `interactive`.
+
+## Attention: amber flash + count badge in the chat switcher (piece 2/10)
+
+Manual DOM checks (no automated test for these). None have ever been checked.
+
+1. **Amber flash on newly waiting.** A terminal session that transitions to `waiting` shows
+   its switcher row flash amber for ~10 seconds, then settle to a steady amber highlight
+   while it stays `waiting`. (never checked)
+2. **Steady amber while waiting.** A session already `waiting` stays steady-amber on
+   subsequent updates without re-flashing. (never checked)
+3. **Title prefix.** While at least one session is `waiting`, the browser tab title reads
+   `(N) <original title>` where N is the waiting count; it restores to `<original title>`
+   when the count returns to 0. (never checked)
+4. **Parent postMessage.** Every time the waiting count changes, the switcher posts
+   `{ type: 'chat-attention', count: N }` to `window.parent` (the dashboard's tab badge
+   itself is a separate change in the dashboard repo). (never checked)

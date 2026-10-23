@@ -25,6 +25,10 @@
 import * as smd from "./vendor/smd.js";
 import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
   formatTerminalRow, orderTerminalSessions, applyTerminalEvent } from "./sessions-view.js";
+// Piece 2/10: the pure "needs you" attention logic (which rows newly became waiting,
+// how many are waiting) lives in attention-view.js (piece 1). This file only calls it
+// and applies the result to the DOM; keep the decision logic there.
+import { attentionStep } from "./attention-view.js";
 
 let toastHideTimer = null;
 
@@ -514,6 +518,15 @@ class SessionSwitcher {
     this.events = null;
     this.open = false;
     this.pollTimer = null;
+    // Attention state (piece 2/10): the previous {key: status} map returned by
+    // attentionStep (attention-view.js, piece 1), the set of keys that newly became
+    // waiting on the last step (drives the amber flash class), the count we last
+    // posted, and the page's original <title> so we can prefix/restore it. Holds only
+    // row identity + status strings -- never any token/credential.
+    this.attentionPrev = null;
+    this.attentionNewlyWaiting = new Set();
+    this.lastAttentionCount = null;
+    this.originalTitle = (typeof document !== 'undefined' && document) ? document.title : null;
     this.slot.innerHTML = `
       <button type="button" class="secondary chat-switcher-btn" aria-haspopup="listbox" aria-expanded="false"></button>
       <div class="chat-switcher-menu" hidden></div>`;
@@ -549,6 +562,7 @@ class SessionSwitcher {
         let data = null;
         try { data = JSON.parse(e.data); } catch (err) { return; }
         this.terminal.rows = applyTerminalEvent(this.terminal.rows, name, data);
+        this.applyAttention(); // piece 2/10: after each terminal-rows update
         this.render();
       });
     }
@@ -557,6 +571,50 @@ class SessionSwitcher {
   stopEvents() {
     if (this.events) this.events.close();
     this.events = null;
+  }
+
+  // Piece 2/10: after EVERY terminal-rows update, run the pure attention step
+  // (attention-view.js, piece 1) and apply its result to the DOM:
+  //   - the amber classes come from this.attentionNewlyWaiting (used in
+  //     renderTerminalSection/renderTerminalRow below),
+  //   - the tab <title> becomes '(N) <original>' while anything is waiting and is
+  //     restored at 0,
+  //   - the parent (dashboard) is told the count via postMessage.
+  // NOTE: the dashboard's own tab BADGE is a separate change in the dashboard repo and
+  // is intentionally NOT implemented here -- we only post the count.
+  // All decision logic stays in attention-view.js; this method only reads its result
+  // and wires the DOM. Every browser API (document, window.parent, postMessage,
+  // location.origin) is guarded so nothing throws in a non-DOM / test environment.
+  applyAttention() {
+    if (typeof attentionStep !== 'function') return;
+    const rows = (this.terminal && Array.isArray(this.terminal.rows)) ? this.terminal.rows : [];
+    let res;
+    try {
+      res = attentionStep(this.attentionPrev, rows);
+    } catch (err) {
+      return; // never let attention break the switcher
+    }
+    this.attentionPrev = res.map;
+    this.attentionNewlyWaiting = new Set(res.newlyWaiting);
+
+    // Tab title: '(N) <original>' while N > 0, restored when N is 0.
+    if (typeof document !== 'undefined' && document && this.originalTitle != null) {
+      document.title = res.count > 0 ? '(' + res.count + ') ' + this.originalTitle : this.originalTitle;
+    }
+
+    // Tell the dashboard on every change of count (its badge is a separate repo change).
+    if (res.count !== this.lastAttentionCount) {
+      this.lastAttentionCount = res.count;
+      try {
+        if (typeof window !== 'undefined' && window && window.parent &&
+            typeof window.parent.postMessage === 'function') {
+          const origin = (window.location && window.location.origin) ? window.location.origin : '*';
+          window.parent.postMessage({ type: 'chat-attention', count: res.count }, origin);
+        }
+      } catch (err) {
+        // postMessage to an opaque/unknown origin can throw SecurityError -- ignore.
+      }
+    }
   }
 
   async refresh() {
@@ -571,6 +629,7 @@ class SessionSwitcher {
     } catch (e) {
       // Same: keep what we had.
     }
+    this.applyAttention(); // piece 2/10: after each terminal-rows update
     this.render();
     return this.rows;
   }
@@ -604,10 +663,15 @@ class SessionSwitcher {
   }
 
   // A terminal session row: display only (no select, no close) until a handoff exists.
-  renderTerminalRow(fmt) {
+  renderTerminalRow(fmt, newlyWaiting) {
     const ctx = fmt.context ? `<span class="chat-switcher-context">${escapeHtml(fmt.context)}</span>` : '';
     const step = fmt.step ? `<div class="chat-switcher-step">${escapeHtml(fmt.step)}</div>` : '';
-    return `<div class="chat-switcher-trow" title="${escapeHtml(fmt.fullTitle)}">
+    // Piece 2/10: a waiting row is steady-amber (.waiting); a row that newly became
+    // waiting additionally flashes amber (.waiting-flash) for 10s via chat.css.
+    const trowCls = 'chat-switcher-trow'
+      + (fmt.waiting ? ' waiting' : '')
+      + (fmt.waiting && newlyWaiting ? ' waiting-flash' : '');
+    return `<div class="${trowCls}" title="${escapeHtml(fmt.fullTitle)}">
       <div class="chat-switcher-title">${escapeHtml(fmt.title)}</div>
       <div class="chat-switcher-meta">
         <span class="chat-switcher-status${fmt.busy ? ' busy' : ''}${fmt.waiting ? ' waiting' : ''}">${escapeHtml(fmt.status)}</span>
@@ -622,7 +686,14 @@ class SessionSwitcher {
     let body;
     if (!t.reachable) body = '<div class="chat-switcher-empty">Session agent unreachable</div>';
     else if (!t.rows.length) body = '<div class="chat-switcher-empty">No terminal sessions</div>';
-    else body = orderTerminalSessions(t.rows).map((r) => this.renderTerminalRow(formatTerminalRow(r, now))).join('');
+    else body = orderTerminalSessions(t.rows).map((r) => {
+      // Piece 2/10: match this row against the newly-waiting keys from the last
+      // attention step (key rule mirrors attention-view.js keyOf: host/id when a host
+      // is present, else the id) to add the amber-flash class.
+      const key = r.host ? (r.host || '') + '/' + r.id : r.id;
+      const newly = (r.status === 'waiting') && this.attentionNewlyWaiting.has(key);
+      return this.renderTerminalRow(formatTerminalRow(r, now), newly);
+    }).join('');
     return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${body}`;
   }
 
