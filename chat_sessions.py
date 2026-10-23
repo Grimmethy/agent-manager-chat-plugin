@@ -38,6 +38,7 @@ import time
 import uuid
 from pathlib import Path
 
+import accounts
 import claude_client
 import local_tool_client
 import model_stats_client
@@ -371,7 +372,7 @@ def _agents_md_blurb(agents_md: str) -> str:
     )
 
 
-def _send_claude(session: dict, message: str) -> str:
+def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
     started = time.time()
     roots = session.get("roots") or [session["repoRoot"]]
     # First turn only: the CLI's --add-dir makes the extra repos reachable but doesn't
@@ -390,11 +391,25 @@ def _send_claude(session: dict, message: str) -> str:
             preamble_parts.append(_agents_md_blurb(agents_md))
         if preamble_parts:
             message = "\n\n---\n\n".join(preamble_parts) + "\n\n---\n\n" + message
+    # HUB0008 3/11: the chat's own account wins; otherwise follow the live account --
+    # re-resolved on EVERY turn (no caching), so a live-account swap takes effect on
+    # the next turn for a session without an explicit account.
+    label = session.get("account") or accounts.live_label(storage_dir)
+    entry = None
+    if label is not None:
+        entry = next((e for e in accounts.load(storage_dir) if e.get("label") == label), None)
+        if entry is None:
+            # Label was set but not found: ONE warning naming the label -- never the
+            # tokenFile path (secrets live outside the repo and must not leak into logs).
+            print(f"[chat-sessions] account label {label!r} not found in registry",
+                  file=sys.stderr, flush=True)
+    token_file = entry.get("tokenFile") if entry else None
     result = claude_client.generate(
         message, model=session.get("model"), effort=session.get("effort"),
         cwd=session["repoRoot"], allowed_tools=CHAT_CLAUDE_ALLOWED_TOOLS,
         max_turns=CHAT_CLAUDE_MAX_TURNS, resume=session.get("claudeSessionId"),
         add_dirs=roots[1:], allow_amplification=True,
+        token_file=token_file,
     )
     if result.get("sessionId"):
         session["claudeSessionId"] = result["sessionId"]
@@ -734,7 +749,7 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     reply_parts = []
     result_box = {}
     if session["provider"] == PROVIDER_CLAUDE:
-        reply = _send_claude(session, message)
+        reply = _send_claude(session, message, storage_dir)
         reply_parts.append(reply)
         session["transcript"][-1]["text"] = reply
         _write_session(storage_dir, session)
