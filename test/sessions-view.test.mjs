@@ -4,6 +4,7 @@ import {
   truncateTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
   orderSessions, nextSelectionAfterClose, formatRow,
   formatTokens, contextLabel, terminalTimer, STALE_BUSY_SECS, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
+  hasShippedChild, retireActionAllowed,
 } from '../static/sessions-view.js';
 
 const NOW = Date.parse('2026-10-19T12:00:00Z');
@@ -131,6 +132,32 @@ test('prototype keys are not statuses', () => {
   assert.equal(formatTerminalRow({ id: 'p', status: 'toString' }, NOW).busy, false);
   assert.deepEqual(orderTerminalSessions([{ id: '1', name: 'a', status: 'constructor' },
     { id: '2', name: 'b', status: 'busy' }]).map((r) => r.id), ['2', '1']);
+});
+
+test('does not render actionable retire control when children are merged', () => {
+  // HUB0005-05 shape: heuristic 'retire' flag, vote not yet cast, child already shipped.
+  const flagged = {
+    id: 'HUB0005-05',
+    disposition: 'retire',
+    voteResult: null,
+    confidenceSource: 'heuristic-default',
+    duplicateFlag: { reason: '~85% token overlap with HUB0010-06', confidence: 'medium' },
+    children: [{ id: 'HUB0011-01', status: 'done', review: 'merged' }],
+  };
+  assert.equal(hasShippedChild(flagged), true);
+  assert.equal(retireActionAllowed(flagged), false); // shipped child blocks the retire action
+  // Same flag with no shipped child is still actionable -- the guard fires only on shipped children.
+  assert.equal(retireActionAllowed({ disposition: 'retire', voteResult: null, children: [] }), true);
+  assert.equal(retireActionAllowed({ disposition: 'retire', voteResult: null }), true);
+  // A done child whose review has not merged is not shipped yet.
+  assert.equal(retireActionAllowed({ disposition: 'retire', voteResult: null,
+    children: [{ status: 'done', review: 'pending' }] }), true);
+  // Non-retire dispositions are never offered as a retire action, even with no children.
+  assert.equal(retireActionAllowed({ disposition: 'archive', children: [{ status: 'done', review: 'merged' }] }), false);
+  assert.equal(retireActionAllowed(null), false);
+  // children shaped like a non-array (or with prototype-like noise) is handled, not thrown on.
+  assert.equal(hasShippedChild({ children: null }), false);
+  assert.equal(hasShippedChild({ children: [null, { review: 'merged' }] }), false);
 });
 
 test('busy with no transcript activity for a long time is flagged, not timed', () => {

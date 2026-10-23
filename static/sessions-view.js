@@ -160,3 +160,26 @@ export function applyTerminalEvent(rows, event, data) {
   next[i] = data;
   return next;
 }
+
+// --- Retire-disposition guard (HUB0005-05 / HUB0010-06 false-duplicate incident) ----------------
+// A heuristic duplicate/staleness flag can carry disposition:'retire' while voteResult is still
+// null -- a LIVE pending retirement against a task that may already have shipped work. That must
+// never be presented as actionable when the target has a shipped child (status 'done', review
+// 'merged'): in the incident, a "~85% token overlap" heuristic (confidenceSource
+// 'heuristic-default') flagged the HUB0005-05 parent against the unrelated HUB0010-06, and acting
+// on the retire vote would have killed a valid task whose child (HUB0011-01) had already shipped.
+// Pure helper (no DOM, injected data only) so it can be consumed by whatever renders a
+// duplicate/staleness flag's retire control and unit-tested directly -- see
+// test/sessions-view.test.mjs.
+export function hasShippedChild(task) {
+  const children = task && Array.isArray(task.children) ? task.children : [];
+  return children.some((c) => c && c.status === 'done' && c.review === 'merged');
+}
+
+// Whether the 'retire' control for a flagged task may be rendered/bound as actionable.
+// Only a flag that actually asks for 'retire' qualifies, and never one whose target has a
+// shipped child -- a done child whose review has not merged yet does not count as shipped.
+export function retireActionAllowed(task) {
+  if (!task || task.disposition !== 'retire') return false;
+  return !hasShippedChild(task);
+}
