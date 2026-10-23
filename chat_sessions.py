@@ -656,7 +656,7 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
         result_box["final_text"] = final_text
 
 
-def stream_message(storage_dir: Path, session_id: str, message: str):
+def stream_message(storage_dir: Path, session_id: str, message: str, *, driven_by: "str | None" = None):
     """Generator sibling of the old send_message -- yields {"type": "chunk", "text"} as
     the reply generates, then exactly one {"type": "final", "session": {...}} carrying
     the same updated-session shape send_message() used to return in one shot, once the
@@ -677,19 +677,22 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
     with _busy_lock:
         _busy_sessions.add(session_id)
     try:
-        yield from _stream_message_turn(storage_dir, session, message)
+        yield from _stream_message_turn(storage_dir, session, message, driven_by=driven_by)
     finally:
         with _busy_lock:
             _busy_sessions.discard(session_id)
 
 
-def _stream_message_turn(storage_dir: Path, session: dict, message: str):
+def _stream_message_turn(storage_dir: Path, session: dict, message: str, *, driven_by: "str | None" = None):
     # 2026-09-01 (Grimmethy: "time stamps to the second programmed into each
     # thought segment"): capture the turn's wall-clock time so the transcript
     # render (grillRenderTranscript in index.html) can stamp each segment. Old
     # persisted entries simply lack the key -- the renderer falls back to no
     # stamp, so this is safe against existing sessions.
-    session["transcript"].append({"role": "user", "text": message, "timestamp": _now_iso()})
+    _user_row = {"role": "user", "text": message, "timestamp": _now_iso()}
+    if driven_by is not None:
+        _user_row["drivenBy"] = driven_by
+    session["transcript"].append(_user_row)
     # In-progress placeholder, rewritten and PERSISTED after every chunk (not just once
     # at the end) -- 2026-08-26, Grimmethy: "It thought a lot and then the chat record
     # just disappeared." Root-caused live: a 30+-minute real investigation was killed
