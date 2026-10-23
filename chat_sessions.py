@@ -302,6 +302,69 @@ def end_session(storage_dir: Path, session_id: str):
     return session
 
 
+def _swap_label(side: dict) -> str:
+    # "provider / model" with the account only when one is pinned -- the human-readable
+    # half of the transcript marker row's text.
+    label = f"{side['provider']} / {side['model']}"
+    if side.get("account"):
+        label += f" (account: {side['account']})"
+    return label
+
+
+def swap_session(storage_dir: Path, session_id: str, provider: str, model: str,
+                 account: str = None, effort: str = None):
+    """HUB0008 4/11 (multi-chat workspace): change a chat's provider/model/account
+    IN PLACE, mid-conversation. Every existing transcript row is kept verbatim --
+    this only appends ONE marker row recording the switch -- and appends one
+    {'at','from','to'} entry to session["swaps"] (schema v2, piece 1) so the swap
+    history survives. Persists exactly once.
+
+    Returns the updated session, or None if the session is missing or not active.
+    Raises ValueError for a provider other than PROVIDER_LOCAL / PROVIDER_CLAUDE.
+
+    claudeSessionId is ALWAYS reset to None on a swap: a Claude CLI session cannot be
+    assumed resumable on another account or after a local-provider interlude -- the
+    new backend gets its history from the transcript (piece 6), never from --resume.
+    """
+    session = _read_session(storage_dir, session_id)
+    if not session or session.get("status") != "active":
+        return None
+    if provider not in (PROVIDER_LOCAL, PROVIDER_CLAUDE):
+        raise ValueError(f"invalid swap provider: {provider!r} "
+                         f"(expected {PROVIDER_LOCAL!r} or {PROVIDER_CLAUDE!r})")
+    from_side = {
+        "provider": session.get("provider"),
+        "model": session.get("model"),
+        "account": session.get("account"),
+    }
+    session["provider"] = provider
+    session["model"] = model
+    # account only means something for the Claude provider -- local has no account.
+    session["account"] = account if provider == PROVIDER_CLAUDE else None
+    if effort is not None:
+        session["effort"] = effort
+    session["claudeSessionId"] = None
+    iso = _now_iso()
+    to_side = {
+        "provider": provider,
+        "model": model,
+        "account": session["account"],
+    }
+    session.setdefault("swaps", []).append({"at": iso, "from": from_side, "to": to_side})
+    # The marker row is the transcript's durable audit record of this swap. It is
+    # skipped in the local model replay (see _build_local_messages) but kept in the
+    # human-visible transcript forever -- never deleted or edited.
+    session["transcript"].append({
+        "role": "assistant",
+        "text": f"Switched from {_swap_label(from_side)} to {_swap_label(to_side)}.",
+        "marker": True,
+        "timestamp": iso,
+    })
+    _touch(session)
+    _write_session(storage_dir, session)
+    return session
+
+
 def _session_title(session: dict) -> str:
     for turn in session.get("transcript") or []:
         if turn.get("role") == "user" and (turn.get("text") or "").strip():
@@ -614,6 +677,12 @@ def _build_local_messages(session: dict, message: str) -> list:
     for turn in recent:
         if turn.get("error"):
             continue  # recorded failure notices are for the human, never replayed to the model
+        if turn.get("marker") is True:
+            # swap_session()'s audit rows are for the human (and the swaps log), never
+            # re-sent to the model -- keyed strictly on the boolean flag, exactly like
+            # the error-row skip above; a real row whose text merely contains the word
+            # "marker" has no marker key and is replayed normally.
+            continue
         role = "assistant" if turn["role"] == "assistant" else "user"
         messages.append({"role": role, "content": turn["text"]})
     messages.append({"role": "user", "content": message})
