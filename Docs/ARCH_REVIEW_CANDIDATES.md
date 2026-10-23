@@ -560,3 +560,29 @@ In each of the three handlers, delete the `import ollama_client` line and change
 
 Benefits:
 The routing layer is now provider-agnostic: it depends only on internal_api_client and the shared app helpers, not on a specific model-client module. Adding or swapping the local model provider later requires no changes to route files.
+
+### AC-43 · Centralize the Node CLI subprocess wrapper into a shared helper
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` independently implement the identical subprocess execution pattern for invoking Node.js CLI scripts: generating a UUID, serializing a JSON payload to a temporary file, constructing and executing a `node` command with a timeout, and cleaning up the temporary file in a `finally` block. This duplication means any change to the execution protocol—such as adding a retry mechanism, altering the payload schema, adjusting timeout defaults, or switching the cleanup strategy—must be made in two places, and a miss in either file silently diverges behavior between the two clients.
+
+Solution:
+Extract the mechanical subprocess-execution steps into a single shared utility function (for example, `_run_node_cli(script_path, args, json_payload, timeout)`) placed in a common module that both clients already depend on. Each client then calls this helper, passing only its own script path, argument list, and payload, while the helper owns UUID generation, temp-file I/O, the `subprocess.run` call with timeout, and guaranteed cleanup in a `finally` block.
+
+Benefits:
+Eliminates the duplicated logic entirely, so there is exactly one code path for Node CLI invocation. Cross-cutting concerns—structured logging, metrics emission, error-classification, or future migration to a different transport—can be added in a single location. The two client modules become thinner, more readable, and easier to unit-test by mocking one helper rather than two near-identical blocks.
+
+### AC-44 · Decouple client modules from `app.py`'s module-level state
+Strength: Strong
+Files: claude_client.py, model_stats_client.py, app.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` import `CORE_REPO_ROOT` directly from `app.py`, which is the Flask application entry point. This forces any consumer of the client modules to import the entire Flask app—its routes, its extensions, its configuration side-effects—just to obtain a filesystem path. It makes the clients untestable in isolation (a unit test must boot or at least import the Flask app), and it inverts the natural dependency direction: low-level utility modules should not depend on the web-application layer.
+
+Solution:
+Move the `CORE_REPO_ROOT` resolution logic (the `os.path` / `pathlib` computation that determines the repository root) into a small, dependency-free module such as `paths.py` or `config.py`. Both `app.py` and the two client modules then import `CORE_REPO_ROOT` from that shared module instead of from `app.py`. The Flask app retains its role as the HTTP entry point, while the path constant lives in a layer that has no web-framework dependency.
+
+Benefits:
+The client modules become importable and testable without pulling in Flask, its extensions, or any route registration. The dependency graph becomes acyclic and directionally correct (clients → shared config; app → shared config), which simplifies refactoring, static analysis, and future extraction of the clients into a standalone package. It also removes a hidden coupling that would break if `app.py` were ever renamed, split, or replaced by a different web framework.
