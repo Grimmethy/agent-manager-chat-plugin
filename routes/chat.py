@@ -9,6 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 import agent_client
+import agent_hosts
 
 # The app.py helpers these views call (CHAT_STORAGE_DIR, _call_chat, _chat_roots,
 # _discuss_provider_args) are imported lazily inside each view: app.py imports THIS
@@ -61,31 +62,52 @@ def api_chat_sessions():
 
 @chat_bp.route("/api/chat/terminal-sessions", methods=["GET"])
 def api_terminal_sessions():
-    """Local Claude Code terminal sessions, as reported by the optional session agent
+    """Local Claude Code terminal sessions from every configured session agent
     (agent_client.py). Never an error: 'enabled' says whether the feature is configured,
-    'reachable' whether the agent answered. Read-only."""
+    'reachable' whether at least one host answered, 'sessions' carries one tagged row per
+    live host ('host': <name>), 'hosts' the configured host names in config order, and
+    'skipped' one {'host','reason'} per failed host. Read-only. No token or token-file
+    path ever appears in the body -- each host's own bearer token stays server-side."""
     if not agent_client.enabled():
-        return jsonify({"enabled": False, "reachable": False, "sessions": []})
-    try:
-        return jsonify({"enabled": True, "reachable": True, "sessions": agent_client.list_sessions()})
-    except agent_client.AgentError:
-        return jsonify({"enabled": True, "reachable": False, "sessions": []})
+        return jsonify({"enabled": False, "reachable": False, "sessions": [],
+                        "hosts": [], "skipped": []})
+    result = agent_client.list_all()
+    hosts = [h.name for h in agent_hosts.hosts()]
+    skipped = result["skipped"]
+    reachable = len(skipped) < len(hosts)
+    if not reachable:
+        result = {"sessions": [], "skipped": skipped}
+    return jsonify({"enabled": True, "reachable": reachable, "sessions": result["sessions"],
+                    "hosts": hosts, "skipped": skipped})
 
 
 @chat_bp.route("/api/chat/terminal-sessions/events", methods=["GET"])
 def api_terminal_sessions_events():
-    """SSE passthrough of the session agent's /events (the agent token stays server-side).
-    The stream just ends if the agent goes away; the browser's EventSource reconnects."""
+    """SSE passthrough of ONE session agent's /events (the agent token stays server-side).
+    Query param host=<name> picks the host: optional with a single configured host (that
+    one is used and its name tagged onto every event), REQUIRED when several are
+    configured (400 when missing, 404 for an unknown name, 502 when that host is
+    unreachable). The stream just ends if the agent goes away; the browser's
+    EventSource reconnects. No token ever appears in the stream."""
     if not agent_client.enabled():
         abort(404, description="session agent is not configured")
+    host = request.args.get("host")
+    hosts = agent_hosts.hosts()
+    if host is None and len(hosts) != 1:
+        abort(400, description=(
+            f"{len(hosts)} session agents are configured; pass host=<name> to pick one"))
+    if host is None:
+        host = hosts[0].name
+    elif not any(h.name == host for h in hosts):
+        abort(404, description=f"unknown session agent host '{host}'")
     try:
-        upstream = agent_client.open_events()
+        upstream = agent_client.open_events(host)
     except agent_client.AgentError:
         abort(502, description="session agent is unreachable")
 
     def relay():
         try:
-            yield from agent_client.filter_events(agent_client.iter_chunks(upstream))
+            yield from agent_client.filter_events(agent_client.iter_chunks(upstream), host=host)
         except (requests.RequestException, OSError) as exc:
             logger.warning("SSE relay stream ended abnormally: %s: %s", type(exc).__name__, exc)
         finally:
