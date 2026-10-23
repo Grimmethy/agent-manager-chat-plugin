@@ -43,6 +43,7 @@ import local_tool_client
 import model_stats_client
 import ollama_client
 import template_store
+import turn_cancel
 
 PROVIDER_LOCAL = "local"
 PROVIDER_CLAUDE = "claude"
@@ -670,6 +671,9 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
     if not session or session["status"] != "active":
         yield {"type": "final", "session": session}
         return
+    # A cancel flag left over from a previously interrupted turn must never leak
+    # into this one -- clear it at the start of every turn.
+    turn_cancel.clear(session_id)
     with _busy_lock:
         _busy_sessions.add(session_id)
     try:
@@ -701,7 +705,12 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
 
     reply_parts = []
     result_box = {}
+    session_id = session["id"]
+    cancelled = False
     if session["provider"] == PROVIDER_CLAUDE:
+        # Claude branch: _send_claude is a single blocking subprocess call that
+        # cannot be interrupted mid-turn, so no turn_cancel check is applied
+        # here -- cancel handling is local-branch only.
         reply = _send_claude(session, message)
         reply_parts.append(reply)
         session["transcript"][-1]["text"] = reply
@@ -709,10 +718,27 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
         yield {"type": "chunk", "text": reply}
     else:
         for chunk in _stream_local(session, message, result_box):
+            # Check between chunks (turn_cancel.py): if a cancel was requested,
+            # stop the stream -- the assistant placeholder already holds the
+            # partial text persisted after the last chunk.
+            if turn_cancel.is_requested(session_id):
+                cancelled = True
+                break
             reply_parts.append(chunk)
             session["transcript"][-1]["text"] = "".join(reply_parts)
             _write_session(storage_dir, session)
             yield {"type": "chunk", "text": chunk}
+
+    if cancelled:
+        # Cancelled turn: keep the partial text already persisted in the
+        # assistant placeholder (per-chunk persistence above is the point of it),
+        # tag the row, clear the flag so it can't leak into the next turn, and
+        # end the turn.
+        session["transcript"][-1]["cancelled"] = True
+        turn_cancel.clear(session_id)
+        _write_session(storage_dir, session)
+        yield {"type": "final", "session": session}
+        return
 
     # 2026-09-15: prefer _stream_local's own authoritative final_text (the model's
     # response with every SIDE-FINDING:/AMPLIFY:/CONCEPT-BUILD:/CONTEXT-LOG: marker
