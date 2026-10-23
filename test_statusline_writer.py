@@ -6,12 +6,18 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 import statusline_writer as sw
 
 PAYLOAD = {"session_id": "sess-1", "model": {"id": "model-a", "display_name": "Model A"},
            "context_window": {"context_window_size": 1000, "used_percentage": 14.2}}
+
+# Fake fixture only (no real tokens/credentials): the ASSUMED rate_limits shape.
+LIMITS_PAYLOAD = {"session_id": "sess-1", "model": {"id": "model-a", "display_name": "Model A"},
+                  "rate_limits": {"five_hour": {"used_percentage": 42.5, "resets_at": 1700000000},
+                                  "seven_day": {"used_percentage": 17, "resets_at": 1700000000}}}
 
 
 class WriterTests(unittest.TestCase):
@@ -74,6 +80,118 @@ class WriterTests(unittest.TestCase):
                              capture_output=True, text=True, timeout=10)
         self.assertEqual((res.returncode, res.stdout.strip()), (0, "Model A 14%"))
         self.assertTrue(self.path.exists())
+
+    # ---- usage limits (piece 3/7) ----
+
+    def test_extract_limits_assumed_shape(self):
+        self.assertEqual(sw.extract_limits(LIMITS_PAYLOAD),
+                         {"fiveHour": {"usedPercentage": 42.5, "resetsAt": 1700000000},
+                          "weekly": {"usedPercentage": 17, "resetsAt": 1700000000}})
+
+    def test_extract_limits_iso_resets_at(self):
+        payload = {"rate_limits": {"five_hour": {"used_percentage": 1, "resets_at": "2025-01-15T08:00:00Z"},
+                                   "seven_day": {"used_percentage": 2, "resets_at": "2025-01-16T00:00:00+02:00"}}}
+        limits = sw.extract_limits(payload)
+        self.assertEqual(limits["fiveHour"]["resetsAt"],
+                         int(datetime.fromisoformat("2025-01-15T08:00:00+00:00").timestamp()))
+        self.assertEqual(limits["weekly"]["resetsAt"],
+                         int(datetime.fromisoformat("2025-01-16T00:00:00+02:00").timestamp()))
+        self.assertIsInstance(limits["fiveHour"]["resetsAt"], int)
+
+    def test_extract_limits_missing_rate_limits(self):
+        for payload in ({}, {"session_id": "abc"}, {"rate_limits": "nope"}, {"rate_limits": None},
+                        {"rate_limits": []}, None, []):
+            self.assertIsNone(sw.extract_limits(payload), payload)
+
+    def test_extract_limits_null_per_model_caps(self):
+        limits = sw.extract_limits({"rate_limits": {"five_hour": None,
+                                                    "seven_day": {"used_percentage": 5, "resets_at": 1}}})
+        self.assertIsNone(limits["fiveHour"])
+        self.assertEqual(limits["weekly"], {"usedPercentage": 5, "resetsAt": 1})
+
+    def test_extract_limits_non_numeric_percentage(self):
+        limits = sw.extract_limits({"rate_limits": {"five_hour": {"used_percentage": "high",
+                                                                  "resets_at": "not a date"}}})
+        self.assertEqual(limits["fiveHour"], {"usedPercentage": None, "resetsAt": None})
+
+    def test_write_limits_label_validation(self):
+        limits = sw.extract_limits(LIMITS_PAYLOAD)
+        for bad in ("", "bad label!", "a" * 41, "x/../y", 123, None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                sw.write_limits(self.dir, bad, limits)
+        label = "a" * 40  # maximum allowed length is accepted
+        path = Path(sw.write_limits(self.dir, label, limits))
+        data = json.loads(path.read_text())
+        self.assertEqual(set(data), {"fiveHour", "weekly", "observedAt"})
+        self.assertEqual(data["fiveHour"], {"usedPercentage": 42.5, "resetsAt": 1700000000})
+        self.assertEqual(data["weekly"], {"usedPercentage": 17, "resetsAt": 1700000000})
+        self.assertIsInstance(data["observedAt"], int)
+
+    def test_raw_sample_written_once_and_not_overwritten(self):
+        first = {"five_hour": {"used_percentage": 1, "resets_at": 10}}
+        second = {"five_hour": {"used_percentage": 99}, "seven_day": None}
+        path = Path(sw._write_raw_sample_once(self.dir, first))
+        before = path.read_text()
+        sw._write_raw_sample_once(self.dir, second)  # never overwrites
+        self.assertEqual(path.read_text(), before)
+        self.assertEqual(json.loads(before), first)
+
+    def test_limits_and_sample_file_modes(self):
+        limits = sw.extract_limits(LIMITS_PAYLOAD)
+        paths = (Path(sw.write_limits(self.dir, "acc-1", limits)),
+                 Path(sw._write_raw_sample_once(self.dir, {"five_hour": None})))
+        for p in paths:
+            self.assertEqual(p.stat().st_mode & 0o777, 0o600, p)
+
+    def test_main_without_label_writes_sample_but_no_limits_file(self):
+        env = os.environ.pop("AM_ACCOUNT_LABEL", None)
+        try:
+            out = io.StringIO()
+            old, sys.stdout = sys.stdout, out
+            try:
+                self.assertEqual(sw.main([str(self.dir)], stdin=io.StringIO(json.dumps(LIMITS_PAYLOAD))), 0)
+            finally:
+                sys.stdout = old
+        finally:
+            if env is not None:
+                os.environ["AM_ACCOUNT_LABEL"] = env
+        self.assertEqual(out.getvalue().splitlines(), ["Model A"])
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["rate_limits.sample.json"])  # no limits.*.json
+        self.assertEqual(json.loads((self.dir / "rate_limits.sample.json").read_text()), LIMITS_PAYLOAD["rate_limits"])
+
+    def test_main_with_label_writes_limits_file_and_never_fails(self):
+        env = os.environ.get("AM_ACCOUNT_LABEL")
+        try:
+            out = io.StringIO()
+            old, sys.stdout = sys.stdout, out
+            try:
+                os.environ["AM_ACCOUNT_LABEL"] = "acc-1"
+                self.assertEqual(sw.main([str(self.dir)], stdin=io.StringIO(json.dumps(LIMITS_PAYLOAD))), 0)
+                os.environ["AM_ACCOUNT_LABEL"] = "bad label!"  # invalid label: still never fails
+                self.assertEqual(sw.main([str(self.dir)], stdin=io.StringIO(json.dumps(LIMITS_PAYLOAD))), 0)
+            finally:
+                sys.stdout = old
+        finally:
+            if env is None:
+                os.environ.pop("AM_ACCOUNT_LABEL", None)
+            else:
+                os.environ["AM_ACCOUNT_LABEL"] = env
+        self.assertEqual(out.getvalue().splitlines(), ["Model A", "Model A"])
+        data = json.loads((self.dir / "limits.acc-1.json").read_text())
+        self.assertEqual(data["fiveHour"], {"usedPercentage": 42.5, "resetsAt": 1700000000})
+        self.assertFalse((self.dir / "limits.bad label!.json").exists())
+        self.assertTrue((self.dir / "rate_limits.sample.json").exists())
+
+    def test_main_without_rate_limits_writes_no_sample(self):
+        out = io.StringIO()
+        old, sys.stdout = sys.stdout, out
+        try:
+            self.assertEqual(sw.main([str(self.dir)], stdin=io.StringIO(json.dumps(PAYLOAD))), 0)
+        finally:
+            sys.stdout = old
+        self.assertEqual(out.getvalue().splitlines(), ["Model A 14%"])
+        self.assertFalse((self.dir / "rate_limits.sample.json").exists())
+        self.assertFalse(any(p.name.startswith("limits.") for p in self.dir.iterdir()))
 
 
 if __name__ == "__main__":

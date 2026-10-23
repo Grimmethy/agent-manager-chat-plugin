@@ -232,8 +232,10 @@ def chat_page():
 
 
 from routes.chat import chat_bp  # noqa: E402
+from routes.accounts import accounts_bp  # noqa: E402
 
 app.register_blueprint(chat_bp)
+app.register_blueprint(accounts_bp)
 
 
 if __name__ == "__main__":
