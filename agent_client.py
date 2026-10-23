@@ -7,6 +7,7 @@ sent as a Bearer header to THAT host only; it is added server-side here and neve
 reaches the browser. Env vars are read per call so tests (and a restarted agent)
 need no re-import.
 """
+import json
 import logging
 import os
 
@@ -90,11 +91,36 @@ def list_sessions() -> list:
     return result["sessions"]
 
 
-def open_events():
-    """An open streaming response for the agent's /events SSE. The caller must close it.
-    Read timeout 60s: the agent sends a keepalive comment every 15s. Singular config only."""
+def _resolve_host(name=None):
+    """The Host to talk to. name=None means 'the only configured host' and raises
+    AgentError when more than one is configured (the caller must say which);
+    an unknown name raises AgentError."""
+    hosts = agent_hosts.hosts()
+    if name is None:
+        if len(hosts) == 1:
+            return hosts[0]
+        raise AgentError(
+            f"{len(hosts)} session agents are configured; pass host=<name> to pick one")
+    for host in hosts:
+        if host.name == name:
+            return host
+    raise AgentError(f"unknown session agent host '{name}'")
+
+
+def open_events(host=None):
+    """An open streaming response for the named host's /events SSE. The caller must
+    close it. host is a host NAME (agent_hosts.hosts()); None means the only
+    configured host (AgentError if more than one, unknown name also AgentError).
+    The request goes to that host's url + '/events' with THAT host's own bearer
+    token only (same rule as list_all). Read timeout 60s: the agent sends a
+    keepalive comment every 15s."""
+    target = _resolve_host(host)
+    headers = {}
+    token = agent_hosts.read_token(target)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        r = requests.get(base_url() + "/events", headers=_headers(), params={"types": "session"},
+        r = requests.get(target.url + "/events", headers=headers, params={"types": "session"},
                          stream=True, timeout=(3, 60))
         r.raise_for_status()
         return r
@@ -117,10 +143,53 @@ def iter_chunks(resp):
         yield chunk
 
 
-def filter_events(chunks, allowed=("session.updated", "session.removed")):
+def _tag_host_block(block, host_name):
+    """Re-serialise the block's data: payload as JSON with "host" added. Passes the
+    block through unchanged when the payload is not a JSON object (or has none)."""
+    lines = block.split(b"\n")
+    values = []
+    for l in lines:
+        if l.startswith(b"data:"):
+            v = l[5:]
+            if v.startswith(b" "):
+                v = v[1:]
+            values.append(v)
+    if not values:
+        return block
+    try:
+        payload = json.loads(b"\n".join(values).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return block
+    if not isinstance(payload, dict):
+        return block
+    payload["host"] = host_name
+    tagged = b"data: " + json.dumps(payload).encode("utf-8")
+    out = []
+    replaced = False
+    for l in lines:
+        if l.startswith(b"data:") and not replaced:
+            out.append(tagged)
+            replaced = True
+        elif not l.startswith(b"data:"):
+            out.append(l)
+    return b"\n".join(out)
+
+
+def filter_events(chunks, allowed=("session.updated", "session.removed"), host=None):
     """Pass through only whole SSE blocks whose event name is in `allowed` (plus comment
     keepalives). transcript.append carries private text the UI never shows, so it is dropped
-    here even though the agent is also asked (types=session) not to send it."""
+    here even though the agent is also asked (types=session) not to send it.
+
+    When host is a host NAME, every passed-through session.updated / session.removed
+    block has its JSON data: payload re-serialised with "host": <name> added (a data
+    payload that is not a JSON object passes through unchanged). With no name given,
+    a singular (single-host) config tags with that host's name -- 'default' for the
+    AGENT_MANAGER_SESSION_AGENT_URL config."""
+    host_tag = host
+    if host_tag is None:
+        hosts = agent_hosts.hosts()
+        if len(hosts) == 1:
+            host_tag = hosts[0].name
     buf = b""
     for chunk in chunks:
         buf += chunk
@@ -132,4 +201,6 @@ def filter_events(chunks, allowed=("session.updated", "session.removed")):
                 continue
             name = next((l[7:].strip() for l in lines if l.startswith(b"event:")), b"")
             if name.decode("utf-8", "replace") in allowed:
+                if host_tag is not None and name in (b"session.updated", b"session.removed"):
+                    block = _tag_host_block(block, host_tag)
                 yield block + b"\n\n"
