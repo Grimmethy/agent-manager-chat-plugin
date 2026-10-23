@@ -586,3 +586,23 @@ Move the `CORE_REPO_ROOT` resolution logic (the `os.path` / `pathlib` computatio
 
 Benefits:
 The client modules become importable and testable without pulling in Flask, its extensions, or any route registration. The dependency graph becomes acyclic and directionally correct (clients → shared config; app → shared config), which simplifies refactoring, static analysis, and future extraction of the clients into a standalone package. It also removes a hidden coupling that would break if `app.py` were ever renamed, split, or replaced by a different web framework.
+
+### AC-45 · Duplicated atomic-write protocol between `write_snapshot` and `_atomic_write`
+Strength: Strong
+Files: (module containing `write_snapshot` and `_atomic_write`; test file exercising `_write_raw_sample_once`)
+
+Problem:
+`write_snapshot` and `_atomic_write` implement the identical atomic-write protocol line-for-line: `os.makedirs` → `os.open(tmp, …O_EXCL, 0o600)` → `json.dump` → `os.replace` → `unlink`-on-failure. The only difference in the *write* portion is the object handed to `json.dump`—`write_snapshot` builds it inline (`{**rec, "observedAt": int(time.time())}`) while `_atomic_write` receives a pre-built `obj`. This means any protocol-level change (adding `os.fsync(fd)` before `os.replace` for crash-durability, switching the tmp suffix from `.{pid}` to a UUID for multi-process safety, adjusting the `O_EXCL` flag, or adding a `"schema_version"` key) must be made in two places in the same file, and a missed copy silently leaves one path with the old, weaker guarantee.
+
+Solution:
+Keep `write_snapshot`'s pre-write idempotency check (read the existing file, compare `contextWindowSize` and `model`, return `False` early if unchanged) in place. Replace only the duplicated *write* portion—the `os.makedirs` → `os.open` → `json.dump` → `os.replace` → `unlink`-on-failure block—with a single call to `_atomic_write`. Concretely, the tail of `write_snapshot` (after the diff-check and the `return False` early-exit) becomes:
+
+```python
+return _atomic_write(directory, rec["sessionId"] + ".json",
+                     {**rec, "observedAt": int(time.time())})
+```
+
+This eliminates the ~12 lines of duplicated protocol code while preserving `write_snapshot`'s full observable contract: it still returns `False` (without touching the filesystem) when the window size and model are unchanged, and it still performs the atomic write and returns `True` (or the path, matching `_atomic_write`'s return) when a change is detected. `_atomic_write` becomes the single owner of the write protocol; `write_snapshot` remains a thin adapter that adds the snapshot-specific diff-check and payload construction.
+
+Benefits:
+A single implementation of the atomic-write protocol means any future durability, concurrency, or schema change is made in exactly one place. The subtle divergence risk (one path gets a new key or flag, the other doesn't) is eliminated. The module's public surface and test coverage remain unchanged—`write_snapshot` still accepts the same arguments, still returns `False` on a no-op (as asserted by `test_writes_only_when_window_or_model_changed`), and still produces the same on-disk result on a real write—so no caller or test needs modification.
