@@ -125,6 +125,10 @@ function lastSegment(path) {
   return parts.length ? parts[parts.length - 1] : '';
 }
 
+export function rowKey(row) {
+  return (row.host || '') + '/' + row.id;
+}
+
 export function formatTerminalRow(row, now) {
   const status = Object.hasOwn(STATUS_WORDS, row.status) ? row.status : 'idle';
   return {
@@ -138,23 +142,54 @@ export function formatTerminalRow(row, now) {
     step: row.step || '',
     context: contextLabel(row.contextTokens, row.contextWindow),
     model: row.model || '',
+    host: row.host || '',
+    key: rowKey(row),
   };
 }
 
-// Waiting (needs you) first, then busy, then idle; ties by title so the list does not jump.
+export function hostsOf(rows) {
+  const set = new Set();
+  for (const r of rows) {
+    const h = r.host || '';
+    if (h !== '') set.add(h);
+  }
+  return [...set].sort();
+}
+
+export function filterByHost(rows, host) {
+  if (host === '' || host == null) return rows;
+  return rows.filter((r) => (r.host || '') === host);
+}
+
+// Waiting (needs you) first, then busy, then idle; ties by host, then title, so the list
+// does not jump.
 export function orderTerminalSessions(rows) {
   const rank = { waiting: 0, busy: 1, idle: 2 };
   const key = (r) => (Object.hasOwn(rank, r.status) ? rank[r.status] : 2);
-  return [...rows].sort((a, b) => key(a) - key(b) || String(a.name || '').localeCompare(String(b.name || '')));
+  return [...rows].sort((a, b) => {
+    const byStatus = key(a) - key(b);
+    if (byStatus !== 0) return byStatus;
+    const hostA = a.host || '';
+    const hostB = b.host || '';
+    if (hostA !== hostB) return hostA.localeCompare(hostB);
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
 }
 
 // SSE reducer: 'session.updated' upserts a full row, 'session.removed' drops it; anything
 // else (e.g. 'transcript.append') leaves the rows alone. Never mutates its input.
+// When data carries a non-empty host, match host-aware (rowKey) so a session id shared
+// across hosts stays distinct; otherwise fall back to id-only matching.
+function matchesRow(row, data) {
+  if (typeof data.host === 'string' && data.host !== '') return rowKey(row) === rowKey(data);
+  return row.id === data.id;
+}
+
 export function applyTerminalEvent(rows, event, data) {
   if (!data || typeof data.id !== 'string') return rows;
-  if (event === 'session.removed') return rows.filter((r) => r.id !== data.id);
+  if (event === 'session.removed') return rows.filter((r) => !matchesRow(r, data));
   if (event !== 'session.updated') return rows;
-  const i = rows.findIndex((r) => r.id === data.id);
+  const i = rows.findIndex((r) => matchesRow(r, data));
   if (i === -1) return [...rows, data];
   const next = [...rows];
   next[i] = data;
