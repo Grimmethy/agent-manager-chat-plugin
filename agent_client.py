@@ -1,13 +1,24 @@
 """Client for the local session agent (session_agent.py), which lists the developer's
-Claude Code terminal sessions. Entirely optional: the feature is off unless
-AGENT_MANAGER_SESSION_AGENT_URL is set. AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE (a file holding
-the token, e.g. from `session_agent.py --token auto`) or AGENT_MANAGER_SESSION_AGENT_TOKEN, if
-set, is sent as a Bearer token on every call; it is added server-side here and never reaches the browser.
-Env vars are read per call so tests (and a restarted agent) need no re-import.
+Claude Code terminal sessions. Entirely optional: the feature is off unless a session
+agent is configured (agent_hosts.py: singular AGENT_MANAGER_SESSION_AGENT_URL or the
+multi-host AGENT_MANAGER_SESSION_AGENT_URLS). Each host's own token (a token file
+holding the token, e.g. from `session_agent.py --token auto`, or a static token) is
+sent as a Bearer header to THAT host only; it is added server-side here and never
+reaches the browser. Env vars are read per call so tests (and a restarted agent)
+need no re-import.
 """
+import logging
 import os
 
 import requests
+
+import agent_hosts
+
+logger = logging.getLogger(__name__)
+
+# Seconds to wait for a host's /sessions response. Module constant so tests can
+# patch it down to exercise the slow-host path without really waiting.
+REQUEST_TIMEOUT = 3
 
 
 class AgentError(RuntimeError):
@@ -19,42 +30,69 @@ def base_url() -> str:
 
 
 def enabled() -> bool:
-    return bool(base_url())
-
-
-def _token():
-    """AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE (read on every call, so an agent restarted with
-    `--token auto` is picked up) wins over AGENT_MANAGER_SESSION_AGENT_TOKEN."""
-    token_file = os.environ.get("AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE", "").strip()
-    if token_file:
-        try:
-            with open(token_file, encoding="utf-8") as f:
-                return f.read().strip() or None
-        except OSError:
-            return None
-    return os.environ.get("AGENT_MANAGER_SESSION_AGENT_TOKEN")
+    return bool(agent_hosts.hosts())
 
 
 def _headers() -> dict:
-    token = _token()
+    token = os.environ.get("AGENT_MANAGER_SESSION_AGENT_TOKEN")
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+def list_all() -> dict:
+    """/sessions from every configured host: {'sessions': [...], 'skipped': [...]}.
+
+    Each row is tagged 'host': <host name> (other fields untouched). A host that
+    fails (connection error, timeout, HTTP error, bad JSON, not a list) is reported
+    in 'skipped' as {'host': name, 'reason': short text} and never aborts the others.
+    Each host's token goes only to that host; a host with no token sends no
+    Authorization header. Failures log the host name and exception class only.
+    """
+    sessions = []
+    skipped = []
+    for host in agent_hosts.hosts():
+        headers = {}
+        token = agent_hosts.read_token(host)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            r = requests.get(host.url + "/sessions", headers=headers, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("session agent host '%s' /sessions failed: %s",
+                           host.name, type(e).__name__)
+            skipped.append({"host": host.name, "reason": type(e).__name__})
+            continue
+        if not isinstance(data, list):
+            logger.warning("session agent host '%s' /sessions returned an unexpected shape: %s",
+                           host.name, type(data).__name__)
+            skipped.append({"host": host.name, "reason": "unexpected shape"})
+            continue
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            row = dict(row)
+            row["host"] = host.name
+            sessions.append(row)
+    return {"sessions": sessions, "skipped": skipped}
+
+
 def list_sessions() -> list:
-    try:
-        r = requests.get(base_url() + "/sessions", headers=_headers(), timeout=3)
-        r.raise_for_status()
-        data = r.json()
-    except (requests.RequestException, ValueError) as e:
-        raise AgentError("session agent /sessions failed") from e
-    if not isinstance(data, list):
-        raise AgentError("session agent /sessions returned an unexpected shape")
-    return [row for row in data if isinstance(row, dict)]
+    """All configured hosts' session rows. Raises AgentError when no host is
+    configured or every configured host failed -- so a single configured host
+    failing behaves exactly as it did before multi-host support."""
+    hosts = agent_hosts.hosts()
+    if not hosts:
+        raise AgentError("session agent is not configured")
+    result = list_all()
+    if result["skipped"] and len(result["skipped"]) == len(hosts):
+        raise AgentError("session agent /sessions failed")
+    return result["sessions"]
 
 
 def open_events():
     """An open streaming response for the agent's /events SSE. The caller must close it.
-    Read timeout 60s: the agent sends a keepalive comment every 15s."""
+    Read timeout 60s: the agent sends a keepalive comment every 15s. Singular config only."""
     try:
         r = requests.get(base_url() + "/events", headers=_headers(), params={"types": "session"},
                          stream=True, timeout=(3, 60))
