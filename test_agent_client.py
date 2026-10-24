@@ -1,6 +1,12 @@
 """Tests for agent_client.py and the terminal-sessions routes, against a REAL session_agent
 server on loopback fed by the synthetic fixtures (no mocks of the HTTP layer).
 
+KNOWN FRAGILITY: setUp starts a real session_agent HTTP server bound to 127.0.0.1.
+On a host without loopback or in a restricted sandbox this will fail. This coupling
+is deliberately authorized and tracked in Docs/ARCH_REVIEW_CANDIDATES.md (AC-5 /
+AC-20 / AC-21); any future change to this file must deliberately address or preserve
+that coupling rather than discover the flake later.
+
 Run: python -m unittest test_agent_client -v
 """
 import json
@@ -31,6 +37,7 @@ class AgentRouteTests(unittest.TestCase):
         shutil.copytree(FIXTURE_HOME, home)
         self.agent = session_agent.Agent(home, token=TOKEN, lister=None, alive=lambda pid: pid != 1003)
         self.agent.refresh()
+        # ⚠ Live loopback server (127.0.0.1): environment-fragile, deliberately authorized -- see module docstring + Docs/ARCH_REVIEW_CANDIDATES.md (AC-5/AC-20/AC-21).
         self.srv = session_agent.make_server(self.agent, "127.0.0.1", 0)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.addCleanup(self._stop)
