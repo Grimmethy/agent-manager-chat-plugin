@@ -1093,3 +1093,47 @@ Move the `CHAT_STORAGE_DIR` definition out of `app.py` and into a shared configu
 
 Benefits:
 Removes the need for lazy imports, making the dependency graph explicit and easier to understand. It improves testability by allowing the storage path to be injected or mocked at a higher level (the config module) rather than patching an attribute on the `app` object. It also prevents potential subtle bugs related to import order or module initialization state.
+
+### AC-82 · Eliminate the `local_tool_client` re-export shim
+Strength: Worth exploring
+Files: local_tool_client.py, app.py, internal_api_client.py
+
+Problem:
+`local_tool_client.py` contains no logic of its own: it re-exports `stream_local_turn` from `internal_api_client` and aliases `InternalApiError` as `LocalToolClientError`. Its sole purpose is to preserve the Phase-1 name `stream_plan_with_tools` so that existing callers (e.g. `app.py`'s `_call_chat` and any other module that imports the shim) don't need to change. This creates a confusing two-name surface for one capability: a reader of `app.py` sees `LocalToolClientError` and infers a separate "local tool" subsystem, while the actual HTTP error is raised as `InternalApiError` inside `internal_api_client`. Because the alias is literally the same class (not a subclass), the catch works, but nothing in the code communicates that equivalence, and the "local tool client" name now misrepresents what is a pure HTTP client. The module adds an indirection hop and a misleading name for no behavioral gain, and it couples `app.py`'s error handling to a shim whose entire content is a re-export.
+
+Solution:
+1. Grep the repository for every import of `local_tool_client` (e.g. `grep -rn "local_tool_client\|LocalToolClientError\|stream_local_turn" --include="*.py"`) to enumerate all consumers before deleting the module.
+2. In `app.py`, change the import to pull `stream_local_turn` and `InternalApiError` directly from `internal_api_client`, and update the `except LocalToolClientError` clause to `except InternalApiError`.
+3. In any other file identified in step 1, update the import to source `stream_local_turn` / `InternalApiError` from `internal_api_client` and rename the error reference accordingly.
+4. Delete `local_tool_client.py`.
+
+This leaves exactly one name for the error type and one import target for the streaming function across the codebase.
+
+Benefits:
+The dependency graph becomes honest: `app.py` and any other consumer import from the module that actually performs the HTTP call. A reader no longer has to trace through a one-line re-export to discover the real source, and the error type has a single, unambiguous name. Future changes to the client (retry logic, new endpoints) live in one file without a second file that must be kept in sync.
+
+### AC-83 · Extract the repeated connection/error-handling block in `internal_api_client`
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+`get_roots`, `preempt`, `reserve`, and `stream_local_turn` each repeat the identical pattern: build a `requests` call with the token header and timeout, call `raise_for_status()`, and wrap any `requests.RequestException` into `InternalApiError` (or, for the streaming function, yield an error dict). The connection-level contract—auth header, timeout policy, exception translation—is stated four times. A change to timeout policy, addition of a retry decorator, or a shift in error-shape (e.g. including the HTTP status code in the message) must be made in four spots, and it is easy to miss one, leaving an inconsistent error surface.
+
+Solution:
+Introduce a small private helper, e.g. `_request(method, path, *, json_body=None, stream=False)`, that encapsulates the token header, timeout, `raise_for_status()`, and the `except requests.RequestException → InternalApiError` translation. For the streaming path, a companion `_stream_request(path, json_body)` that yields the response iterator and translates errors into the existing error-dict shape. The four public functions then reduce to one-liners that call the helper and shape the return value.
+
+Benefits:
+The connection and error-handling invariant lives in exactly one place. A timeout-policy change, a retry wrapper, or an error-shape update is a single edit. New endpoints added to the internal API inherit the correct contract by construction rather than by copy-paste. The public function signatures and the `InternalApiError` type remain unchanged, so no downstream code is affected.
+
+### AC-84 · Distinguish failure origins in `_call_chat`'s 502 response
+Strength: Worth exploring
+Files: app.py, internal_api_client.py
+
+Problem:
+`_call_chat` catches `ClaudeClientError`, `LocalToolClientError` (i.e. `InternalApiError`), and `(TimeoutError, ConnectionError, OSError)` and collapses all of them into `abort(502, description=...)`. The only differentiator is the human-readable string in `description`, which the frontend must pattern-match on to show a meaningful message. A caller hitting a 502 cannot programmatically distinguish "the core dashboard's internal API is down" from "a Claude account call failed" from "a raw socket timeout slipped past `requests`." The `OSError` branch is effectively redundant because `requests` already wraps socket-level failures into `RequestException`→`InternalApiError`, so it only catches edge cases that should not occur in practice.
+
+Solution:
+Assign each failure origin a stable machine-readable code (e.g. `"internal_api"`, `"claude"`, `"network"`) and include it as a structured field in the 502 response body alongside the human-readable `description`. Remove the redundant `(TimeoutError, ConnectionError, OSError)` catch since `requests` already translates those into `InternalApiError`. Update the frontend to read the code field for routing its error UI, falling back to the description string for display.
+
+Benefits:
+The frontend can branch on a stable identifier rather than parsing English prose, making error handling resilient to wording changes. Operators debugging a 502 can immediately tell which upstream dependency failed without reading logs. The redundant `OSError` catch is removed, simplifying the exception hierarchy the reader must track.
