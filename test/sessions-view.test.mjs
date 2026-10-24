@@ -4,6 +4,7 @@ import {
   truncateTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
   orderSessions, nextSelectionAfterClose, formatRow,
   formatTokens, contextLabel, terminalTimer, STALE_BUSY_SECS, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
+  filterRows, jumpTarget,
 } from '../static/sessions-view.js';
 import { rowKey, hostsOf, filterByHost } from '../static/sessions-view.js';
 import { skippedLabel } from '../static/sessions-view.js';
@@ -227,3 +228,76 @@ test('skippedLabel returns raw text (the caller escapes it)', () => {
   assert.equal(skippedLabel([{ host: '<b>', reason: 'x&y' }]), '<b> (x&y)');
 });
 
+
+const FILTER_ROWS = [
+  { id: 'a', name: 'Build Server', cwd: '/home/wok/agent-manager', host: 'wok' },
+  { id: 'b', name: 'docs', cwd: '/srv/Notes', host: 'grimm' },
+  { id: 'c', cwd: '/tmp/scratch' },
+  { id: 'd', name: 'other', cwd: null, host: null },
+];
+
+test('filterRows matches name, cwd and host', () => {
+  assert.deepEqual(filterRows(FILTER_ROWS, 'server').map((r) => r.id), ['a']);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'agent-manager').map((r) => r.id), ['a']);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'grimm').map((r) => r.id), ['b']);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'scratch').map((r) => r.id), ['c']);
+});
+
+test('filterRows is case-insensitive and trims the query', () => {
+  assert.deepEqual(filterRows(FILTER_ROWS, 'BUILD').map((r) => r.id), ['a']);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'notes').map((r) => r.id), ['b']);
+  assert.deepEqual(filterRows(FILTER_ROWS, '  grimm  ').map((r) => r.id), ['b']);
+});
+
+test('filterRows with an empty, whitespace or missing query returns every row in order', () => {
+  assert.equal(filterRows(FILTER_ROWS, ''), FILTER_ROWS);
+  assert.equal(filterRows(FILTER_ROWS, '   '), FILTER_ROWS);
+  assert.equal(filterRows(FILTER_ROWS, null), FILTER_ROWS);
+  assert.equal(filterRows(FILTER_ROWS, undefined), FILTER_ROWS);
+});
+
+test('filterRows with no match gives [], treats missing fields as empty, and does not match the string "null"', () => {
+  assert.deepEqual(filterRows(FILTER_ROWS, 'zzz'), []);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'null'), []);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'undefined'), []);
+});
+
+test('filterRows skips null entries instead of throwing', () => {
+  assert.deepEqual(filterRows([null, { id: 'k', name: 'keep' }, undefined], 'keep').map((r) => r.id), ['k']);
+});
+
+test('filterRows does not mutate its input and keeps the order', () => {
+  const rows = [{ id: 'x', name: 'm2' }, { id: 'y', name: 'm1' }, { id: 'z', name: 'other' }];
+  const before = JSON.stringify(rows);
+  assert.deepEqual(filterRows(rows, 'm').map((r) => r.id), ['x', 'y']);
+  assert.equal(JSON.stringify(rows), before);
+});
+
+test('jumpTarget returns the key of the nth row of the order given', () => {
+  const rows = ['r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9', 'r10'].map((id) => ({ id }));
+  assert.equal(jumpTarget(rows, 1), 'r1');
+  assert.equal(jumpTarget(rows, 9), 'r9');
+  const reversed = [...rows].reverse();
+  assert.equal(jumpTarget(reversed, 1), 'r10');
+});
+
+test('jumpTarget is null for n outside 1-9, non-integers and past the end', () => {
+  const rows = Array.from({ length: 12 }, (_, i) => ({ id: 'r' + (i + 1) }));
+  assert.equal(jumpTarget(rows, 10), null);
+  assert.equal(jumpTarget(rows, 0), null);
+  assert.equal(jumpTarget(rows, -1), null);
+  assert.equal(jumpTarget(rows, 1.5), null);
+  assert.equal(jumpTarget(rows, '2'), null);
+  assert.equal(jumpTarget(rows, NaN), null);
+  assert.equal(jumpTarget([{ id: 'only' }], 2), null);
+  assert.equal(jumpTarget([], 1), null);
+  assert.equal(jumpTarget(null, 1), null);
+});
+
+test('jumpTarget prefixes the host when the row has one and not otherwise', () => {
+  const rows = [{ id: 'a', host: 'wok' }, { id: 'b', host: '' }, { id: 'c' }, { id: 'd', host: null }];
+  assert.equal(jumpTarget(rows, 1), 'wok/a');
+  assert.equal(jumpTarget(rows, 2), 'b');
+  assert.equal(jumpTarget(rows, 3), 'c');
+  assert.equal(jumpTarget(rows, 4), 'd');
+});
