@@ -51,8 +51,13 @@ class TemplateStoreTests(unittest.TestCase):
 
     def test_save_success_marks_saved_and_edits_win(self):
         s = self._session()
-        with mock.patch.object(ts.requests, "post", side_effect=[FakeResp({"value": ""}), FakeResp({"saved": True})]) as post:
-            p = ts.save_proposal(s, 1, 0, key="classroom", text="a classroom with many desks and a chalkboard")
+        saved_text = "a classroom with many desks and a chalkboard"
+        with mock.patch.object(ts.requests, "post", side_effect=[
+            FakeResp({"value": ""}),          # initial get: empty
+            FakeResp({"saved": True}),         # add
+            FakeResp({"value": saved_text}),   # verification get: our text
+        ]) as post:
+            p = ts.save_proposal(s, 1, 0, key="classroom", text=saved_text)
         self.assertEqual(p["status"], "saved")
         add = post.call_args_list[1].kwargs["json"]
         self.assertEqual((add["action"], add["target"], add["key"]), ("add", "backgrounds", "classroom"))
@@ -68,6 +73,21 @@ class TemplateStoreTests(unittest.TestCase):
         self.assertEqual(p["status"], "failed")
         self.assertIn("already exists", p["message"])
         self.assertEqual(post.call_count, 1)
+
+    def test_concurrent_writer_detected_by_verification(self):
+        """If a cross-process writer overwrites our value between add and verify-get,
+        save_template must return ok=False with a 'concurrent writer' message."""
+        s = self._session()
+        our_text = "a classroom with many desks and a chalkboard"
+        with mock.patch.object(ts.requests, "post", side_effect=[
+            FakeResp({"value": ""}),                    # initial get: empty
+            FakeResp({"saved": True}),                   # add succeeds
+            FakeResp({"value": "someone else's text"}),  # verify: different!
+        ]) as post:
+            p = ts.save_proposal(s, 1, 0, key="classroom", text=our_text)
+        self.assertEqual(p["status"], "failed")
+        self.assertIn("concurrent writer", p["message"])
+        self.assertEqual(post.call_count, 3)
 
     def test_unreachable_app_reports_failure(self):
         s = self._session()

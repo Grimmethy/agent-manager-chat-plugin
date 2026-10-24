@@ -18,6 +18,7 @@ the transcript -- nothing here is allowed to fail silently.
 """
 import os
 import re
+import threading
 
 import requests
 
@@ -76,8 +77,28 @@ def _validate(block: dict):
     return None
 
 
+# --- Per-(target, key) locks that serialise the get-then-add window -----------------------
+_save_locks: dict = {}
+_locks_guard = threading.Lock()
+
+
+def _key_lock(target: str, key: str) -> threading.Lock:
+    """Return (creating if needed) the per-(target,key) lock that serialises the
+    get-then-add sequence so two threads in this process cannot interleave their writes."""
+    pair = (target, key)
+    with _locks_guard:
+        if pair not in _save_locks:
+            _save_locks[pair] = threading.Lock()
+        return _save_locks[pair]
+
+
 def save_template(block: dict) -> dict:
-    """Saves one parsed block. Returns {ok, kind, key, message}."""
+    """Saves one parsed block. Returns {ok, kind, key, message}.
+
+    Concurrency: the get+add pair is serialised per (target, key) via an in-process
+    threading.Lock, and a post-add verification read detects any cross-process overwrite.
+    The "never overwrite" guarantee holds for same-process callers; cross-process races
+    are detected and reported rather than silently applied."""
     out = {"ok": False, "kind": block["kind"], "key": block["key"], "message": ""}
     problem = _validate(block)
     if problem:
@@ -85,23 +106,39 @@ def save_template(block: dict) -> dict:
         return out
     kind = KINDS[block["kind"]]
     base = kind["base_url"]()
-    try:
-        r = requests.post(f"{base}/api/entry", json={"action": "get", "target": kind["target"], "key": block["key"]}, timeout=10)
-        r.raise_for_status()
-        if (r.json().get("value") or "").strip():
-            out["message"] = f"'{block['key']}' already exists in {kind['app']} -- not overwritten (pick another name or edit it there)"
+    with _key_lock(kind["target"], block["key"]):
+        try:
+            r = requests.post(f"{base}/api/entry", json={"action": "get", "target": kind["target"], "key": block["key"]}, timeout=10)
+            r.raise_for_status()
+            if (r.json().get("value") or "").strip():
+                out["message"] = f"'{block['key']}' already exists in {kind['app']} -- not overwritten (pick another name or edit it there)"
+                return out
+            r = requests.post(
+                f"{base}/api/entry",
+                json={"action": "add", "target": kind["target"], "path": [], "key": block["key"], "value": block["text"]},
+                timeout=15,
+            )
+            if r.status_code >= 400:
+                out["message"] = f"{kind['app']} refused it: {(r.json() or {}).get('error', r.status_code)}"
+                return out
+            # Post-add verification: detect a cross-process writer that slipped past the
+            # in-process lock and overwrote our value between our add and now.
+            verify = requests.post(
+                f"{base}/api/entry",
+                json={"action": "get", "target": kind["target"], "key": block["key"]},
+                timeout=10,
+            )
+            verify.raise_for_status()
+            stored = (verify.json().get("value") or "").strip()
+            if stored != block["text"].strip():
+                out["message"] = (
+                    f"'{block['key']}' was modified by a concurrent writer between "
+                    f"our check and write -- not saved (pick another name or retry)"
+                )
+                return out
+        except (requests.RequestException, ValueError) as e:
+            out["message"] = f"could not reach {kind['app']} at {base} ({e})"
             return out
-        r = requests.post(
-            f"{base}/api/entry",
-            json={"action": "add", "target": kind["target"], "path": [], "key": block["key"], "value": block["text"]},
-            timeout=15,
-        )
-        if r.status_code >= 400:
-            out["message"] = f"{kind['app']} refused it: {(r.json() or {}).get('error', r.status_code)}"
-            return out
-    except (requests.RequestException, ValueError) as e:
-        out["message"] = f"could not reach {kind['app']} at {base} ({e})"
-        return out
     out["ok"] = True
     out["message"] = f"Saved {block['kind']} template '{block['key']}' to {kind['app']} -- it now appears in {kind['where']}."
     return out
