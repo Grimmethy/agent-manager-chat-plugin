@@ -963,3 +963,23 @@ Have `accounts.make_live` (and any other public mutation that accepts a label) r
 
 Benefits:
 The routing layer no longer depends on a private symbol, so refactoring `accounts.py`'s internals (renaming, splitting, or changing `_valid_label`) cannot silently break the route. Error semantics become self-documenting: the domain module declares *what* is wrong (invalid vs. missing) via exception type, and the routing layer maps that to HTTP status codes. A single source of truth for label validation lives in `accounts.py`, eliminating the risk of the two modules drifting out of sync.
+
+### AC-73 · Consolidate duplicated provider-labeling logic into a shared module
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` export a `providerLabel` function that maps a session's `provider` and `model` fields to a display string, but the two implementations have diverged. `sessions-view.js` checks `row.provider === 'claude'` and returns either `'Claude'` or `'Local'`, treating every non-`'claude'` value as Local. `swap-view.js` checks `session.provider === 'claude'` or `'local'` and returns `'Claude · <model> · <account>'` or `'Local · <model>'`, explicitly distinguishing the `'local'` string from other unknown values. The same conceptual question—"what provider and model is this session on?"—is answered in two places with two different output shapes and two different sets of recognized provider values, creating a shallow-interface duplication that will silently drift as providers are added or renamed.
+
+Solution:
+Extract the provider/model identification logic into a single shared module (e.g. `static/provider-label.js`) that exports one `providerLabel(session)` function returning a **structured result object** (e.g. `{ provider: 'claude' | 'local' | <unknown>, model, account }`). The shared module is the single authority on which provider strings are recognized and how they are normalized.
+
+Each view module then imports this function and performs its own **view-specific string formatting** from the structured result:
+
+- `sessions-view.js` composes a short label (e.g. `result.provider === 'claude' ? 'Claude' : 'Local'`).
+- `swap-view.js` composes the longer form (e.g. `` `${result.provider} · ${result.model} · ${result.account}` ``).
+
+This keeps the **exported public API of each view module unchanged**—both still export a `providerLabel` that accepts a session object and returns a display **string**, so any downstream caller that imports and renders that string sees the same type and the same (now-corrected) value. What changes is the **internal implementation** of those two view modules: the duplicated branching over raw provider strings is replaced by a call to the shared module plus a thin, view-specific format step.
+
+Benefits:
+A single source of truth governs which provider strings are valid and how they are normalized. Adding a new provider (e.g. `'openai'`) requires editing the shared module once; both view modules automatically pick up the new value through the structured result, eliminating the `'local'`-vs-"everything-else-is-Local" discrepancy that already exists. The view-specific formatting (short label vs. long label with account) remains a one-line composition in each view file rather than a re-implemented branch, so the two files can no longer silently disagree about which providers are recognized. Downstream callers of the view modules' `providerLabel` continue to receive a string and need no code changes; the only files that change are the two view modules (internal rewrite) and the new shared module.
