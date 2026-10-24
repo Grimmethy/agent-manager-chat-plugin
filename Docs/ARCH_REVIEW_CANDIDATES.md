@@ -1067,3 +1067,29 @@ Benefits:
 The client presents a uniform error contract that callers can rely on, matching the defensive posture of `model_stats_client.py`. Logged details make it straightforward to diagnose connectivity or server-side issues. By explicitly updating the caller to handle the `"error"` key, the system degrades gracefully (showing a user-facing message) rather than failing with an opaque 500 error or an unhandled exception.
 
 NOTE: Flag 3 was not applied to AC-001 or AC-002 because the critique acknowledges that the core problem descriptions (duplicated logic in AC-001, inverted dependency in AC-002) are valid refactoring targets even if the specific file contents were not fully provided in the input; the flags regarding "unverifiable" content do not invalidate the architectural issues identified, and the draft's solution remains the correct architectural response to the described coupling.
+
+### AC-80 · Eliminate redundant registry I/O in the "make live" route
+Strength: Strong
+Files: routes/accounts.py, accounts.py
+
+Problem:
+In `routes/accounts.py`, the `api_chat_accounts_make_live` handler calls `accounts.make_live()`, which internally executes `load()` and `_save()`. Immediately following this, the handler calls `_accounts_body()`, which executes `accounts.load()` and `accounts.live_label()` (which in turn calls `load()` again). This results in reading and parsing the `accounts.json` file three times and writing it once for a single logical operation, all within one request cycle.
+
+Solution:
+Refactor `accounts.py` to provide a combined `make_live_and_get_view(storage_dir, label)` function that loads the accounts file once, applies the `make_live` mutation, saves the file, and returns the `public_view` list and `live_label` string directly from the in-memory object it just modified. The route handler in `routes/accounts.py` then calls this single function to obtain the view data, and **separately** iterates over the returned `public_view` to attach the per-account `usage` key (calling `usage.read_usage(usage_dir, account["label"], now)`), since `usage_dir` / `AM_STATUSLINE_DIR` is a route-layer concern that `accounts.py` does not import or know about. This keeps the `usage` logic in the view layer where it belongs while eliminating the redundant `load()` calls that were the source of the triple-read.
+
+Benefits:
+Reduces disk I/O and JSON parsing overhead by two-thirds for this endpoint (three `load()` calls become one). It also enforces the invariant that the state returned to the client exactly matches the state that was just written to disk, removing the theoretical risk of a race condition where another process modifies the file between the write and the subsequent read. The `usage` attachment remains a pure in-memory step over the already-loaded view, so no additional file I/O is introduced.
+
+### AC-81 · Decouple route handlers from the `app` module to resolve circular import risk
+Strength: Worth exploring
+Files: routes/accounts.py, app.py
+
+Problem:
+`routes/accounts.py` uses lazy imports (`from app import CHAT_STORAGE_DIR` inside the view functions) to avoid a circular import, as `app.py` imports the blueprint from this module. This pattern is a code smell indicating tight coupling between the routing layer and the application entry point. It also makes the code harder to test in isolation, as the tests must mock `app.CHAT_STORAGE_DIR` rather than injecting the dependency at a higher level.
+
+Solution:
+Move the `CHAT_STORAGE_DIR` definition out of `app.py` and into a shared configuration module (e.g., `config.py` or `settings.py`) that both `app.py` and `routes/accounts.py` can import at the top level without circularity. Alternatively, pass the storage directory as a dependency to the blueprint or use a context variable, so the route module never needs to reach back into the application entry point.
+
+Benefits:
+Removes the need for lazy imports, making the dependency graph explicit and easier to understand. It improves testability by allowing the storage path to be injected or mocked at a higher level (the config module) rather than patching an attribute on the `app` object. It also prevents potential subtle bugs related to import order or module initialization state.
