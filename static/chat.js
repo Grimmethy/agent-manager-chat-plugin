@@ -24,7 +24,7 @@
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
 import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
-  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel } from "./sessions-view.js";
+  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel, filterRows, jumpTarget } from "./sessions-view.js";
 // HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
 // (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
 // split. providerLabel drives the header label, swapOptions builds the Swap menu,
@@ -693,6 +693,11 @@ class SessionSwitcher {
     this._eventSignature = null;
     // Terminal-section host filter: '' means All.
     this.hostFilter = '';
+    // HUB0010 9/10: the type-to-filter query (terminal rows only), the terminal rows as
+    // last DISPLAYED (what Ctrl+1..9 counts), and the key of the row Ctrl+N jumped to.
+    this.filterQuery = '';
+    this.displayedTerminalRows = [];
+    this.jumpedKey = null;
     this.open = false;
     this.pollTimer = null;
     // Attention state (piece 2/10): the previous {key: status} map returned by
@@ -712,16 +717,24 @@ class SessionSwitcher {
       <div class="chat-switcher-menu" hidden></div>`;
     this.btn = this.slot.querySelector('.chat-switcher-btn');
     this.menu = this.slot.querySelector('.chat-switcher-menu');
+    // The filter box lives outside the list that render() rebuilds, so typing never
+    // loses its value or focus when the list refreshes.
+    this.menu.innerHTML = '<input type="text" class="chat-switcher-filter" placeholder="Filter chats" aria-label="Filter chats" autocomplete="off"><div class="chat-switcher-list"></div>';
+    this.filterInput = this.menu.querySelector('.chat-switcher-filter');
+    this.list = this.menu.querySelector('.chat-switcher-list');
+    this.filterInput.addEventListener('input', () => { this.filterQuery = this.filterInput.value; this.jumpedKey = null; this.render(); });
     this.btn.onclick = (e) => { e.stopPropagation(); this.setOpen(!this.open); };
     this.menu.addEventListener('click', (e) => this.onMenuClick(e));
     this.menu.addEventListener('change', (e) => this.onMenuChange(e));
     document.addEventListener('click', (e) => { if (this.open && !this.slot.contains(e.target)) this.setOpen(false); });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.open) this.setOpen(false); });
+    document.addEventListener('keydown', (e) => this.onJumpKey(e));
     this.renderButton();
   }
 
   setOpen(open) {
     this.open = open;
+    if (!open) this.jumpedKey = null;
     this.menu.hidden = !open;
     this.btn.setAttribute('aria-expanded', String(open));
     clearInterval(this.pollTimer);
@@ -875,7 +888,7 @@ class SessionSwitcher {
 
   // A terminal session row: display only (no select, no close) until a handoff exists.
   // `showHost` gates the host badge: pointless when every row shares one host. `newlyWaiting` (piece 2/10): a row that just became waiting also flashes amber.
-  renderTerminalRow(fmt, newlyWaiting, showHost) {
+  renderTerminalRow(fmt, newlyWaiting, showHost, jumped) {
     const ctx = fmt.context ? `<span class="chat-switcher-context">${escapeHtml(fmt.context)}</span>` : '';
     const step = fmt.step ? `<div class="chat-switcher-step">${escapeHtml(fmt.step)}</div>` : '';
     const badge = (showHost && fmt.host)
@@ -885,7 +898,8 @@ class SessionSwitcher {
     // waiting additionally flashes amber (.waiting-flash) for 10s via chat.css.
     const trowCls = 'chat-switcher-trow'
       + (fmt.waiting ? ' waiting' : '')
-      + (fmt.waiting && newlyWaiting ? ' waiting-flash' : '');
+      + (fmt.waiting && newlyWaiting ? ' waiting-flash' : '')
+      + (jumped ? ' jumped' : '');
     return `<div class="${trowCls}" title="${escapeHtml(fmt.fullTitle)}">
       <div class="chat-switcher-title">${escapeHtml(fmt.title)}${badge}</div>
       <div class="chat-switcher-meta">
@@ -906,15 +920,19 @@ class SessionSwitcher {
     let selectedHost = multiHost ? this.hostFilter : '';
     if (selectedHost && !hosts.includes(selectedHost)) selectedHost = '';
     let body;
+    // What is on screen, in order (host filter, then the text filter): Ctrl+1..9 counts these.
+    const displayed = (t.reachable && t.rows.length) ? filterRows(filterByHost(rows, selectedHost), this.filterQuery) : [];
+    this.displayedTerminalRows = displayed;
     if (!t.reachable) body = '<div class="chat-switcher-empty">Session agent unreachable</div>';
     else if (!t.rows.length) body = '<div class="chat-switcher-empty">No terminal sessions</div>';
-    else body = filterByHost(rows, selectedHost).map((r) => {
+    else if (!displayed.length) body = '<div class="chat-switcher-empty">No sessions match</div>';
+    else body = displayed.map((r) => {
       // Piece 2/10: match this row against the newly-waiting keys from the last
       // attention step (key rule mirrors attention-view.js keyOf: host/id when a host
       // is present, else the id) to add the amber-flash class.
       const key = r.host ? (r.host || '') + '/' + r.id : r.id;
       const newly = (r.status === 'waiting') && this.attentionNewlyWaiting.has(key);
-      return this.renderTerminalRow(formatTerminalRow(r, now), newly, multiHost);
+      return this.renderTerminalRow(formatTerminalRow(r, now), newly, multiHost, key === this.jumpedKey);
     }).join('');
     let filterHtml = '';
     if (multiHost) {
@@ -1008,10 +1026,28 @@ class SessionSwitcher {
     this.renderButton();
     const now = Date.now();
     const selectedId = this.getSelectedId();
-    this.menu.innerHTML = `<div class="chat-switcher-new" role="option">+ New chat</div>`
+    this.list.innerHTML = `<div class="chat-switcher-new" role="option">+ New chat</div>`
       + this.rows.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('')
       + this.renderTerminalSection(now)
       + this.renderChimeSetting();
+  }
+
+  // Ctrl+1..Ctrl+9 while the switcher is open: jump to the nth DISPLAYED terminal row. Terminal
+  // rows are read-only (no hand-off exists yet), so "select" means highlight the row and scroll it
+  // into view. Nothing else is touched, and the key is left alone (no preventDefault) unless a
+  // row was actually found.
+  onJumpKey(e) {
+    try {
+      if (!this.open || !e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+      if (typeof e.key !== 'string' || !/^[1-9]$/.test(e.key)) return;
+      const key = jumpTarget(this.displayedTerminalRows, Number(e.key));
+      if (key === null) return;
+      e.preventDefault();
+      this.jumpedKey = key;
+      this.render();
+      const el = this.list.querySelector('.chat-switcher-trow.jumped');
+      if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'nearest' });
+    } catch (err) { /* a shortcut must never break the switcher */ }
   }
 
   async onMenuClick(e) {

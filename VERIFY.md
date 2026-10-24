@@ -119,3 +119,12 @@ Manual browser checks (the template functions are unit-tested; the menu and stor
 2. **Save current as.** 'Save current as…' opens an inline name box (no browser pop-up); typing a name and pressing Enter or Save adds it to the menu, Escape closes the box without saving; an empty name saves nothing. (never checked)
 3. **Persists per browser.** After a reload the saved template is still in the menu (localStorage key 'chat-workspace-templates'); in another browser profile it is not. (never checked)
 4. **Storage blocked.** With site storage blocked the menu still works and the built-ins show; a saved template lasts until reload. (never checked)
+
+## Filter and jump in the switcher (piece 9/10)
+
+Manual browser checks (filterRows and jumpTarget are unit-tested; the box and the shortcut are not). None have ever been checked.
+
+1. **Filter box.** The switcher menu starts with a 'Filter chats' box; typing narrows the terminal sessions by name, folder or host as you type (any case), the box keeps its text and focus while the list refreshes every 5 seconds, and clearing it restores the whole list. Chat rows are not filtered. (never checked)
+2. **No match.** A query that matches nothing shows 'No sessions match' instead of the list. (never checked)
+3. **Ctrl+1..9 jump.** With the menu open, Ctrl+1 to Ctrl+9 highlights that terminal row of the list as shown (after any host or text filter) and scrolls it into view; a number past the end does nothing, and the browser keeps the key. With the menu closed nothing happens. The browser itself may claim Ctrl+number for switching tabs; if so, note which browser. (never checked)
+4. **Read-only rows.** Jumping only highlights a row: terminal sessions still cannot be opened from the switcher. (never checked)

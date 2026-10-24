@@ -170,3 +170,7 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 .multi-chat-template-save { display: inline-flex; align-items: center; gap: 4px; }
 .multi-chat-template-save[hidden] { display: none; }
 .multi-chat-template-name { width: 11em; min-width: 0; }
+
+/* filter box and Ctrl+1..9 jump (HUB0010 9/10) */
+.chat-switcher-filter { display: block; box-sizing: border-box; width: calc(100% - 16px); margin: 8px; }
+.chat-switcher-trow.jumped { outline: 2px solid var(--accent); outline-offset: -2px; }
