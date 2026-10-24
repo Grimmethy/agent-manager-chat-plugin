@@ -671,3 +671,31 @@ Introduce a small helper function (e.g. `parse_sse_events(response) -> list[dict
 
 Benefits:
 Removes the duplicated parsing code, making each test body shorter and focused on its actual assertion. A future change to the SSE format requires updating exactly one function rather than N test methods. Reduces the risk of a test passing while inadvertently skipping or mis-parsing an event due to a subtle copy-paste divergence in the inline logic.
+
+### AC-51 · Duplicated Node.js subprocess and temp-file lifecycle logic
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` independently implement the same low-level pattern for invoking Node.js scripts: generating a UUID-based temporary file, serializing a JSON payload into it, calling `subprocess.run` with a timeout, and attempting to unlink the file in a `finally` block. Because the mechanics are copy-pasted rather than shared, any change to the timeout strategy, the temp-file naming scheme, the cleanup path, or the subprocess arguments must be manually replicated in both modules. This duplication increases the surface area for subtle divergence—for example, one module might tighten its timeout or add a retry while the other is left behind—making the two integration points harder to audit and more likely to drift out of sync over time.
+
+Solution:
+Extract the shared subprocess-and-temp-file mechanics into a single utility function (e.g., `run_node_script(script_path, payload, timeout)`) that encapsulates UUID temp-file creation, JSON serialization, `subprocess.run` invocation with the given timeout, and guaranteed cleanup in a `finally` block. The utility should return the raw subprocess result (return code, stdout, stderr) without performing any error handling or exception raising. Both `claude_client.py` and `model_stats_client.py` would then delegate to this one utility for the execution mechanics, while retaining their own distinct logic for interpreting the result: `claude_client.py` would raise `ClaudeClientError` with specific stderr text on failure, and `model_stats_client.py` would log and return `None` on failure. This preserves the distinct operational contracts of each module while eliminating the duplicated low-level code.
+
+Benefits:
+Eliminates the duplicated file-lifecycle and process-execution code, ensuring that timeout handling, temp-file cleanup, and subprocess invocation behave identically across all Node.js integrations. Future changes to the execution strategy (e.g., switching to `asyncio.create_subprocess_exec`, adding a retry loop, or changing the temp-file directory) require editing a single function rather than hunting for every copy, reducing the risk of one integration silently diverging from the others. The distinct error-handling contracts of each module remain intact and explicit, as the utility does not impose a unified error policy.
+
+### AC-52 · Inconsistent exception contracts for Node.js subprocess failures
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+The two modules treat subprocess failures in fundamentally different ways. `claude_client.py` raises a custom `ClaudeClientError` with descriptive messages for timeouts, non-zero exits, and non-JSON output, surfacing the failure to the caller. `model_stats_client.py`, by contrast, catches the same class of failure, logs a warning, and returns `None`, deliberately hiding the error so that a stats-collection hiccup never breaks the surrounding feature. A caller that has interacted with one client and then encounters the other must maintain two separate mental models of what "the Node script failed" means, and a developer debugging a silent `None` return in the stats path has no exception to inspect—only a log line that may have been lost in volume.
+
+Solution:
+Refactor the error-handling logic in both modules to be explicit and localized, without introducing a new shared exception type. In `claude_client.py`, ensure that all failure paths (timeout, non-zero exit, unparseable output) consistently raise `ClaudeClientError` with the specific stderr text from the Node script, preserving the module's stated intent to surface the Node script's own error messages directly. In `model_stats_client.py`, ensure that all failure paths consistently log a structured warning and return `None`, preserving its "never break the real feature" contract. This makes the distinct error contracts of each module explicit and easy to audit, without forcing them into a unified exception hierarchy that would contradict their design rationale.
+
+Benefits:
+Makes the distinct error-handling contracts of each module explicit and intentional, rather than implicit side-effects of duplicated code. Developers can easily understand and audit why `claude_client.py` fails loudly with specific error messages while `model_stats_client.py` swallows errors and returns `None`. This clarity reduces the risk of accidental divergence or misunderstanding of the modules' behavior, and it preserves the design rationale of each module without introducing unnecessary indirection.
+
+NOTE: Flag 1 was addressed by removing the proposal to introduce `NodeScriptError` and instead preserving `claude_client.py`'s direct use of `ClaudeClientError` with specific stderr text. Flag 2 was addressed by ensuring the `run_node_script` utility does not impose a unified error policy, allowing each module to retain its distinct operational contract.
