@@ -174,3 +174,10 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 /* filter box and Ctrl+1..9 jump (HUB0010 9/10) */
 .chat-switcher-filter { display: block; box-sizing: border-box; width: calc(100% - 16px); margin: 8px; }
 .chat-switcher-trow.jumped { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* the filter box and the layout toolbar's Templates select / template-name box: dark like .chat-input, not the white browser default */
+.chat-switcher-filter, .multi-chat-template-select, .multi-chat-template-name {
+  background: var(--panel); color: var(--text); border: 2px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; font-size: 13px; font-family: inherit;
+}
+.multi-chat-template-select { color-scheme: dark; }
+
