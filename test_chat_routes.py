@@ -7,9 +7,13 @@ Uses a Claude-provider session so the message route skips the local-model GPU pr
 Run: .venv/bin/python -m unittest test_chat_routes -v
 """
 import json
+import os
+import socket
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -261,6 +265,210 @@ class SessionListAndCloseRouteTest(RouteTestBase):
         self.assertIn("chat-1-aaaaaaaa", ids)
         self.assertIn("chat-2-bbbbbbbb", ids)
         self.assertEqual(self.client.get("/api/chat/active").get_json()["id"], new_id)
+
+
+class TerminalSessionsMultiHostRouteTest(unittest.TestCase):
+    """Multi-host /api/chat/terminal-sessions and per-host /events, via the Flask test
+    client against two REAL stub HTTP agents on loopback (same pattern as
+    test_agent_client_multihost / test_agent_client_events). All token strings are fake
+    ("fake-token-a" / "fake-token-b") -- never real credentials."""
+
+    TOKEN_A = "fake-token-a"
+    TOKEN_B = "fake-token-b"
+
+    BODY_A = (
+        b": keepalive\n\n"
+        b"event: session.updated\ndata: {\"id\": \"sess-a\", \"status\": \"busy\"}\n\n"
+        b"event: session.removed\ndata: {\"id\": \"sess-a\"}\n\n"
+    )
+    BODY_B = (
+        b": keepalive\n\n"
+        b"event: session.updated\ndata: {\"id\": \"sess-b\", \"status\": \"idle\"}\n\n"
+        b"event: session.removed\ndata: {\"id\": \"sess-b\"}\n\n"
+    )
+
+    class _SessionsHandler(BaseHTTPRequestHandler):
+        rows = []
+
+        def do_GET(self):
+            body = json.dumps(self.rows).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    class _SSEHandler(BaseHTTPRequestHandler):
+        body = b""
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(self.body)))
+            self.end_headers()
+            self.wfile.write(self.body)
+            self.wfile.flush()
+
+        def log_message(self, *a):
+            pass
+
+    @staticmethod
+    def _free_port():
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    @staticmethod
+    def _write_token(text):
+        tf = Path(tempfile.mkdtemp()) / "tok"
+        tf.write_text(text)
+        return str(tf)
+
+    def _stub_sessions(self, rows):
+        handler = type("Bound", (self._SessionsHandler,), {"rows": rows})
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        srv.recorded = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def _stub_sse(self, body):
+        handler = type("Bound", (self._SSEHandler,), {"body": body})
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        srv.seen = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def _plural_env(self, url_a, url_b):
+        return {
+            "AGENT_MANAGER_SESSION_AGENT_URL": "",
+            "AGENT_MANAGER_SESSION_AGENT_TOKEN": "",
+            "AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE": "",
+            "AGENT_MANAGER_SESSION_AGENT_URLS": json.dumps([
+                {"host": "alpha", "url": url_a, "tokenFile": self._write_token(self.TOKEN_A)},
+                {"host": "beta", "url": url_b, "tokenFile": self._write_token(self.TOKEN_B)},
+            ]),
+        }
+
+    def _singular_env(self, url):
+        return {
+            "AGENT_MANAGER_SESSION_AGENT_URLS": "",
+            "AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE": "",
+            "AGENT_MANAGER_SESSION_AGENT_URL": url,
+            "AGENT_MANAGER_SESSION_AGENT_TOKEN": self.TOKEN_A,
+        }
+
+    def _no_hosts_env(self):
+        return {"AGENT_MANAGER_SESSION_AGENT_URLS": "", "AGENT_MANAGER_SESSION_AGENT_URL": "",
+                "AGENT_MANAGER_SESSION_AGENT_TOKEN": "",
+                "AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE": ""}
+
+    def setUp(self):
+        self.client = app.app.test_client()
+
+    def test_two_hosts_listed_with_host_tags_and_hosts_skipped_keys(self):
+        _, url_a = self._stub_sessions([{"id": "sess-a", "status": "busy"}])
+        _, url_b = self._stub_sessions([{"id": "sess-b", "status": "idle"}])
+        with mock.patch.dict(os.environ, self._plural_env(url_a, url_b)):
+            body = self.client.get("/api/chat/terminal-sessions").get_json()
+        self.assertTrue(body["enabled"])
+        self.assertTrue(body["reachable"])
+        self.assertEqual(body["hosts"], ["alpha", "beta"])
+        self.assertEqual(body["skipped"], [])
+        self.assertEqual([r["id"] for r in body["sessions"]], ["sess-a", "sess-b"])
+        self.assertEqual(body["sessions"][0]["host"], "alpha")
+        self.assertEqual(body["sessions"][1]["host"], "beta")
+        self.assertNotIn(self.TOKEN_A, json.dumps(body))
+        self.assertNotIn(self.TOKEN_B, json.dumps(body))
+
+    def test_one_host_down_appears_in_skipped_reachable_stays_true(self):
+        _, url_a = self._stub_sessions([{"id": "sess-a"}])
+        down_b = f"http://127.0.0.1:{self._free_port()}"
+        with mock.patch.dict(os.environ, self._plural_env(url_a, down_b)):
+            body = self.client.get("/api/chat/terminal-sessions").get_json()
+        self.assertTrue(body["reachable"])
+        self.assertEqual([r["id"] for r in body["sessions"]], ["sess-a"])
+        self.assertEqual(body["hosts"], ["alpha", "beta"])
+        self.assertEqual([s["host"] for s in body["skipped"]], ["beta"])
+        self.assertTrue(body["skipped"][0]["reason"])
+
+    def test_all_hosts_down_is_unreachable_with_empty_sessions(self):
+        down_a = f"http://127.0.0.1:{self._free_port()}"
+        down_b = f"http://127.0.0.1:{self._free_port()}"
+        with mock.patch.dict(os.environ, self._plural_env(down_a, down_b)):
+            body = self.client.get("/api/chat/terminal-sessions").get_json()
+        self.assertTrue(body["enabled"])
+        self.assertFalse(body["reachable"])
+        self.assertEqual(body["sessions"], [])
+        self.assertEqual(body["hosts"], ["alpha", "beta"])
+        self.assertEqual([s["host"] for s in body["skipped"]], ["alpha", "beta"])
+
+    def test_no_host_configured_keeps_disabled_shape(self):
+        with mock.patch.dict(os.environ, self._no_hosts_env()):
+            body = self.client.get("/api/chat/terminal-sessions").get_json()
+            events = self.client.get("/api/chat/terminal-sessions/events")
+        self.assertEqual(body, {"enabled": False, "reachable": False, "sessions": [],
+                                "hosts": [], "skipped": []})
+        self.assertEqual(events.status_code, 404)
+
+    def test_events_missing_host_with_two_hosts_is_400(self):
+        _, url_a = self._stub_sse(self.BODY_A)
+        _, url_b = self._stub_sse(self.BODY_B)
+        with mock.patch.dict(os.environ, self._plural_env(url_a, url_b)):
+            resp = self.client.get("/api/chat/terminal-sessions/events")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("host=", resp.get_data(as_text=True))
+
+    def test_events_unknown_host_is_404(self):
+        _, url_a = self._stub_sse(self.BODY_A)
+        _, url_b = self._stub_sse(self.BODY_B)
+        with mock.patch.dict(os.environ, self._plural_env(url_a, url_b)):
+            resp = self.client.get("/api/chat/terminal-sessions/events?host=nope")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_events_unreachable_host_is_502(self):
+        _, url_a = self._stub_sse(self.BODY_A)
+        down_b = f"http://127.0.0.1:{self._free_port()}"
+        with mock.patch.dict(os.environ, self._plural_env(url_a, down_b)):
+            resp = self.client.get("/api/chat/terminal-sessions/events?host=beta")
+        self.assertEqual(resp.status_code, 502)
+
+    def test_events_stream_only_the_requested_host_tagged(self):
+        _, url_a = self._stub_sse(self.BODY_A)
+        _, url_b = self._stub_sse(self.BODY_B)
+        with mock.patch.dict(os.environ, self._plural_env(url_a, url_b)):
+            resp = self.client.get("/api/chat/terminal-sessions/events?host=alpha")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.mimetype, "text/event-stream")
+        stream = iter(resp.response)
+        text = b""
+        while b"session.removed" not in text:
+            text += next(stream)
+        resp.close()
+        self.assertIn(b'"host": "alpha"', text)
+        self.assertNotIn(b"sess-b", text)
+        self.assertNotIn(self.TOKEN_A.encode(), text)
+        self.assertNotIn(self.TOKEN_B.encode(), text)
+
+    def test_singular_config_events_work_without_host_param(self):
+        _, url_a = self._stub_sse(self.BODY_A)
+        with mock.patch.dict(os.environ, self._singular_env(url_a)):
+            resp = self.client.get("/api/chat/terminal-sessions/events")
+        self.assertEqual(resp.status_code, 200)
+        stream = iter(resp.response)
+        text = b""
+        while b"session.updated" not in text:
+            text += next(stream)
+        self.assertIn(b'"host": "default"', text)
+        self.assertNotIn(self.TOKEN_A.encode(), text)
+        resp.close()
 
 
 if __name__ == "__main__":

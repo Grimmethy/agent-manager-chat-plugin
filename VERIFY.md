@@ -63,3 +63,15 @@ HUB0008 10/11 (header provider label, Swap menu, one-click swap offer). Manual i
 9. Swapping a chat that holds the local reservation to Claude releases the reservation; swapping to local never acquires one (never checked).
 10. The first Claude turn after a swap shows the hand-off in the model's view (header, summary if any, the last `CHAT_RECENT_TURNS_KEPT` rows); a long transcript gets a summary and a failed summarizer does not block the swap (never checked).
 11. `limit-error-samples.jsonl` appears in the storage directory after a real Claude limit error, and its text shows whether the assumed phrases in `limit_errors.py` match; send the shapes to the owner (never checked).
+
+## Multi-host terminal sessions (manual)
+
+HUB0005 7/7, replacing the shorter HUB0017 list. Two machines, wok and grimm, each running `session_agent.py`, with the example `AGENT_MANAGER_SESSION_AGENT_URLS` from the README set in the plugin's environment (plugin on its default port 7442). Do not paste token text, token file paths or session ids anywhere: report pass or fail per item. Each item is marked (never checked).
+
+1. **Both hosts listed.** `curl -s localhost:7442/api/chat/terminal-sessions` answers `enabled` true, `reachable` true, `hosts` `["wok","grimm"]` in that order, `skipped` `[]`, and every row in `sessions` has `host` set to `wok` or `grimm` (never checked).
+2. **One agent down, the other stays live.** Stop the agent on grimm. Within one poll the same request answers `reachable` true, `skipped` with one entry `{"host":"grimm","reason":...}`, and still lists wok's sessions; the chat panel shows wok's rows and a line saying grimm was skipped that names grimm (and its reason), not a bare object. Start it again: grimm's rows return and `skipped` is `[]` (never checked).
+3. **Both agents down.** Stop both: `reachable` false, `sessions` `[]`, `skipped` has both hosts, and the panel says "Session agent unreachable" (never checked).
+4. **A session ending on one host disappears only there.** End a terminal session on grimm: its row disappears from the panel within a few seconds and no wok row changes, including a wok session that happens to share the same session id (never checked).
+5. **The events route.** With two hosts configured, `curl -N 'localhost:7442/api/chat/terminal-sessions/events'` answers 400; `?host=wok` streams events tagged `wok`; `?host=nobody` answers 404; `?host=grimm` with grimm stopped answers 502 (never checked).
+6. **Host badge and filter.** Each terminal row shows its host in a small badge (`.terminal-row-host-badge`); the filter lists `grimm` and `wok` sorted plus All; choosing one shows only that host's rows and All resets it (never checked).
+7. **Tokens stay server-side.** Search every response body and the event stream from items 1 to 6 for the token file paths and for the first characters of each token: neither appears (never checked).
