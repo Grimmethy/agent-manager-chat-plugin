@@ -983,3 +983,29 @@ This keeps the **exported public API of each view module unchanged**—both stil
 
 Benefits:
 A single source of truth governs which provider strings are valid and how they are normalized. Adding a new provider (e.g. `'openai'`) requires editing the shared module once; both view modules automatically pick up the new value through the structured result, eliminating the `'local'`-vs-"everything-else-is-Local" discrepancy that already exists. The view-specific formatting (short label vs. long label with account) remains a one-line composition in each view file rather than a re-implemented branch, so the two files can no longer silently disagree about which providers are recognized. Downstream callers of the view modules' `providerLabel` continue to receive a string and need no code changes; the only files that change are the two view modules (internal rewrite) and the new shared module.
+
+### AC-74 · Dead auth helpers shadow duplicated inline header construction
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_client.py` defines `base_url()` and `_headers()`—both relics of a singular-host era that read environment variables directly. Neither function is called anywhere in the community. Meanwhile, the actual "resolve this host's token and build the Authorization header" logic is copy-pasted inline in two call sites (`list_all()` and `open_events()`), each independently calling `agent_hosts.read_token(host)` and assembling a Bearer header. The dead `_headers()` is actively misleading: a developer adding a new auth header or switching schemes would naturally edit it, only to discover it is unused and that the real logic lives in two separate inline blocks. Updating one inline site without the other silently breaks one code path.
+
+Solution:
+Delete both `base_url()` and `_headers()` from `agent_client.py`. Extract the token-to-header step into a single private helper (e.g. `_auth_headers(host)`) that calls `agent_hosts.read_token(host)` and returns the fully-formed header dict. Both `list_all()` and `open_events()` then call `_auth_headers(host)` instead of duplicating the two-line block.
+
+Benefits:
+A single canonical site owns the auth-header construction, eliminating the risk of the two call sites drifting apart. Removing the dead functions removes the false affordance that a developer would edit `_headers()` and see no effect. Future changes to the auth scheme (new header, mTLS, per-host scheme) touch exactly one function.
+
+### AC-75 · `_resolve_host` re-implements `agent_hosts.get_host` lookup
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_hosts.py` already exposes `get_host(name)` which iterates the host list and returns the matching `Host` or `None`. `agent_client._resolve_host(name)` re-does that same iteration by hand. The only added value of `_resolve_host` is the `name is None` → "pick the single host or raise" branch and the `AgentError` wrapping. As written, the named-lookup branch is a duplicate of `agent_hosts.get_host` with a different return convention (raise vs. `None`). If `agent_hosts` later adds host-aliasing, case-folding, or a deprecation warning inside `get_host`, `_resolve_host` will silently diverge because it bypasses that logic.
+
+Solution:
+Replace the manual loop inside `_resolve_host` with a call to `agent_hosts.get_host(name)`. If the result is `None`, raise `AgentError` with a descriptive message. Keep the `name is None` auto-select branch (pick the single host or raise) local to `agent_client`, since that is a client-level policy decision rather than a host-list concern.
+
+Benefits:
+Host-lookup logic lives in exactly one place (`agent_hosts.get_host`), so any future normalization, aliasing, or deprecation rules are applied uniformly. `agent_client` retains only the policy it uniquely owns (auto-select when no name is given, error wrapping for the caller). The two modules no longer need to be kept in lockstep by convention.
