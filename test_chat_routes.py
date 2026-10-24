@@ -116,6 +116,88 @@ class MessageRouteErrorTest(RouteTestBase):
         self.assertEqual(transcript[-2]["text"], "hello")
 
 
+class SwapOfferErrorTest(RouteTestBase):
+    """HUB0008 8/11: a failed claude-provider turn whose error looks like a limit
+    error (ASSUMED phrases) gets a swapOffer on the SSE error event plus one 0600
+    sample line; local-provider and unclassified errors stay the old event. Fake
+    token file paths only -- never a real token."""
+
+    def _crash_with(self, msg):
+        def crashing(storage_dir, session_id, message):
+            raise RuntimeError(msg)
+            yield  # pragma: no cover -- generator like the real stream_message
+        return crashing
+
+    def _post_message(self, msg):
+        with mock.patch.object(chat_sessions, "stream_message", self._crash_with(msg)):
+            resp = self.client.post(f"/api/chat/{SID}/message", json={"message": "hello"})
+        body = resp.get_data(as_text=True)
+        events = [json.loads(line[len("data: "):]) for line in body.splitlines()
+                  if line.startswith("data: ")]
+        return resp, body, events
+
+    def _register_two_accounts(self):
+        import accounts
+        accounts.add(self.storage, "acct-a", "https://api.example", "/tmp/fake-token-a")
+        accounts.add(self.storage, "acct-b", "https://api.example", "/tmp/fake-token-b")
+
+    def test_classified_claude_error_gets_swapoffer_and_a_0600_sample(self):
+        self._register_two_accounts()  # acct-a is live (first added), i.e. the one used
+        self._store([])
+        resp, body, events = self._post_message("You have hit your usage limit, resets tomorrow")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(events[-1]["type"], "error")
+        offer = events[-1]["swapOffer"]
+        self.assertEqual(offer["kind"], "usage_limit")
+        # the live (used) account is excluded; the offer always ends with local
+        self.assertEqual(offer["options"],
+                         [{"provider": "claude", "account": "acct-b"}, {"provider": "local"}])
+        self.assertEqual(offer["options"][-1], {"provider": "local"})
+        self.assertNotIn("tokenFile", body)
+        self.assertNotIn("fake-token", body)
+        sample = self.storage / "limit-error-samples.jsonl"
+        self.assertEqual(sample.stat().st_mode & 0o777, 0o600)
+        lines = sample.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        rec = json.loads(lines[0])
+        self.assertIn("at", rec)
+        self.assertEqual(rec["text"], "RuntimeError: You have hit your usage limit, resets tomorrow")
+
+    def test_swapoffer_excludes_the_pinned_account_not_the_live_one(self):
+        self._register_two_accounts()  # live = acct-a
+        s = _session([])
+        s["account"] = "acct-b"  # the chat is pinned to acct-b, so acct-b is the one used
+        chat_sessions._write_sessions(self.storage, {SID: s})
+        _, _, events = self._post_message("HTTP 429 Too Many Requests")
+        offer = events[-1]["swapOffer"]
+        self.assertEqual(offer["kind"], "rate_limit")
+        self.assertEqual(offer["options"],
+                         [{"provider": "claude", "account": "acct-a"}, {"provider": "local"}])
+
+    def test_unclassified_claude_error_is_unchanged_and_not_sampled(self):
+        self._register_two_accounts()
+        self._store([])
+        _, body, events = self._post_message("connection refused by the provider")
+        self.assertEqual(events, [{"type": "error",
+                                   "error": "RuntimeError: connection refused by the provider"}])
+        self.assertNotIn("swapOffer", body)
+        self.assertFalse((self.storage / "limit-error-samples.jsonl").exists())
+
+    def test_local_provider_error_is_unchanged_and_not_sampled(self):
+        s = _session([])
+        s["provider"] = "local"
+        chat_sessions._write_sessions(self.storage, {SID: s})
+        import internal_api_client
+        with mock.patch.object(internal_api_client, "preempt", return_value=[]), \
+                mock.patch.object(chat_sessions, "stream_message",
+                                  self._crash_with("usage limit reached")):
+            resp = self.client.post(f"/api/chat/{SID}/message", json={"message": "hi"})
+        body = resp.get_data(as_text=True)
+        self.assertNotIn("swapOffer", body)
+        self.assertNotIn("token", body)
+        self.assertFalse((self.storage / "limit-error-samples.jsonl").exists())
+
+
 class SessionListAndCloseRouteTest(RouteTestBase):
     def setUp(self):
         super().setUp()
