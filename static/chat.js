@@ -24,7 +24,12 @@
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
 import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
-  formatTerminalRow, orderTerminalSessions, applyTerminalEvent } from "./sessions-view.js";
+  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel } from "./sessions-view.js";
+// HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
+// (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
+// split. providerLabel drives the header label, swapOptions builds the Swap menu,
+// swapBody builds each POST body, offerText renders the failed-turn one-click offer.
+import { providerLabel, swapOptions, offerText, swapBody } from "./swap-view.js";
 // Piece 2/10: the pure "needs you" attention logic (which rows newly became waiting,
 // how many are waiting) lives in attention-view.js (piece 1). This file only calls it
 // and applies the result to the DOM; keep the decision logic there.
@@ -125,6 +130,17 @@ function providerButtonLabel(provider) {
   return provider === 'claude' ? 'Claude' : 'Local';
 }
 
+// Menu / offer-button text for one swap option. swap-view.js's swapOptions entries
+// carry a `label`; the failed-turn offer options the route builds (HUB0008 8/11,
+// routes/chat.py) only carry {provider, account?}, so fall back to the account's
+// label, or 'Local model' -- the exact label swap-view.js uses for its own local entry.
+function swapOptionLabel(option) {
+  const o = option || {};
+  if (o.label) return o.label;
+  if (o.provider === 'local') return 'Local model';
+  return o.account || 'Claude';
+}
+
 // One chat: owns its session, its DOM (built inside `root`), its isSending guard and its
 // provider toggle. Every DOM lookup and event listener is scoped to `root` (class
 // selectors, no document-wide ids), so several panes can coexist on one page later.
@@ -158,6 +174,11 @@ class ChatPane {
   <div class="chat-header">
     <div class="chat-switcher-slot"></div>
     <span class="chat-provider-container"></span>
+    <span class="chat-provider-label" hidden></span>
+    <span class="chat-swap-slot">
+      <button type="button" class="secondary chat-swap-btn" hidden>Swap</button>
+      <div class="chat-swap-menu" hidden></div>
+    </span>
     <button type="button" class="secondary chat-reserve-btn" style="display:none" title="Hold the local model exclusively for this conversation until you turn it back off">Reserve</button>
     <button type="button" class="secondary chat-context-log-btn" title="View this session's context log -- a compacted, durable record built from CONTEXT-LOG: blocks at the end of each response, cross-referenced to any task discussed">Log</button>
   </div>
@@ -178,6 +199,13 @@ class ChatPane {
     const q = (sel) => this.root.querySelector(sel);
     this.switcherSlot = q('.chat-switcher-slot');
     this.providerContainer = q('.chat-provider-container');
+    // HUB0008 10/11: header provider label + Swap menu (see syncSwapHeader below).
+    this.providerLabelEl = q('.chat-provider-label');
+    this.swapBtn = q('.chat-swap-btn');
+    this.swapMenu = q('.chat-swap-menu');
+    this.swapOpen = false;
+    this.swapChoices = [];      // current menu/offer entries; data-swap-index points into this
+    this.pendingSwapOffer = null; // failed-turn swapOffer (error event, piece 8), rendered by render()
     this.reserveBtn = q('.chat-reserve-btn');
     this.logBtn = q('.chat-context-log-btn');
     this.logPanel = q('.chat-context-log-panel');
@@ -204,6 +232,12 @@ class ChatPane {
       await this.startNew();
     };
 
+    // HUB0008 10/11: Swap menu button; outside clicks and Escape close it (same
+    // pattern as the session switcher's menu).
+    this.swapBtn.onclick = (e) => { e.stopPropagation(); this.setSwapOpen(!this.swapOpen); };
+    document.addEventListener('click', (e) => { if (this.swapOpen && !this.root.contains(e.target)) this.setSwapOpen(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.swapOpen) this.setSwapOpen(false); });
+
     this.sendBtn.onclick = () => this.send();
     this.input.onkeydown = (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -225,8 +259,16 @@ class ChatPane {
   }
 
   setSession(session) {
+    const prevId = this.sessionId;
     this.session = session;
     this.sessionId = session ? session.id : null;
+    // A DIFFERENT chat was loaded: a pending swap offer or an open Swap menu belong to
+    // the previous chat and must not leak into this one. (Same-id updates -- e.g. the
+    // swap response itself -- keep state; performSwap() clears the offer explicitly.)
+    if (prevId !== this.sessionId) {
+      this.pendingSwapOffer = null;
+      this.setSwapOpen(false);
+    }
     this.onSessionChange(session);
   }
 
@@ -235,6 +277,81 @@ class ChatPane {
     this.providerBtn.dataset.provider = this.providerChoice;
     this.providerBtn.textContent = providerButtonLabel(this.providerChoice);
     this.providerBtn.classList.toggle('provider-toggle-claude', claude);
+  }
+
+  // HUB0008 10/11: the header provider label (swap-view.providerLabel) and the Swap
+  // button's visibility track the loaded session. All decisions -- what the label is,
+  // which entries the menu lists, what each POST body looks like -- live in
+  // static/swap-view.js (piece 9); this method only places them in the DOM. No token
+  // or token path ever touches the client here: the menu entries and the swap body
+  // carry only labels (swapBody), and the accounts endpoint returns public_view only.
+  syncSwapHeader() {
+    const has = !!this.session;
+    this.providerLabelEl.textContent = has ? providerLabel(this.session) : '';
+    this.providerLabelEl.hidden = !has;
+    this.swapBtn.hidden = !has;
+    if (!has) this.setSwapOpen(false);
+  }
+
+  setSwapOpen(open) {
+    this.swapOpen = open;
+    this.swapMenu.hidden = !open;
+    if (open) this.renderSwapMenu();
+  }
+
+  // Builds the Swap menu from GET api/chat/accounts (public_view shape: {accounts:
+  // [{label, host, live}]}) through swap-view.swapOptions, which drops the session's
+  // pinned account and appends the local model (unless the session is already local).
+  async renderSwapMenu() {
+    const session = this.session;
+    if (!session) return;
+    this.swapMenu.innerHTML = '<div class="chat-switcher-empty">Loading accounts&hellip;</div>';
+    let accounts;
+    try {
+      const body = await fetchJson('api/chat/accounts');
+      accounts = Array.isArray(body.accounts) ? body.accounts : [];
+    } catch (e) {
+      this.swapMenu.innerHTML = `<div class="chat-switcher-empty">Could not load accounts: ${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    const options = swapOptions(accounts, session);
+    this.swapChoices = options;
+    this.swapMenu.innerHTML = options.length
+      ? options.map((o, i) =>
+        `<div class="chat-switcher-row" role="option" data-swap-index="${i}">
+           <span class="chat-switcher-main"><span class="chat-switcher-title">${escapeHtml(swapOptionLabel(o))}</span></span>
+         </div>`).join('')
+      : '<div class="chat-switcher-empty">Nothing else to switch to.</div>';
+  }
+
+  // Performs the swap -- the ONE code path shared by a Swap-menu entry and a
+  // one-click offer button. POSTs api/chat/<id>/swap with swapBody(option) (piece 7's
+  // route validates the account label server-side and returns the updated session
+  // with its new marker row in the transcript); setSession + render show it.
+  async performSwap(option) {
+    const session = this.session;
+    if (!session) return;
+    if (this.isSending) {
+      showToast('Wait for the current reply to finish before switching model.', 'info');
+      return;
+    }
+    this.setSwapOpen(false);
+    this.swapBtn.disabled = true;
+    try {
+      const resp = await fetch(`api/chat/${encodeURIComponent(session.id)}/swap`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(swapBody(option)),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
+      this.pendingSwapOffer = null; // the swap succeeded; the offer is stale now
+      this.setSession(body);       // updated session -- the marker row renders with it
+    } catch (e) {
+      showToast('Could not switch model: ' + e.message);
+    } finally {
+      this.swapBtn.disabled = false;
+    }
+    this.render();
   }
 
   // Fetches the pane's CURRENT session (by remembered id), falling back to the most
@@ -291,6 +408,16 @@ class ChatPane {
   }
 
   async onRootClick(e) {
+    // HUB0008 10/11: Swap-menu entries and one-click offer buttons both resolve to a
+    // data-swap-index into this.swapChoices and share performSwap (same POST body path
+    // as the header menu). Checked before the template-card handler below.
+    const swapEl = e.target.closest &&
+      (e.target.closest('.chat-swap-menu [data-swap-index]') || e.target.closest('.chat-swap-offer-btn'));
+    if (swapEl) {
+      const option = this.swapChoices[Number(swapEl.dataset.swapIndex)];
+      if (option) { this.setSwapOpen(false); this.performSwap(option); }
+      return;
+    }
     const btn = e.target.closest && e.target.closest('.tpl-save');
     if (!btn || !this.session || !this.root.contains(btn)) return;
     const card = btn.closest('.tpl-card');
@@ -361,6 +488,7 @@ class ChatPane {
     const message = this.input.value.trim();
     if (!message || !this.session) return;
     const session = this.session; // a mid-stream switch is blocked, but never write into another chat
+    this.pendingSwapOffer = null; // a new turn supersedes any previous failed-turn offer
     this.isSending = true;
     this.input.value = '';
     this.input.disabled = true;
@@ -423,6 +551,11 @@ class ChatPane {
             finalSession = evt.session;
           } else if (evt.type === 'error') {
             streamErr = evt.error;
+            // HUB0008 10/11: a failed CLAUDE turn classified as a limit error carries
+            // swapOffer {kind, options} on the SAME error event (routes/chat.py, piece
+            // 8). Hold it so render() shows the one-click offer; absent on every other
+            // error (local turns, unclassified) -- then nothing extra is rendered.
+            this.pendingSwapOffer = evt.swapOffer || null;
           }
         }
       }
@@ -478,6 +611,7 @@ class ChatPane {
 
   render() {
     const session = this.session;
+    this.syncSwapHeader();
     if (session && session.provider && this.providerChoice !== session.provider) {
       this.providerChoice = session.provider;
       this.syncProviderToggle();
@@ -496,6 +630,30 @@ class ChatPane {
     this.transcriptEl.innerHTML = session && session.transcript.length
       ? chatRenderTranscript(session.transcript, session)
       : '<div class="empty">Say something to the chat.</div>';
+    // HUB0008 10/11: the failed-turn one-click swap offer. offerText (swap-view, piece 9)
+    // decides whether there is anything to offer at all -- null/missing offer, unknown
+    // kind or an empty options list all yield '' and we render NOTHING extra. When it
+    // speaks, one button per option, each wired (via onRootClick) to the same
+    // performSwap POST as the header Swap menu. Appended INSIDE the transcript scroll
+    // box when one exists so it scrolls with the failed turn.
+    if (this.pendingSwapOffer) {
+      const offer = this.pendingSwapOffer;
+      const text = offerText(offer);
+      const options = Array.isArray(offer.options) ? offer.options : [];
+      if (text && options.length) {
+        this.swapChoices = options;
+        const html =
+          `<div class="chat-swap-offer">` +
+          `<div class="chat-swap-offer-text">${escapeHtml(text)}</div>` +
+          `<div class="chat-swap-offer-actions">` +
+          options.map((o, i) =>
+            `<button type="button" class="secondary chat-swap-offer-btn" data-swap-index="${i}">` +
+            `Switch to ${escapeHtml(swapOptionLabel(o))}</button>`).join('') +
+          `</div></div>`;
+        const target = this.transcriptEl.querySelector('.chat-transcript') || this.transcriptEl;
+        target.insertAdjacentHTML('beforeend', html);
+      }
+    }
     const scrollBox = this.transcriptEl.querySelector('.chat-transcript');
     if (scrollBox) scrollBox.scrollTop = scrollBox.scrollHeight;
   }
@@ -514,8 +672,13 @@ class SessionSwitcher {
     this.getRoots = getRoots || (() => []);
     this.rows = [];
     // Read-only terminal sessions from the optional session agent (see agent_client.py).
-    this.terminal = { enabled: false, reachable: false, rows: [] };
-    this.events = null;
+    this.terminal = { enabled: false, reachable: false, rows: [], hosts: [], skipped: [] };
+    // One EventSource per host (HUB0017), keyed by host name; '' is the single-host
+    // fallback stream. Closed together by stopEvents().
+    this.hostEvents = {};
+    this._eventSignature = null;
+    // Terminal-section host filter: '' means All.
+    this.hostFilter = '';
     this.open = false;
     this.pollTimer = null;
     // Attention state (piece 2/10): the previous {key: status} map returned by
@@ -552,13 +715,33 @@ class SessionSwitcher {
     }
   }
 
-  // Live terminal-session updates while the dropdown is open. EventSource reconnects by
-  // itself; the 5s refresh() above is the fallback when the stream is down.
+  // Live terminal-session updates while the dropdown is open. One EventSource per host
+  // (HUB0017); each reconnects by itself, and the 5s refresh() above is the fallback
+  // when a stream is down. A single host uses the plain single-host URL.
   startEvents() {
-    if (this.events || !this.terminal.enabled || !this.terminal.reachable || typeof EventSource === 'undefined') return;
-    this.events = new EventSource('api/chat/terminal-sessions/events');
+    if (!this.terminal.enabled || !this.terminal.reachable || typeof EventSource === 'undefined') return;
+    const hosts = (Array.isArray(this.terminal.hosts) && this.terminal.hosts.length)
+      ? this.terminal.hosts
+      : hostsOf(this.terminal.rows);
+    if (!hosts.length) return;
+    const signature = hosts.join('\u0000');
+    if (this._eventSignature === signature) return; // streams already match the host list
+    this.stopEvents(); // host list changed: close all, reopen fresh
+    this._eventSignature = signature;
+    if (hosts.length === 1) {
+      this.openEventStream(hosts[0], 'api/chat/terminal-sessions/events');
+    } else {
+      for (const host of hosts) {
+        this.openEventStream(host, 'api/chat/terminal-sessions/events?host=' + encodeURIComponent(host));
+      }
+    }
+  }
+
+  openEventStream(host, url) {
+    const events = new EventSource(url);
+    this.hostEvents[host] = events;
     for (const name of ['session.updated', 'session.removed']) {
-      this.events.addEventListener(name, (e) => {
+      events.addEventListener(name, (e) => {
         let data = null;
         try { data = JSON.parse(e.data); } catch (err) { return; }
         this.terminal.rows = applyTerminalEvent(this.terminal.rows, name, data);
@@ -569,8 +752,9 @@ class SessionSwitcher {
   }
 
   stopEvents() {
-    if (this.events) this.events.close();
-    this.events = null;
+    for (const host of Object.keys(this.hostEvents)) this.hostEvents[host].close();
+    this.hostEvents = {};
+    this._eventSignature = null;
   }
 
   // Piece 2/10: after EVERY terminal-rows update, run the pure attention step
@@ -625,11 +809,19 @@ class SessionSwitcher {
     }
     try {
       const t = await fetchJson('api/chat/terminal-sessions');
-      this.terminal = { enabled: !!t.enabled, reachable: !!t.reachable, rows: Array.isArray(t.sessions) ? t.sessions : [] };
+      this.terminal = {
+        enabled: !!t.enabled,
+        reachable: !!t.reachable,
+        rows: Array.isArray(t.sessions) ? t.sessions : [],
+        hosts: Array.isArray(t.hosts) ? t.hosts : [],
+        skipped: Array.isArray(t.skipped) ? t.skipped : [],
+      };
     } catch (e) {
       // Same: keep what we had.
     }
     this.applyAttention(); // piece 2/10: after each terminal-rows update
+    // Host list can change between polls (agent added/removed): re-sync the streams.
+    if (this.open) this.startEvents();
     this.render();
     return this.rows;
   }
@@ -663,16 +855,20 @@ class SessionSwitcher {
   }
 
   // A terminal session row: display only (no select, no close) until a handoff exists.
-  renderTerminalRow(fmt, newlyWaiting) {
+  // `showHost` gates the host badge: pointless when every row shares one host. `newlyWaiting` (piece 2/10): a row that just became waiting also flashes amber.
+  renderTerminalRow(fmt, newlyWaiting, showHost) {
     const ctx = fmt.context ? `<span class="chat-switcher-context">${escapeHtml(fmt.context)}</span>` : '';
     const step = fmt.step ? `<div class="chat-switcher-step">${escapeHtml(fmt.step)}</div>` : '';
+    const badge = (showHost && fmt.host)
+      ? `<span class="terminal-row-host-badge">${escapeHtml(fmt.host)}</span>`
+      : '';
     // Piece 2/10: a waiting row is steady-amber (.waiting); a row that newly became
     // waiting additionally flashes amber (.waiting-flash) for 10s via chat.css.
     const trowCls = 'chat-switcher-trow'
       + (fmt.waiting ? ' waiting' : '')
       + (fmt.waiting && newlyWaiting ? ' waiting-flash' : '');
     return `<div class="${trowCls}" title="${escapeHtml(fmt.fullTitle)}">
-      <div class="chat-switcher-title">${escapeHtml(fmt.title)}</div>
+      <div class="chat-switcher-title">${escapeHtml(fmt.title)}${badge}</div>
       <div class="chat-switcher-meta">
         <span class="chat-switcher-status${fmt.busy ? ' busy' : ''}${fmt.waiting ? ' waiting' : ''}">${escapeHtml(fmt.status)}</span>
         <span>${escapeHtml(fmt.timer)}</span>${ctx}
@@ -683,18 +879,39 @@ class SessionSwitcher {
   renderTerminalSection(now) {
     const t = this.terminal;
     if (!t.enabled) return '';
+    const rows = orderTerminalSessions(t.rows);
+    // Host badge + All/each-host filter only make sense with more than one host.
+    const hosts = hostsOf(rows);
+    const multiHost = hosts.length > 1;
+    // A stale filter (e.g. its host vanished from the list) would empty the rows; clamp.
+    let selectedHost = multiHost ? this.hostFilter : '';
+    if (selectedHost && !hosts.includes(selectedHost)) selectedHost = '';
     let body;
     if (!t.reachable) body = '<div class="chat-switcher-empty">Session agent unreachable</div>';
     else if (!t.rows.length) body = '<div class="chat-switcher-empty">No terminal sessions</div>';
-    else body = orderTerminalSessions(t.rows).map((r) => {
+    else body = filterByHost(rows, selectedHost).map((r) => {
       // Piece 2/10: match this row against the newly-waiting keys from the last
       // attention step (key rule mirrors attention-view.js keyOf: host/id when a host
       // is present, else the id) to add the amber-flash class.
       const key = r.host ? (r.host || '') + '/' + r.id : r.id;
       const newly = (r.status === 'waiting') && this.attentionNewlyWaiting.has(key);
-      return this.renderTerminalRow(formatTerminalRow(r, now), newly);
+      return this.renderTerminalRow(formatTerminalRow(r, now), newly, multiHost);
     }).join('');
-    return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${body}`;
+    let filterHtml = '';
+    if (multiHost) {
+      const options = [''].concat(hosts);
+      filterHtml = '<div class="chat-switcher-host-filter">'
+        + options.map((h) => {
+            const active = (selectedHost || '') === (h || '');
+            return `<button type="button" class="secondary chat-switcher-host-filter-btn${active ? ' active' : ''}" data-host-filter="${escapeHtml(h || '')}">${h ? escapeHtml(h) : 'All'}</button>`;
+          }).join('')
+        + '</div>';
+    }
+    const skippedText = skippedLabel(t.skipped);
+    const skippedLine = skippedText
+      ? `<div class="chat-switcher-empty">Some hosts were skipped: ${escapeHtml(skippedText)}</div>`
+      : '';
+    return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${filterHtml}${body}${skippedLine}`;
   }
 
   render() {
@@ -708,6 +925,13 @@ class SessionSwitcher {
 
   async onMenuClick(e) {
     e.stopPropagation();
+    // Host filter (terminal section): pick All / one host and re-render only.
+    const hostFilterBtn = e.target.closest('.chat-switcher-host-filter-btn');
+    if (hostFilterBtn) {
+      this.hostFilter = hostFilterBtn.dataset.hostFilter || '';
+      this.render();
+      return;
+    }
     if (e.target.closest('.chat-switcher-new')) {
       this.setOpen(false);
       await this.onNew();
@@ -729,6 +953,7 @@ class SessionSwitcher {
 }
 
 function mountChat() {
+  if (window.__CHAT_MULTI_PANES__) return;
   // #chat-panel (in templates/chat.html) is the sole id-based contract between
   // this file and the template; every other selector here is class-based.
   const root = document.getElementById('chat-panel');
@@ -791,3 +1016,5 @@ function mountChat() {
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mountChat);
 else mountChat();
+
+export { ChatPane, SessionSwitcher, showToast };

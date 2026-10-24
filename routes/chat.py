@@ -9,6 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 import agent_client
+import agent_hosts
 
 # The app.py helpers these views call (CHAT_STORAGE_DIR, _call_chat, _chat_roots,
 # _discuss_provider_args) are imported lazily inside each view: app.py imports THIS
@@ -61,31 +62,52 @@ def api_chat_sessions():
 
 @chat_bp.route("/api/chat/terminal-sessions", methods=["GET"])
 def api_terminal_sessions():
-    """Local Claude Code terminal sessions, as reported by the optional session agent
+    """Local Claude Code terminal sessions from every configured session agent
     (agent_client.py). Never an error: 'enabled' says whether the feature is configured,
-    'reachable' whether the agent answered. Read-only."""
+    'reachable' whether at least one host answered, 'sessions' carries one tagged row per
+    live host ('host': <name>), 'hosts' the configured host names in config order, and
+    'skipped' one {'host','reason'} per failed host. Read-only. No token or token-file
+    path ever appears in the body -- each host's own bearer token stays server-side."""
     if not agent_client.enabled():
-        return jsonify({"enabled": False, "reachable": False, "sessions": []})
-    try:
-        return jsonify({"enabled": True, "reachable": True, "sessions": agent_client.list_sessions()})
-    except agent_client.AgentError:
-        return jsonify({"enabled": True, "reachable": False, "sessions": []})
+        return jsonify({"enabled": False, "reachable": False, "sessions": [],
+                        "hosts": [], "skipped": []})
+    result = agent_client.list_all()
+    hosts = [h.name for h in agent_hosts.hosts()]
+    skipped = result["skipped"]
+    reachable = len(skipped) < len(hosts)
+    if not reachable:
+        result = {"sessions": [], "skipped": skipped}
+    return jsonify({"enabled": True, "reachable": reachable, "sessions": result["sessions"],
+                    "hosts": hosts, "skipped": skipped})
 
 
 @chat_bp.route("/api/chat/terminal-sessions/events", methods=["GET"])
 def api_terminal_sessions_events():
-    """SSE passthrough of the session agent's /events (the agent token stays server-side).
-    The stream just ends if the agent goes away; the browser's EventSource reconnects."""
+    """SSE passthrough of ONE session agent's /events (the agent token stays server-side).
+    Query param host=<name> picks the host: optional with a single configured host (that
+    one is used and its name tagged onto every event), REQUIRED when several are
+    configured (400 when missing, 404 for an unknown name, 502 when that host is
+    unreachable). The stream just ends if the agent goes away; the browser's
+    EventSource reconnects. No token ever appears in the stream."""
     if not agent_client.enabled():
         abort(404, description="session agent is not configured")
+    host = request.args.get("host")
+    hosts = agent_hosts.hosts()
+    if host is None and len(hosts) != 1:
+        abort(400, description=(
+            f"{len(hosts)} session agents are configured; pass host=<name> to pick one"))
+    if host is None:
+        host = hosts[0].name
+    elif not any(h.name == host for h in hosts):
+        abort(404, description=f"unknown session agent host '{host}'")
     try:
-        upstream = agent_client.open_events()
+        upstream = agent_client.open_events(host)
     except agent_client.AgentError:
         abort(502, description="session agent is unreachable")
 
     def relay():
         try:
-            yield from agent_client.filter_events(agent_client.iter_chunks(upstream))
+            yield from agent_client.filter_events(agent_client.iter_chunks(upstream), host=host)
         except (requests.RequestException, OSError) as exc:
             logger.warning("SSE relay stream ended abnormally: %s: %s", type(exc).__name__, exc)
         finally:
@@ -220,7 +242,7 @@ def api_chat_message(session_id):
     # streamed as SSE: one `data:` frame per {"type":"chunk"} as text arrives, then one
     # {"type":"final","session":{...}} carrying the same shape this route used to return
     # in one shot, so the frontend still ends up with the same authoritative session.
-    from chat_sessions import stream_message, PROVIDER_LOCAL
+    from chat_sessions import stream_message, PROVIDER_LOCAL, PROVIDER_CLAUDE
     from claude_client import ClaudeClientError
     from local_tool_client import LocalToolClientError
     from internal_api_client import InternalApiError, preempt as internal_preempt
@@ -254,7 +276,31 @@ def api_chat_message(session_id):
                 record_turn_error(CHAT_STORAGE_DIR, session_id, msg)
             except Exception as werr:  # noqa: BLE001 -- never mask the original error
                 print(f"[chat-error-record] failed: {werr}", file=sys.stderr, flush=True)
-            return f"data: {json.dumps({'type': 'error', 'error': msg})}\n\n"
+            event = {'type': 'error', 'error': msg}
+            # HUB0008 8/11: a failed CLAUDE-provider turn whose error looks like a
+            # limit error (ASSUMED phrases -- see limit_errors.py) gets a swapOffer on
+            # the SSE error event and the error text is sampled so the owner can turn
+            # real errors into fixtures. Local-provider errors and unclassified Claude
+            # errors are untouched. Only account LABELS go into the event -- never a
+            # token or a tokenFile (accounts.load entries carry both).
+            if existing.get("provider") == PROVIDER_CLAUDE:
+                from limit_errors import classify, record_sample
+                kind = classify(msg)["kind"]
+                if kind is not None:
+                    try:
+                        record_sample(CHAT_STORAGE_DIR, msg)
+                    except Exception as serr:  # noqa: BLE001 -- the offer must not die
+                        print(f"[chat-error-sample] failed: {serr}", file=sys.stderr, flush=True)
+                    import accounts
+                    # The account used for the turn: the chat's pinned account, else
+                    # the live one (same resolution as chat_sessions's turn path).
+                    used = existing.get("account") or accounts.live_label(CHAT_STORAGE_DIR)
+                    options = [{"provider": "claude", "account": a["label"]}
+                               for a in accounts.load(CHAT_STORAGE_DIR)
+                               if a.get("label") != used]
+                    options.append({"provider": "local"})
+                    event["swapOffer"] = {"kind": kind, "options": options}
+            return f"data: {json.dumps(event)}\n\n"
 
         if preempted:
             yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
@@ -320,6 +366,98 @@ def api_chat_reserve(session_id):
 
     session = set_reserved(CHAT_STORAGE_DIR, session_id, want_on)
     return jsonify(session)
+
+
+def _public_session(session):
+    """The session dict with any token / tokenFile key stripped -- HUB0008 7/11: no
+    token or tokenFile ever leaves the server in a swap response. A session should
+    only ever hold the account LABEL (accounts.py keeps tokenFile paths server-side),
+    but the strip is applied anyway as the belt to that suspenders."""
+    if not isinstance(session, dict):
+        return {}
+    return {k: v for k, v in session.items() if k not in ("token", "tokenFile")}
+
+
+@chat_bp.route("/api/chat/<session_id>/swap", methods=["POST"])
+def api_chat_swap(session_id):
+    """HUB0008 7/11 (multi-chat workspace): swap the model behind a live chat,
+    mid-conversation.
+
+    Body: {provider: 'local' | 'claude', model?: string, account?: string}.
+    For 'claude', `account`, when given, must be the label of an existing account
+    (accounts.load against CHAT_STORAGE_DIR); when omitted the session follows the
+    live account (account None -- see accounts.live_label). For 'local' the account
+    is ignored (local has no account).
+
+    - 404 for an unknown or inactive session; 400 for a bad provider or an unknown
+      claude account.
+    - If the session currently holds the local reservation and the target is not
+      local, the reservation is released FIRST, exactly as api_chat_reserve does
+      (internal reserve off, then set_reserved False). A swap TO local NEVER
+      acquires a reservation -- the /reserve flow is the only way to get one.
+    - When handoff.needs_summary(transcript, target provider) is true, the local
+      summarizer builds the older-turns summary (chat_sessions.summarize_older)
+      before returning. A summarizer error does NOT block the swap: a warning is
+      logged and the turn continues with the verbatim hand-off (piece 6).
+    Returns the updated session JSON -- never a token or tokenFile.
+    """
+    from app import CHAT_STORAGE_DIR
+    from chat_sessions import (get_session, swap_session, summarize_older,
+                               PROVIDER_LOCAL, PROVIDER_CLAUDE)
+    import handoff
+
+    body = request.get_json(silent=True) or {}
+    provider = body.get("provider")
+    model = body.get("model")
+    account = body.get("account")
+
+    session = get_session(CHAT_STORAGE_DIR, session_id)
+    if not session or session.get("status") != "active":
+        abort(404)
+    if provider not in (PROVIDER_LOCAL, PROVIDER_CLAUDE):
+        abort(400, description="provider must be 'local' or 'claude'")
+
+    if provider == PROVIDER_CLAUDE:
+        if account is not None:
+            import accounts
+            labels = {a.get("label") for a in accounts.load(CHAT_STORAGE_DIR)}
+            if account not in labels:
+                abort(400, description="unknown account: %s" % account)
+        # account None: the session follows the live account.
+    else:
+        account = None  # local has no account; whatever the body sent is ignored.
+
+    # Leaving local while holding the reservation: release it first, the exact
+    # api_chat_reserve release shape (best-effort -- a failed release must not
+    # block the swap, mirroring api_chat_close). A swap TO local never acquires.
+    if session.get("reserved") and provider != PROVIDER_LOCAL:
+        from chat_sessions import set_reserved
+        from internal_api_client import InternalApiError, reserve as internal_reserve
+        import ollama_client
+        try:
+            internal_reserve(session_id, ollama_client.MODEL, False)
+        except InternalApiError as e:  # noqa: BLE001 -- never block the swap on the release
+            logger.warning("[chat-swap] reservation release failed (non-fatal): %s", e)
+        set_reserved(CHAT_STORAGE_DIR, session_id, False)
+
+    updated = swap_session(CHAT_STORAGE_DIR, session_id, provider, model, account=account)
+    if not updated:
+        abort(404)
+
+    # Optional older-turns summary: only when the transcript would overflow the
+    # TARGET provider's window (handoff.needs_summary, piece 5). A failure here must
+    # not block the swap -- warn and continue with the verbatim hand-off (piece 6).
+    try:
+        if handoff.needs_summary(updated.get("transcript") or [], provider):
+            summarized = summarize_older(CHAT_STORAGE_DIR, session_id)
+            if summarized:
+                updated = summarized
+    except Exception as e:  # noqa: BLE001 -- a summarizer error never fails the swap
+        logger.warning("[chat-swap] summarise-older failed (non-fatal, continuing with the "
+                       "verbatim hand-off): %s: %s", type(e).__name__, e)
+        updated = get_session(CHAT_STORAGE_DIR, session_id) or updated
+
+    return jsonify(_public_session(updated))
 
 
 @chat_bp.route("/api/chat/<session_id>/template/save", methods=["POST"])
