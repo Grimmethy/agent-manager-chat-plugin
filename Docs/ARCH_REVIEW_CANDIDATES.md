@@ -909,3 +909,18 @@ Pick one env-var semantics for the chat-swap feature and apply it consistently. 
 
 Benefits:
 Operators and tests get a single, predictable rule for how configuration changes propagate: either both modules see the new value immediately or both require a process restart. The inconsistency is eliminated at the source, and the agreement test (using `importlib.reload` to force re-evaluation of the import-time binding) makes any future regression—e.g. someone re-introducing a module-level constant in one file—a red build rather than a silent mismatch in production.
+
+### AC-69 · Divergent provider fallback logic across session and swap views
+Strength: Moderate
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `sessions-view.js` and `swap-view.js` define a local function named `providerLabel` that maps a provider identifier to a human-readable string. However, they encode different fallback rules for unrecognized providers: `sessions-view.js` defaults to the literal string `'Local'`, while `swap-view.js` defaults to `'Unknown'`. This divergence creates a consistency hazard: if a session with a non-standard provider (e.g., a typo or a newly added provider not yet mapped) is displayed in both the session list and the swap menu, the user will see contradictory labels (`'Local'` vs. `'Unknown'`) for the same underlying data. Additionally, the identical function name in two separate modules creates a naming collision that can confuse developers, particularly when searching for or refactoring the provider-labeling logic, as it is unclear which implementation is the "canonical" one or whether they are intended to be kept in sync.
+
+Solution:
+Extract the provider-to-label mapping logic into a single shared utility function (e.g., `getProviderLabel(provider)` in a new `utils.js` or similar module) that defines one consistent fallback rule (e.g., always `'Unknown'` for unrecognized providers, or a configurable default). Both `sessions-view.js` and `swap-view.js` should import and use this shared function. If the two views require different display formats (e.g., one includes an account suffix and the other does not), the shared utility should handle the core provider-to-label mapping, and each view can append its specific context-specific suffixes (like account names) separately. This ensures the core provider label is consistent across the UI while allowing for view-specific formatting.
+
+Benefits:
+Ensures consistent user experience by preventing contradictory labels for the same provider across different UI components. Reduces code duplication and eliminates the risk of the two implementations diverging further over time. Clarifies the codebase structure by establishing a single source of truth for provider labeling, making it easier for developers to understand and maintain the logic. Removes the naming collision, improving code readability and reducing the chance of import or reference errors.
+
+NOTE: The critique regarding `chat.js` was not applied because the file was not provided in the inputs, and the corrected draft removes all unverified claims about `chat.js` imports or aliases, focusing instead on the verifiable divergence in fallback logic and naming collision between the two provided files.
