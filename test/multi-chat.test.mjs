@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  applyPreset, closePane, serialize, deserialize, firstOpenPane,
+  applyPreset, closePane, serialize, deserialize, firstOpenPane, layoutForWidth,
 } from '../static/multi-chat.js';
 
 test('save (serialize): two open panes round-trip to JSON with preset and both session ids', () => {
@@ -94,4 +94,40 @@ test('no shared state: two independently created layout states do not affect eac
   const s2 = deserialize(stored);
   s1.panes.push('p3');
   assert.deepEqual(s2.panes, ['p1', 'p2']);
+});
+
+test('layoutForWidth: below the breakpoint collapses to the active pane in a 1-pane preset', () => {
+  const state = { preset: '2x2', panes: ['a', 'b', 'c', 'd'] };
+  assert.deepEqual(layoutForWidth(state, 'c', 400), { preset: '1', panes: ['c'] });
+  assert.deepEqual(layoutForWidth(state, 'c', 759), { preset: '1', panes: ['c'] });
+});
+
+test('layoutForWidth: at or above the breakpoint returns the very same state object', () => {
+  const state = { preset: '2col', panes: ['a', 'b'] };
+  assert.equal(layoutForWidth(state, 'a', 760), state);
+  assert.equal(layoutForWidth(state, 'a', 1200), state);
+  assert.equal(layoutForWidth(state, 'a', 500, 400), state, 'a custom breakpoint is honoured');
+  assert.deepEqual(layoutForWidth(state, 'b', 500, 600), { preset: '1', panes: ['b'] });
+});
+
+test('layoutForWidth: a null or unknown activeId falls back to the first open pane', () => {
+  const state = { preset: '2col', panes: [null, 'x', 'y'] };
+  assert.deepEqual(layoutForWidth(state, null, 300).panes, ['x']);
+  assert.deepEqual(layoutForWidth(state, 'gone', 300).panes, ['x']);
+  assert.deepEqual(layoutForWidth(state, undefined, 300).panes, ['x']);
+});
+
+test('layoutForWidth: no open panes gives an empty single-pane layout', () => {
+  assert.deepEqual(layoutForWidth({ preset: '1', panes: [] }, null, 300), { preset: '1', panes: [] });
+  assert.deepEqual(layoutForWidth({ preset: '2col', panes: [null, null] }, 'a', 300), { preset: '1', panes: [] });
+});
+
+test('layoutForWidth: never mutates its input and returns a new state when collapsing', () => {
+  const state = { preset: '2x2', panes: ['a', 'b', 'c', 'd'] };
+  const before = JSON.stringify(state);
+  const out = layoutForWidth(state, 'b', 300);
+  assert.equal(JSON.stringify(state), before);
+  assert.notEqual(out, state);
+  out.panes.push('z');
+  assert.deepEqual(state.panes, ['a', 'b', 'c', 'd']);
 });

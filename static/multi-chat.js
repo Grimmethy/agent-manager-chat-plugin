@@ -104,6 +104,16 @@ export function firstOpenPane(state) {
   return ids.length ? ids[0] : null;
 }
 
+// Phone-width rule (HUB0010 4/10): below `breakpoint` px the workspace shows one pane, the
+// active chat (the first open pane when activeId is null or not open; none when nothing is
+// open). At or above it the same state object comes back unchanged. Never mutates `state`.
+export function layoutForWidth(state, activeId, width, breakpoint = 760) {
+  if (!(width < breakpoint)) return state;
+  const ids = openIds(state);
+  const keep = typeof activeId === 'string' && ids.includes(activeId) ? activeId : ids[0];
+  return { preset: '1', panes: keep === undefined ? [] : [keep] };
+}
+
 // ============================================================================
 // Browser-only adapter. Node imports of this module stop at the guard above.
 // ============================================================================
