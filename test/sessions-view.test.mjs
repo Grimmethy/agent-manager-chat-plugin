@@ -4,7 +4,7 @@ import {
   truncateTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
   orderSessions, nextSelectionAfterClose, formatRow,
   formatTokens, contextLabel, terminalTimer, STALE_BUSY_SECS, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
-  filterRows, jumpTarget,
+  filterRows, filterChats, jumpTarget,
 } from '../static/sessions-view.js';
 import { rowKey, hostsOf, filterByHost } from '../static/sessions-view.js';
 import { skippedLabel } from '../static/sessions-view.js';
@@ -300,4 +300,28 @@ test('jumpTarget prefixes the host when the row has one and not otherwise', () =
   assert.equal(jumpTarget(rows, 2), 'b');
   assert.equal(jumpTarget(rows, 3), 'c');
   assert.equal(jumpTarget(rows, 4), 'd');
+});
+
+const CHAT_ROWS = [
+  { id: 'c1', title: 'Task: author a new selectable PromptForge scene', provider: 'local', model: 'qwen3' },
+  { id: 'c2', title: 'New chat', provider: 'claude', model: 'claude-sonnet-5-5' },
+  { id: 'c3', title: null, provider: 'local', model: null },
+];
+
+test('filterChats matches the full title and the provider/model label, case-insensitively', () => {
+  assert.deepEqual(filterChats(CHAT_ROWS, 'PROMPTFORGE').map((r) => r.id), ['c1']);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'sonnet').map((r) => r.id), ['c2']);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'claude').map((r) => r.id), ['c2']);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'new chat').map((r) => r.id), ['c2']);
+});
+
+test('filterChats: an empty or whitespace query returns the rows as given; no match returns []', () => {
+  assert.equal(filterChats(CHAT_ROWS, ''), CHAT_ROWS);
+  assert.equal(filterChats(CHAT_ROWS, '   '), CHAT_ROWS);
+  assert.equal(filterChats(CHAT_ROWS, null), CHAT_ROWS);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'zzzz'), []);
+});
+
+test('filterChats tolerates null fields and null rows', () => {
+  assert.deepEqual(filterChats([null, ...CHAT_ROWS], 'local').map((r) => r.id), ['c1', 'c3']);
 });

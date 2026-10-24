@@ -24,7 +24,7 @@
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
 import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
-  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel, filterRows, jumpTarget } from "./sessions-view.js";
+  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel, filterRows, filterChats, jumpTarget } from "./sessions-view.js";
 // HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
 // (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
 // split. providerLabel drives the header label, swapOptions builds the Swap menu,
@@ -1026,8 +1026,11 @@ class SessionSwitcher {
     this.renderButton();
     const now = Date.now();
     const selectedId = this.getSelectedId();
+    const chats = filterChats(this.rows, this.filterQuery);
+    const chatsEmpty = this.rows.length && !chats.length
+      ? '<div class="chat-switcher-empty">No chats match</div>' : '';
     this.list.innerHTML = `<div class="chat-switcher-new" role="option">+ New chat</div>`
-      + this.rows.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('')
+      + chats.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('') + chatsEmpty
       + this.renderTerminalSection(now)
       + this.renderChimeSetting();
   }
