@@ -1,0 +1,34 @@
+{
+  "id": "chat-1700000000-legacy01",
+  "provider": "claude",
+  "model": "opus",
+  "effort": "high",
+  "roots": ["/home/demo/agent-manager"],
+  "repoRoot": "/home/demo/agent-manager",
+  "instancesDir": null,
+  "claudeSessionId": "fake-claude-session-abc123",
+  "transcript": [
+    {
+      "role": "user",
+      "text": "Please check the status of the nightly build.",
+      "timestamp": "2026-10-18T09:00:00Z"
+    },
+    {
+      "role": "assistant",
+      "text": "The nightly build failed at step 3; here is the fake error output for this test fixture.",
+      "timestamp": "2026-10-18T09:00:05Z",
+      "error": "Fake build timeout after 600s (placeholder error text, not a real failure)"
+    },
+    {
+      "role": "assistant",
+      "text": "I drafted the release report using the standard templates.",
+      "timestamp": "2026-10-18T09:00:10Z",
+      "templates": ["release-notes", "changelog"]
+    }
+  ],
+  "status": "active",
+  "startedAt": "2026-10-18T09:00:00Z",
+  "lastActivityAt": "2026-10-18T09:00:10Z",
+  "endedAt": null,
+  "reserved": false
+}

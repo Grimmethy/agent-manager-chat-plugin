@@ -25,6 +25,11 @@
 import * as smd from "./vendor/smd.js";
 import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
   formatTerminalRow, orderTerminalSessions, applyTerminalEvent } from "./sessions-view.js";
+// HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
+// (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
+// split. providerLabel drives the header label, swapOptions builds the Swap menu,
+// swapBody builds each POST body, offerText renders the failed-turn one-click offer.
+import { providerLabel, swapOptions, offerText, swapBody } from "./swap-view.js";
 
 let toastHideTimer = null;
 
@@ -121,6 +126,17 @@ function providerButtonLabel(provider) {
   return provider === 'claude' ? 'Claude' : 'Local';
 }
 
+// Menu / offer-button text for one swap option. swap-view.js's swapOptions entries
+// carry a `label`; the failed-turn offer options the route builds (HUB0008 8/11,
+// routes/chat.py) only carry {provider, account?}, so fall back to the account's
+// label, or 'Local model' -- the exact label swap-view.js uses for its own local entry.
+function swapOptionLabel(option) {
+  const o = option || {};
+  if (o.label) return o.label;
+  if (o.provider === 'local') return 'Local model';
+  return o.account || 'Claude';
+}
+
 // One chat: owns its session, its DOM (built inside `root`), its isSending guard and its
 // provider toggle. Every DOM lookup and event listener is scoped to `root` (class
 // selectors, no document-wide ids), so several panes can coexist on one page later.
@@ -154,6 +170,11 @@ class ChatPane {
   <div class="chat-header">
     <div class="chat-switcher-slot"></div>
     <span class="chat-provider-container"></span>
+    <span class="chat-provider-label" hidden></span>
+    <span class="chat-swap-slot">
+      <button type="button" class="secondary chat-swap-btn" hidden>Swap</button>
+      <div class="chat-swap-menu" hidden></div>
+    </span>
     <button type="button" class="secondary chat-reserve-btn" style="display:none" title="Hold the local model exclusively for this conversation until you turn it back off">Reserve</button>
     <button type="button" class="secondary chat-context-log-btn" title="View this session's context log -- a compacted, durable record built from CONTEXT-LOG: blocks at the end of each response, cross-referenced to any task discussed">Log</button>
   </div>
@@ -174,6 +195,13 @@ class ChatPane {
     const q = (sel) => this.root.querySelector(sel);
     this.switcherSlot = q('.chat-switcher-slot');
     this.providerContainer = q('.chat-provider-container');
+    // HUB0008 10/11: header provider label + Swap menu (see syncSwapHeader below).
+    this.providerLabelEl = q('.chat-provider-label');
+    this.swapBtn = q('.chat-swap-btn');
+    this.swapMenu = q('.chat-swap-menu');
+    this.swapOpen = false;
+    this.swapChoices = [];      // current menu/offer entries; data-swap-index points into this
+    this.pendingSwapOffer = null; // failed-turn swapOffer (error event, piece 8), rendered by render()
     this.reserveBtn = q('.chat-reserve-btn');
     this.logBtn = q('.chat-context-log-btn');
     this.logPanel = q('.chat-context-log-panel');
@@ -200,6 +228,12 @@ class ChatPane {
       await this.startNew();
     };
 
+    // HUB0008 10/11: Swap menu button; outside clicks and Escape close it (same
+    // pattern as the session switcher's menu).
+    this.swapBtn.onclick = (e) => { e.stopPropagation(); this.setSwapOpen(!this.swapOpen); };
+    document.addEventListener('click', (e) => { if (this.swapOpen && !this.root.contains(e.target)) this.setSwapOpen(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.swapOpen) this.setSwapOpen(false); });
+
     this.sendBtn.onclick = () => this.send();
     this.input.onkeydown = (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -221,8 +255,16 @@ class ChatPane {
   }
 
   setSession(session) {
+    const prevId = this.sessionId;
     this.session = session;
     this.sessionId = session ? session.id : null;
+    // A DIFFERENT chat was loaded: a pending swap offer or an open Swap menu belong to
+    // the previous chat and must not leak into this one. (Same-id updates -- e.g. the
+    // swap response itself -- keep state; performSwap() clears the offer explicitly.)
+    if (prevId !== this.sessionId) {
+      this.pendingSwapOffer = null;
+      this.setSwapOpen(false);
+    }
     this.onSessionChange(session);
   }
 
@@ -231,6 +273,81 @@ class ChatPane {
     this.providerBtn.dataset.provider = this.providerChoice;
     this.providerBtn.textContent = providerButtonLabel(this.providerChoice);
     this.providerBtn.classList.toggle('provider-toggle-claude', claude);
+  }
+
+  // HUB0008 10/11: the header provider label (swap-view.providerLabel) and the Swap
+  // button's visibility track the loaded session. All decisions -- what the label is,
+  // which entries the menu lists, what each POST body looks like -- live in
+  // static/swap-view.js (piece 9); this method only places them in the DOM. No token
+  // or token path ever touches the client here: the menu entries and the swap body
+  // carry only labels (swapBody), and the accounts endpoint returns public_view only.
+  syncSwapHeader() {
+    const has = !!this.session;
+    this.providerLabelEl.textContent = has ? providerLabel(this.session) : '';
+    this.providerLabelEl.hidden = !has;
+    this.swapBtn.hidden = !has;
+    if (!has) this.setSwapOpen(false);
+  }
+
+  setSwapOpen(open) {
+    this.swapOpen = open;
+    this.swapMenu.hidden = !open;
+    if (open) this.renderSwapMenu();
+  }
+
+  // Builds the Swap menu from GET api/chat/accounts (public_view shape: {accounts:
+  // [{label, host, live}]}) through swap-view.swapOptions, which drops the session's
+  // pinned account and appends the local model (unless the session is already local).
+  async renderSwapMenu() {
+    const session = this.session;
+    if (!session) return;
+    this.swapMenu.innerHTML = '<div class="chat-switcher-empty">Loading accounts&hellip;</div>';
+    let accounts;
+    try {
+      const body = await fetchJson('api/chat/accounts');
+      accounts = Array.isArray(body.accounts) ? body.accounts : [];
+    } catch (e) {
+      this.swapMenu.innerHTML = `<div class="chat-switcher-empty">Could not load accounts: ${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    const options = swapOptions(accounts, session);
+    this.swapChoices = options;
+    this.swapMenu.innerHTML = options.length
+      ? options.map((o, i) =>
+        `<div class="chat-switcher-row" role="option" data-swap-index="${i}">
+           <span class="chat-switcher-main"><span class="chat-switcher-title">${escapeHtml(swapOptionLabel(o))}</span></span>
+         </div>`).join('')
+      : '<div class="chat-switcher-empty">Nothing else to switch to.</div>';
+  }
+
+  // Performs the swap -- the ONE code path shared by a Swap-menu entry and a
+  // one-click offer button. POSTs api/chat/<id>/swap with swapBody(option) (piece 7's
+  // route validates the account label server-side and returns the updated session
+  // with its new marker row in the transcript); setSession + render show it.
+  async performSwap(option) {
+    const session = this.session;
+    if (!session) return;
+    if (this.isSending) {
+      showToast('Wait for the current reply to finish before switching model.', 'info');
+      return;
+    }
+    this.setSwapOpen(false);
+    this.swapBtn.disabled = true;
+    try {
+      const resp = await fetch(`api/chat/${encodeURIComponent(session.id)}/swap`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(swapBody(option)),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
+      this.pendingSwapOffer = null; // the swap succeeded; the offer is stale now
+      this.setSession(body);       // updated session -- the marker row renders with it
+    } catch (e) {
+      showToast('Could not switch model: ' + e.message);
+    } finally {
+      this.swapBtn.disabled = false;
+    }
+    this.render();
   }
 
   // Fetches the pane's CURRENT session (by remembered id), falling back to the most
@@ -287,6 +404,16 @@ class ChatPane {
   }
 
   async onRootClick(e) {
+    // HUB0008 10/11: Swap-menu entries and one-click offer buttons both resolve to a
+    // data-swap-index into this.swapChoices and share performSwap (same POST body path
+    // as the header menu). Checked before the template-card handler below.
+    const swapEl = e.target.closest &&
+      (e.target.closest('.chat-swap-menu [data-swap-index]') || e.target.closest('.chat-swap-offer-btn'));
+    if (swapEl) {
+      const option = this.swapChoices[Number(swapEl.dataset.swapIndex)];
+      if (option) { this.setSwapOpen(false); this.performSwap(option); }
+      return;
+    }
     const btn = e.target.closest && e.target.closest('.tpl-save');
     if (!btn || !this.session || !this.root.contains(btn)) return;
     const card = btn.closest('.tpl-card');
@@ -357,6 +484,7 @@ class ChatPane {
     const message = this.input.value.trim();
     if (!message || !this.session) return;
     const session = this.session; // a mid-stream switch is blocked, but never write into another chat
+    this.pendingSwapOffer = null; // a new turn supersedes any previous failed-turn offer
     this.isSending = true;
     this.input.value = '';
     this.input.disabled = true;
@@ -419,6 +547,11 @@ class ChatPane {
             finalSession = evt.session;
           } else if (evt.type === 'error') {
             streamErr = evt.error;
+            // HUB0008 10/11: a failed CLAUDE turn classified as a limit error carries
+            // swapOffer {kind, options} on the SAME error event (routes/chat.py, piece
+            // 8). Hold it so render() shows the one-click offer; absent on every other
+            // error (local turns, unclassified) -- then nothing extra is rendered.
+            this.pendingSwapOffer = evt.swapOffer || null;
           }
         }
       }
@@ -474,6 +607,7 @@ class ChatPane {
 
   render() {
     const session = this.session;
+    this.syncSwapHeader();
     if (session && session.provider && this.providerChoice !== session.provider) {
       this.providerChoice = session.provider;
       this.syncProviderToggle();
@@ -492,6 +626,30 @@ class ChatPane {
     this.transcriptEl.innerHTML = session && session.transcript.length
       ? chatRenderTranscript(session.transcript, session)
       : '<div class="empty">Say something to the chat.</div>';
+    // HUB0008 10/11: the failed-turn one-click swap offer. offerText (swap-view, piece 9)
+    // decides whether there is anything to offer at all -- null/missing offer, unknown
+    // kind or an empty options list all yield '' and we render NOTHING extra. When it
+    // speaks, one button per option, each wired (via onRootClick) to the same
+    // performSwap POST as the header Swap menu. Appended INSIDE the transcript scroll
+    // box when one exists so it scrolls with the failed turn.
+    if (this.pendingSwapOffer) {
+      const offer = this.pendingSwapOffer;
+      const text = offerText(offer);
+      const options = Array.isArray(offer.options) ? offer.options : [];
+      if (text && options.length) {
+        this.swapChoices = options;
+        const html =
+          `<div class="chat-swap-offer">` +
+          `<div class="chat-swap-offer-text">${escapeHtml(text)}</div>` +
+          `<div class="chat-swap-offer-actions">` +
+          options.map((o, i) =>
+            `<button type="button" class="secondary chat-swap-offer-btn" data-swap-index="${i}">` +
+            `Switch to ${escapeHtml(swapOptionLabel(o))}</button>`).join('') +
+          `</div></div>`;
+        const target = this.transcriptEl.querySelector('.chat-transcript') || this.transcriptEl;
+        target.insertAdjacentHTML('beforeend', html);
+      }
+    }
     const scrollBox = this.transcriptEl.querySelector('.chat-transcript');
     if (scrollBox) scrollBox.scrollTop = scrollBox.scrollHeight;
   }
