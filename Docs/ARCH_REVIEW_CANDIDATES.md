@@ -805,3 +805,16 @@ Align `open_events`'s error handling with `list_all`'s pattern: catch the specif
 
 Benefits:
 Operators and on-call engineers can immediately identify the failing host and the nature of the failure from the log line, reducing mean-time-to-diagnosis. The caller receives a consistent error contract across both functions, making it safe to write a single error-handling path. Removing the silent context loss eliminates a class of "works in dev, unexplained failure in prod" tickets.
+
+### AC-61 · `save_template` bakes a two-step get-then-add protocol into the save path, entangling the "never overwrite" guarantee with its mechanism
+Strength: Worth exploring
+Files: template_store.py
+
+Problem:
+`save_template` enforces its "never overwrite" contract by issuing two sequential `requests.post` calls to the same `/api/entry` endpoint — first an `action: "get"` to read the current value, then an `action: "add"` to write. This creates two coupled frictions: (a) the atomicity of the no-overwrite guarantee depends on an unstated single-writer assumption, because there is a TOCTOU window between the two HTTP calls during which another actor (a concurrent chat session, a shared entry store, or the app's own "add entry" box) can create the key; and (b) the two-step get-then-add protocol is hard-coded into the function body rather than being a property of the target app's API, so if a future kind's target exposes a single atomic "add-if-absent" endpoint, the module cannot use it without restructuring `save_template`. The "never overwrite" guarantee and the "how to save" mechanism are entangled in one place, and the concurrency assumption is implicit rather than named.
+
+Solution:
+Introduce a private helper, e.g. `_save_if_absent(base_url, target, key, value)`, that owns the two-step protocol and returns a normalized outcome (saved / already-exists / refused / unreachable). `save_template` calls this helper instead of inlining the two `requests.post` calls. The public signature of `save_template` and the shape of its result dict are unchanged, so `save_proposal` and the existing tests remain untouched. The helper becomes the single place where the "never overwrite" guarantee is implemented and where the concurrency assumption is documented. If a target app later offers an atomic add-if-absent endpoint, a per-kind flag in the KINDS registry can select the atomic path, and only `_save_if_absent` changes.
+
+Benefits:
+The "never overwrite" guarantee is localized to one function, making the concurrency assumption explicit and auditable in a single place rather than scattered across the body of `save_template`. The save mechanism (two-step vs. atomic) becomes swappable per-kind without touching validation, the result-dict contract, or the caller (`save_proposal`). The TOCTOU window still exists (it is a property of the target app's API, not something this module can fully remove), but it is now named and contained, so a future maintainer can see exactly where the assumption lives and add a server-side atomic path when a target app supports one.
