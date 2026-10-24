@@ -818,3 +818,14 @@ Introduce a private helper, e.g. `_save_if_absent(base_url, target, key, value)`
 
 Benefits:
 The "never overwrite" guarantee is localized to one function, making the concurrency assumption explicit and auditable in a single place rather than scattered across the body of `save_template`. The save mechanism (two-step vs. atomic) becomes swappable per-kind without touching validation, the result-dict contract, or the caller (`save_proposal`). The TOCTOU window still exists (it is a property of the target app's API, not something this module can fully remove), but it is now named and contained, so a future maintainer can see exactly where the assumption lives and add a server-side atomic path when a target app supports one.
+
+### AC-62 · Status-word mapping in `static/sessions-view.js`
+Strength: No issue found
+Files: static/sessions-view.js
+
+Assessment:
+The module defines two status-word helpers: `statusWord(row)` maps the boolean `row.busy` to `'Busy'`/`'Idle'` for chat-session rows, and `terminalStatusWord(status)` maps the string `row.status` through the `STATUS_WORDS` constant to `'Busy'`/`'Waiting'`/`'Idle'` for terminal-session rows. These are **not** two encodings of the same concept that must be kept in sync. They operate on different data shapes (boolean vs. string), different state spaces (two states vs. three), and different domains (chat sessions have no `waiting` state; terminal sessions do). The `waiting` state is a legitimate, domain-specific terminal concept, not an orphan or a synchronization hazard.
+
+Because the two functions serve independent domains with independent vocabularies, there is no single source of truth to unify and no risk of them drifting out of sync. Renaming `Busy` in the chat context is a one-line edit to `statusWord`; renaming it in the terminal context is a one-line edit to `STATUS_WORDS`. A hypothetical global rename across both is a trivial find-and-replace, not an architectural defect.
+
+No change is warranted. The existing separation is appropriate.
