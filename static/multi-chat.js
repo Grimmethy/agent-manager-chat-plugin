@@ -114,6 +114,82 @@ export function layoutForWidth(state, activeId, width, breakpoint = 760) {
   return { preset: '1', panes: keep === undefined ? [] : [keep] };
 }
 
+// Layout templates (HUB0010 6/10): named {preset, count} recipes. Plain data in, plain data
+// out; nothing here touches storage or the DOM, and no input is ever mutated.
+function slotsFor(preset) {
+  return preset === '2col' ? 2 : preset === '2x2' ? 4 : 1;
+}
+
+function idsOf(list) {
+  return Array.isArray(list) ? list.filter((p) => typeof p === 'string' && p.length > 0) : [];
+}
+
+function copyTemplates(templates) {
+  const out = {};
+  for (const name of Object.keys(templates)) out[name] = { preset: templates[name].preset, count: templates[name].count };
+  return out;
+}
+
+export const DEFAULT_TEMPLATES = {
+  'driver + 2 workers': { preset: '2x2', count: 3 },
+  'monitor grid': { preset: '2x2', count: 4 },
+};
+
+function ownTemplate(templates, name) {
+  if (!templates || typeof templates !== 'object' || !Object.prototype.hasOwnProperty.call(templates, name)) return null;
+  const t = templates[name];
+  return t && PRESETS.includes(t.preset) ? t : null;
+}
+
+// A NEW templates object with `name` set to the preset and pane count of `state`.
+export function saveTemplate(templates, name, state) {
+  const out = copyTemplates(templates && typeof templates === 'object' ? templates : {});
+  out[name] = { preset: state.preset, count: Array.isArray(state.panes) ? state.panes.length : 0 };
+  return out;
+}
+
+// A NEW state with the template's preset: panes come from state.panes first, then from
+// `openIdList` (ids not already used), up to the template's count (capped at the preset's
+// slot count), and null placeholders pad it to the slot count. An unknown name (or a
+// template with a bad preset) returns `state` unchanged.
+export function applyTemplate(templates, name, state, openIdList) {
+  const t = ownTemplate(templates, name);
+  if (!t) return state;
+  const slots = slotsFor(t.preset);
+  const want = Math.min(Number.isInteger(t.count) && t.count > 0 ? t.count : 0, slots);
+  const panes = [];
+  for (const id of idsOf(state && state.panes).concat(idsOf(openIdList))) {
+    if (panes.length >= want) break;
+    if (!panes.includes(id)) panes.push(id);
+  }
+  while (panes.length < slots) panes.push(null);
+  return { preset: t.preset, panes };
+}
+
+export function serializeTemplates(templates) {
+  return JSON.stringify(templates && typeof templates === 'object' ? templates : {});
+}
+
+// Malformed JSON, or anything that is not a plain object, gives a copy of DEFAULT_TEMPLATES.
+// Entries with an unknown preset, or a count that is not a whole number >= 0, are dropped.
+export function deserializeTemplates(json) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(json);
+  } catch (e) {
+    return copyTemplates(DEFAULT_TEMPLATES);
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return copyTemplates(DEFAULT_TEMPLATES);
+  const out = {};
+  for (const name of Object.keys(parsed)) {
+    const t = parsed[name];
+    if (t && PRESETS.includes(t.preset) && Number.isInteger(t.count) && t.count >= 0) {
+      out[name] = { preset: t.preset, count: t.count };
+    }
+  }
+  return out;
+}
+
 // ============================================================================
 // Browser-only adapter. Node imports of this module stop at the guard above.
 // ============================================================================
