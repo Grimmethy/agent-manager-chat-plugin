@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import app  # noqa: E402
 import chat_sessions  # noqa: E402
 import template_store  # noqa: E402
+import driven  # noqa: E402
+import drive_log  # noqa: E402
 
 SID = "chat-route-test"
 
@@ -265,6 +267,115 @@ class SessionListAndCloseRouteTest(RouteTestBase):
         self.assertIn("chat-1-aaaaaaaa", ids)
         self.assertIn("chat-2-bbbbbbbb", ids)
         self.assertEqual(self.client.get("/api/chat/active").get_json()["id"], new_id)
+
+
+class DrivenMessageRouteTest(RouteTestBase):
+    """HUB0015 2/2: the optional `from` + `link` pair on /api/chat/<id>/message
+    (routes/chat.py api_chat_message) routes the hop through driven.admit() and,
+    only on admission, drive_log.append() before the turn runs. Both boundaries are
+    mocked (MagicMock via patch.object) so no drive_links state is needed and the
+    'refusals are never logged' invariant is asserted on the log mock itself."""
+
+    DRIVER = "driver-chat"
+    LINK = "drive-link-1"
+
+    def _post(self, body):
+        return self.client.post(f"/api/chat/{SID}/message", json=body)
+
+    def test_admitted_driven_message_is_tagged_and_logged(self):
+        self._store([])
+        with mock.patch.object(driven, "admit",
+                               return_value={"ok": True, "reason": "ok"}) as admit, \
+                mock.patch.object(drive_log, "append",
+                                  return_value={"time": "t", "from": self.DRIVER,
+                                                "to": SID, "text": "hi"}) as log:
+            def driven_stream(storage_dir, session_id, message, driven_by=None):
+                yield {"type": "final", "session": {"id": session_id, "drivenBy": driven_by}}
+
+            with mock.patch.object(chat_sessions, "stream_message", driven_stream):
+                resp = self._post({"message": "hi", "from": self.DRIVER, "link": self.LINK})
+
+        self.assertEqual(resp.status_code, 200)
+        admit.assert_called_once_with(self.storage, self.LINK, self.DRIVER, SID)
+        log.assert_called_once_with(self.storage, self.DRIVER, SID, "hi")
+        events = [json.loads(line[len("data: "):]) for line in resp.get_data(as_text=True).splitlines()
+                  if line.startswith("data: ")]
+        self.assertEqual(events[-1]["session"]["drivenBy"], self.DRIVER)  # the user turn is tagged
+
+    def test_budget_exhaustion_is_429_and_never_logged(self):
+        self._store([])
+        with mock.patch.object(driven, "admit",
+                               return_value={"ok": False, "reason": "budget"}) as admit, \
+                mock.patch.object(drive_log, "append") as log:
+            resp = self._post({"message": "hi", "from": self.DRIVER, "link": self.LINK})
+
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(resp.get_json(), {"error": "drive refused", "reason": "budget"})
+        admit.assert_called_once()
+        log.assert_not_called()  # a refused hop is never in the audit log
+
+    def test_stopped_link_is_403_and_never_logged(self):
+        self._store([])
+        with mock.patch.object(driven, "admit",
+                               return_value={"ok": False, "reason": "stopped"}) as admit, \
+                mock.patch.object(drive_log, "append") as log:
+            resp = self._post({"message": "hi", "from": self.DRIVER, "link": self.LINK})
+
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.get_json(), {"error": "drive refused", "reason": "stopped"})
+        admit.assert_called_once()
+        log.assert_not_called()
+
+    def test_mismatch_is_403_and_never_logged(self):
+        self._store([])
+        with mock.patch.object(driven, "admit",
+                               return_value={"ok": False, "reason": "mismatch"}) as admit, \
+                mock.patch.object(drive_log, "append") as log:
+            resp = self._post({"message": "hi", "from": self.DRIVER, "link": self.LINK})
+
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.get_json(), {"error": "drive refused", "reason": "mismatch"})
+        admit.assert_called_once()
+        log.assert_not_called()
+
+    def test_from_without_link_is_400_and_admit_never_called(self):
+        self._store([])
+        with mock.patch.object(driven, "admit") as admit, \
+                mock.patch.object(drive_log, "append") as log:
+            resp = self._post({"message": "hi", "from": self.DRIVER})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("from and link must both be present or both absent", resp.get_data(as_text=True))
+        admit.assert_not_called()
+        log.assert_not_called()
+
+    def test_link_without_from_is_400_and_admit_never_called(self):
+        self._store([])
+        with mock.patch.object(driven, "admit") as admit, \
+                mock.patch.object(drive_log, "append") as log:
+            resp = self._post({"message": "hi", "link": self.LINK})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("from and link must both be present or both absent", resp.get_data(as_text=True))
+        admit.assert_not_called()
+        log.assert_not_called()
+
+    def test_normal_message_is_unchanged_and_never_driven(self):
+        self._store([])
+        with mock.patch.object(driven, "admit") as admit, \
+                mock.patch.object(drive_log, "append") as log:
+            def plain_stream(storage_dir, session_id, message):
+                # Exactly 3 positional args -- if the route ever passed driven_by
+                # for a plain message, this would TypeError and the test would fail.
+                yield {"type": "final", "session": {"id": session_id}}
+
+            with mock.patch.object(chat_sessions, "stream_message", plain_stream):
+                resp = self._post({"message": "hello"})
+
+        self.assertEqual(resp.status_code, 200)
+        events = [json.loads(line[len("data: "):]) for line in resp.get_data(as_text=True).splitlines()
+                  if line.startswith("data: ")]
+        self.assertEqual(events, [{"type": "final", "session": {"id": SID}}])
+        admit.assert_not_called()
+        log.assert_not_called()
 
 
 class TerminalSessionsMultiHostRouteTest(unittest.TestCase):
