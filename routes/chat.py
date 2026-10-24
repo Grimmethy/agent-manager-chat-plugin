@@ -234,6 +234,34 @@ def api_chat_message(session_id):
     if not existing or existing.get("status") != "active":
         abort(404)
 
+    # HUB0015 1/2 (chat-to-chat drive hub): an optional `from` + `link` pair in the
+    # body marks this turn as driven by another chat over an active drive link.
+    # Admit it through driven.admit() first (driven.py) and, only on admission, log
+    # the hop with drive_log.append() (drive_log.py) before the turn runs. Both
+    # fields are optional together; exactly one present is a client error. The
+    # imports stay local to this branch so `import routes.chat` stays as cheap as
+    # today, and the both-absent path below runs exactly as it did before.
+    driver = body.get("from")
+    link = body.get("link")
+    has_driver = isinstance(driver, str) and driver != ""
+    has_link = isinstance(link, str) and link != ""
+    if has_driver != has_link:
+        abort(400, description="from and link must both be present or both absent")
+    driven_by = None
+    if has_driver:
+        import driven
+        import drive_log
+        admission = driven.admit(CHAT_STORAGE_DIR, link, driver, session_id)
+        if not admission.get("ok"):
+            reason = admission.get("reason")
+            # Refusal reasons (driven.py): unknown / mismatch / stopped -> 403,
+            # budget / time -> 429. A refused hop is NEVER logged (drive_log is
+            # the audit of admitted hops only).
+            status = 429 if reason in ("budget", "time") else 403
+            return jsonify({"error": "drive refused", "reason": reason}), status
+        drive_log.append(CHAT_STORAGE_DIR, driver, session_id, message)
+        driven_by = driver
+
     # 2026-08-26 (Open WebUI investigation, Grimmethy: "vastly improve the chat
     # system... streaming"): this used to be a single blocking send_message() call
     # returning the whole updated session as one JSON body -- the user stared at nothing
@@ -305,7 +333,14 @@ def api_chat_message(session_id):
         if preempted:
             yield f"data: {json.dumps({'type': 'preempt', 'lanes': preempted})}\n\n"
         try:
-            for event in stream_message(CHAT_STORAGE_DIR, session_id, message):
+            if driven_by is not None:
+                # HUB0015 1/2: a driven turn -- chat_sessions tags the user row with
+                # drivenBy so the transcript records who actually drove the hop.
+                events = stream_message(CHAT_STORAGE_DIR, session_id, message, driven_by=driven_by)
+            else:
+                # The plain path, byte-for-byte as before: no driven_by argument.
+                events = stream_message(CHAT_STORAGE_DIR, session_id, message)
+            for event in events:
                 yield f"data: {json.dumps(event)}\n\n"
         except (ClaudeClientError, LocalToolClientError) as e:
             yield fail(str(e))
