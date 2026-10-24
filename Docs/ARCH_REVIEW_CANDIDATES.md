@@ -779,3 +779,29 @@ Benefits:
 The documented fail-open resilience is fully preserved—the system still degrades gracefully and a Chat turn still has a root path to work with. Operators gain an immediate, self-explanatory signal that the configuration is not ideal, turning a silent, machine-specific assumption into a visible, actionable warning. When the fallback directory does not exist, the operator has already seen the warning and can diagnose the missing directory rather than encountering an opaque `FileNotFoundError` deep in a subprocess call. The error-handling philosophy is aligned: the system does not crash, but it does not hide the degraded state either.
 
 NOTE: Flag #3 was not applied because it explicitly states the issue is "not a problem" and requires no change. Flag #4 was addressed by removing the "or in `app.py`" alternative from AC-001's solution and committing to `node_utils.py`, which is consistent with AC-002's decoupling goal.
+
+### AC-59 · Redundant and divergent token-resolution logic
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+Both `list_all` and `open_events` independently read the token from the `agent_hosts` object and construct the `Authorization` header with identical inline logic. In addition, the module defines a `_headers()` helper that reads the token from `os.environ` rather than from the host object, creating a third, inconsistent code path that is currently unused by the main functions. This duplication means any future change to token handling (e.g., adding a refresh step, switching to a different credential source, or adding a scope parameter) must be applied in two or three places, and the divergent `_headers()` helper is a latent trap for a developer who assumes it is the canonical helper.
+
+Solution:
+Extract a single private helper, e.g. `_auth_headers(host)`, that reads the token from the `agent_hosts` object and returns a fully-populated headers dict (or an empty dict when no token is present). Replace the inline token logic in both `list_all` and `open_events` with a call to this helper, and remove the unused `_headers()` function (or, if it is intentionally kept for a different credential source, rename it clearly and document why it differs).
+
+Benefits:
+Token handling lives in exactly one place, eliminating the risk of the two call sites drifting apart. Removing the inconsistent, unused helper reduces cognitive load and prevents a future caller from accidentally using the environment-variable path. Any future change to authentication (rotation, multi-tenant tokens, etc.) is a one-line edit.
+
+### AC-60 · Inconsistent error handling and logging between `list_all` and `open_events`
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+`list_all` catches connection and JSON errors, logs a warning that includes the exception class name, and appends a structured `skipped` entry so the caller can see which host failed and why. `open_events`, by contrast, catches `requests.RequestException`, logs nothing, and raises a generic `AgentError` with a static message that omits the host name and the underlying exception type. A failure to connect to the SSE stream is therefore significantly harder to diagnose: the operator sees only a bare "agent error" with no indication of which host was unreachable or whether the failure was a DNS timeout, a TLS handshake error, or a 502 from a proxy.
+
+Solution:
+Align `open_events`'s error handling with `list_all`'s pattern: catch the specific exception, log a warning that includes the host identifier and the exception class (and ideally a short message), and then raise `AgentError` with a message that embeds the host name and the original exception's `str()`. Alternatively, if the design intent is for `open_events` to be retryable by the caller, let the original exception propagate (or wrap it in a typed `AgentConnectionError`) so the caller can distinguish transient from permanent failures.
+
+Benefits:
+Operators and on-call engineers can immediately identify the failing host and the nature of the failure from the log line, reducing mean-time-to-diagnosis. The caller receives a consistent error contract across both functions, making it safe to write a single error-handling path. Removing the silent context loss eliminates a class of "works in dev, unexplained failure in prod" tickets.
