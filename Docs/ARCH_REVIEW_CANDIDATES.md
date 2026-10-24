@@ -1026,3 +1026,44 @@ Marginal: one fewer copy of a three-line pattern to update if the match key ever
 ---
 
 *AC-001 from the prior draft has been removed.* Its central claim—that `agent_client._headers()` is dead code "never called anywhere in the community"—is incorrect: the function is invoked by `app.py` on the singular-config path (exercised by `test_wrong_token_is_unreachable_not_an_error`), and in that path the global token is correctly scoped to the single configured host, so the "wrong credential to the wrong host" hazard does not materialise. The proposed solution (delete `_headers()`, re-source the token exclusively through `agent_hosts.read_token`) would break the `app.py` caller without specifying how it would obtain the Authorization header, making the fix internally inconsistent. The residual observation (two modules each call `os.environ.get` for the same variable) is a one-liner idiom that does not rise to a "Strong" finding.
+
+### AC-77 · Centralize the "plain transcript row" predicate across handoff and chat_sessions
+Strength: Worth exploring
+Files: handoff.py, chat_sessions.py
+
+Problem:
+The predicate that identifies a valid, non-error, non-marker transcript row is implemented independently in two modules. `handoff.py` defines `_is_plain_row()` to check for the absence of `error` and `marker` keys. The review notes that `chat_sessions.py` (specifically the logic within `_build_local_messages`) re-implements this same two-skip logic inline. Because the definition of a "plain row" is scattered, any future change to the transcript schema (for example, introducing a new system-row type that must be skipped) requires a synchronized edit in both files. This violates DRY and creates a tight, implicit coupling between the two modules: a developer updating one side may overlook the other, leading to silent divergence in which rows are processed.
+
+Solution:
+Extract the row-filtering logic into a single shared utility function (e.g., `is_plain_transcript_row(row)`) placed in a common module such as `handoff.py` or a new `transcript_utils.py`. Both `handoff.py` and `chat_sessions.py` then import and call this one function to decide which rows to process. The concept of a "plain row" gains a single, named home, and the two call sites become thin consumers of a well-defined contract.
+
+Benefits:
+A change to the transcript schema is made in exactly one place, eliminating the risk of the two implementations drifting apart. The named function makes the intent at each call site immediately readable. Maintenance cost drops because there is no longer a second, implicit copy of the skip-logic to keep in sync.
+
+### AC-78 · Decouple model_stats_client from the app entry-point module
+Strength: Strong
+Files: model_stats_client.py, app.py
+
+Problem:
+`model_stats_client.py` performs a module-level import of `CORE_REPO_ROOT` from `app.py` (`from app import CORE_REPO_ROOT`). This inverts the expected layering: a low-level client module depends on the high-level application entry point. This coupling means `model_stats_client.py` cannot be imported, unit-tested, or reused in a different context without pulling in the entire `app` module and its side effects. Furthermore, if `app.py` ever imports `model_stats_client.py` directly or transitively (a common pattern in Flask apps where the app module initializes clients), the result is a circular-import error at startup. Even without a present-day cycle, the dependency direction is inverted and fragile.
+
+Solution:
+Move the `CORE_REPO_ROOT` constant into a small, dependency-free configuration module (e.g., `config.py` or `paths.py`). Both `app.py` and `model_stats_client.py` then import `CORE_REPO_ROOT` from that shared module. The client no longer depends on the application entry point, restoring a clean dependency direction (client → config, app → config).
+
+Benefits:
+The potential for circular-import hazards is removed. `model_stats_client.py` becomes independently importable and testable without loading the Flask application. The configuration concern is isolated in one place, making it straightforward to override or parameterize in tests.
+
+### AC-79 · Standardize Ollama client error handling to prevent silent or unhandled failures
+Strength: Worth exploring
+Files: ollama_client.py
+
+Problem:
+The `generate()` function in `ollama_client.py` issues an HTTP request via `urllib.request.urlopen` and parses the response with `json.loads`, but does not wrap these calls in explicit exception handling for `urllib.error.URLError`, `json.JSONDecodeError`, or `OSError`. If the Ollama server is unreachable, times out, or returns malformed JSON, the exception propagates uncaught to the caller. In a standard Flask application, this results in a 500 Internal Server Error response, which is a "loud" failure but provides no structured context to the frontend or logging system. More critically, the existing caller code in `chat_sessions.py` (and its test mocks) expects `generate` to return a dictionary containing a `"response"` key. Currently, if an exception is raised, the caller crashes with a `500` error. If the caller is modified to handle errors gracefully, it currently lacks a standardized contract to check against.
+
+Solution:
+Wrap the `urlopen` and `json.loads` calls in a `try-except` block that catches `urllib.error.URLError`, `json.JSONDecodeError`, and `OSError`. On failure, log the exception via the `logging` module and return a standardized error dictionary (e.g., `{"error": "Ollama request failed", "details": str(exc)}`). **Crucially, this change must be accompanied by an update to the caller logic in `chat_sessions.py` (specifically `_send_claude` or equivalent) to explicitly check for the `"error"` key before accessing `"response"`.** Without this caller-side update, the new return contract will cause a `KeyError` or `TypeError` when the caller attempts to access `data["response"]` on an error payload.
+
+Benefits:
+The client presents a uniform error contract that callers can rely on, matching the defensive posture of `model_stats_client.py`. Logged details make it straightforward to diagnose connectivity or server-side issues. By explicitly updating the caller to handle the `"error"` key, the system degrades gracefully (showing a user-facing message) rather than failing with an opaque 500 error or an unhandled exception.
+
+NOTE: Flag 3 was not applied to AC-001 or AC-002 because the critique acknowledges that the core problem descriptions (duplicated logic in AC-001, inverted dependency in AC-002) are valid refactoring targets even if the specific file contents were not fully provided in the input; the flags regarding "unverifiable" content do not invalidate the architectural issues identified, and the draft's solution remains the correct architectural response to the described coupling.
