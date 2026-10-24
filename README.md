@@ -133,3 +133,21 @@ environment. The session switcher then
 gets a read-only "Terminal sessions" group (status, timer, current step, context size) fed by
 `GET api/chat/terminal-sessions` and the SSE passthrough `GET api/chat/terminal-sessions/events`
 (the token stays server-side). Unset URL = feature off; agent down = "Session agent unreachable".
+
+## Model swap (multi-chat)
+
+A live chat can change the model behind it without losing the conversation. Nothing here is checked against a real swap yet; see the `Model swap (manual)` section of `VERIFY.md`.
+
+**Session fields and `schemaVersion` 2.** Each chat records its `provider`, `model` and `account`, plus `swaps` (one `{at, from, to}` entry per swap) and `summary`. `SCHEMA_VERSION` is 2. An older chat without those fields is upgraded automatically the next time it is written (`_migrate_session`): the four new fields get defaults and nothing else changes. The migration is lossless and the transcript is never touched.
+
+**`POST /api/chat/<id>/swap`.** The body is `{provider: 'local' | 'claude', model?, account?}`. For `claude`, `account` must be a label from the accounts registry; leave it out to follow the live account. For `local` any `account` is ignored. An unknown or inactive chat answers 404, a bad provider or an unknown account answers 400. A swap keeps every transcript row, appends one marker row and one `swaps` entry, and always resets `claudeSessionId` to `None`: a Claude CLI session is not assumed resumable after a swap, so the new side gets its history from the transcript. If the chat holds the local reservation and the target is not local, the reservation is released first, the same way `/reserve` releases it. The response is the updated session and never a token or `tokenFile`.
+
+**Hand-off.** On the first Claude turn after a swap, `handoff.build_handoff` prepends a hand-off: a header, the stored local summary if there is one, the last `CHAT_RECENT_TURNS_KEPT` plain rows verbatim (oldest first), and a line saying how many earlier rows are not included. The original rows are never removed or edited. When the transcript would overflow the target provider's window (`handoff.needs_summary`), the swap also asks the local model for a summary of the older rows (`summarize_older`); a summarizer error is logged and the swap carries on with the verbatim hand-off.
+
+**New environment variables.** `AGENT_MANAGER_CHAT_CLAUDE_WINDOW_TOKENS` (default 200000) and `AGENT_MANAGER_CHAT_LOCAL_WINDOW_TOKENS` (default 16384) set the context window `handoff.window_tokens` uses per provider. A value that is not a positive integer falls back to the default. Token counts are a coarse estimate (characters / 4), only good enough to decide whether a summary is needed.
+
+**A swap to local never takes the GPU.** Only the existing `/reserve` flow acquires the local reservation; `POST /api/chat/<id>/swap` with `provider: 'local'` never does.
+
+**Account tokens.** The `token_file` argument of `claude_client` names a 0600 file holding an account's OAuth token. It is read at call time and passed only in the environment of the child process as `CLAUDE_CODE_OAUTH_TOKEN`; `os.environ`, the request JSON and log lines never see it. An unreadable or empty file raises `ClaudeClientError` with a fixed message that names neither the path nor any content.
+
+**Limit-error classifier (phrases are ASSUMED).** `limit_errors.classify` recognizes a usage limit by the phrases `usage limit` or `limit reached`, and a rate limit by `429`, `rate limit` or `rate_limit`. No real limit-error text has been recorded, so these phrases are assumptions. A failed Claude turn that matches gets a `swapOffer` on its error event, and `record_sample` appends the error text to `limit-error-samples.jsonl` in the storage directory (mode 0600). **Owner step:** after the first real limit, open `limit-error-samples.jsonl` and send the shapes, so the phrases can be replaced with real ones.
