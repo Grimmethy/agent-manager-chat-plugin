@@ -161,3 +161,6 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 
 /* HUB0017: host badge on terminal rows */
 .terminal-row-host-badge { display: inline-block; padding: 1px 6px; margin-left: 6px; font-size: 0.75em; font-weight: 600; line-height: 1.4; color: var(--text, #e0e0e0); background: var(--panel, #3a3a4a); border-radius: 4px; vertical-align: baseline; white-space: nowrap; }
+
+/* phone width (HUB0010 5/10): multi-chat.js sets [hidden] on the preset toolbar below 760px; its own display:flex would otherwise win */
+.multi-chat-toolbar[hidden] { display: none; }

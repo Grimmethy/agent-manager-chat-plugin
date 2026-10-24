@@ -154,9 +154,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '.multi-chat-pane.wide, .multi-chat-placeholder.wide { flex-basis:100%; }' +
       '.multi-chat-pane-head { display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:4px 8px 0; }' +
       '.multi-chat-pane-body { flex:1; min-height:0; }' +
-      '.multi-chat-placeholder { border:2px dashed var(--border,#ccc); border-radius:8px; align-items:center; justify-content:center; background:transparent; }' +
-      '.multi-chat-mobile-bar { display:flex; align-items:center; gap:8px; padding:8px 12px; }' +
-      '.multi-chat-mobile-bar select { flex:1; min-width:0; }';
+      '.multi-chat-placeholder { border:2px dashed var(--border,#ccc); border-radius:8px; align-items:center; justify-content:center; background:transparent; }';
     document.head.appendChild(style);
   }
 
@@ -313,12 +311,18 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function render() {
       host.innerHTML = ''; // unmounts every previous pane's DOM -- no network
       markPreset();
-      const wide = state.preset === '1';
-      const mounted = mountedSet(state, activeId);
+      // HUB0010 5/10: below the breakpoint what is rendered is layoutForWidth's
+      // single-pane view of the layout. `state` (and the saved layout) keeps the wide
+      // layout, so widening the window brings it back; render never saves.
+      const mobile = isMobile();
+      const view = mobile ? layoutForWidth(state, activeId, window.innerWidth || 1024, MOBILE_MAX_WIDTH) : state;
+      toolbar.hidden = mobile; // phone width: the chat's own switcher is the navigation
+      const wide = view.preset === '1';
+      const mounted = mountedSet(view, activeId);
 
       // Open panes in recency order, each with a live ChatPane when it is in the
       // mount pool (active + two most recent); otherwise a "open" placeholder.
-      const open = state.panes.map((id) => {
+      const open = view.panes.map((id) => {
         if (id === null) return null;
         if (!mounted.has(id)) {
           return { id, placeholder: true, nodes: null };
@@ -326,29 +330,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         return { id, placeholder: false, nodes: null };
       }).filter(Boolean);
 
-      if (isMobile()) {
-        // Narrow viewport: one group with a switcher, per the design rule.
-        const bar = document.createElement('div');
-        bar.className = 'multi-chat-mobile-bar';
-        const select = document.createElement('select');
-        bar.appendChild(select);
-        for (const o of open) {
-          const opt = document.createElement('option');
-          opt.value = o.id;
-          opt.textContent = o.id;
-          if (o.id === activeId) opt.selected = true;
-          select.appendChild(opt);
-        }
-        const newOpt = document.createElement('option');
-        newOpt.value = '__new__';
-        newOpt.textContent = '+ New chat';
-        select.appendChild(newOpt);
-        select.onchange = () => {
-          if (select.value === '__new__') { openNewChat(); return; }
-          activeId = select.value;
-          render();
-        };
-        host.appendChild(bar);
+      if (mobile) {
+        // Narrow viewport: one pane; the switcher inside it is the only navigation.
         const target = open.find((o) => o.id === activeId) || open[0];
         if (!target) {
           host.appendChild(placeholder('+ New chat', openNewChat, true));
@@ -432,14 +415,19 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     // Re-render only when crossing the 760px boundary (a plain resize must not
-    // throw away in-flight pane state).
+    // throw away in-flight pane state); debounced 150 ms so a drag settles first.
     let lastMobile = isMobile();
+    let resizeTimer = null;
     window.addEventListener('resize', () => {
-      const mobile = isMobile();
-      if (mobile !== lastMobile) {
-        lastMobile = mobile;
-        render();
-      }
+      if (resizeTimer !== null) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        resizeTimer = null;
+        const mobile = isMobile();
+        if (mobile !== lastMobile) {
+          lastMobile = mobile;
+          render();
+        }
+      }, 150);
     });
 
     import('./chat.js')

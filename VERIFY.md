@@ -100,3 +100,13 @@ Manual browser checks (the decision itself, `shouldChime`, is unit-tested; the s
 2. **Saved setting.** Ticking the box stores `chat-chime` = `1` in localStorage; after a reload it is still ticked, and unticking stores `0`. With storage blocked the page still works and the box just resets on reload. (never checked)
 3. **One short beep.** With the box ticked, a session newly turning `waiting` that is not on screen plays one short beep (about 0.2 s); a session already waiting does not repeat it. (never checked)
 4. **Silent when on screen.** In the multi-pane layout a newly waiting chat that is mounted in a pane does not chime. Terminal sessions never match chat panes, so every newly waiting terminal session chimes while the box is ticked. (never checked)
+
+## Phone width: one pane, the switcher is the navigation (piece 5/10)
+
+Manual browser checks (layoutForWidth itself is unit-tested). None have ever been checked.
+
+1. **Narrow window shows one pane.** With a 2-column or 2x2 layout saved, shrinking the window below 760 px shows only the active chat and the preset buttons (Single / Two columns / Grid 2x2) disappear. (never checked)
+2. **Widening restores the layout.** Widening back to 760 px or more brings the saved wide layout and the preset buttons back, without a reload, and `localStorage` key `chat-workspace-layout` was not changed by the narrow period. (never checked)
+3. **Load at phone width.** Loading the page already narrow shows the single active pane and no preset buttons. (never checked)
+4. **Resize is debounced.** Dragging the window edge across 760 px renders once after the drag settles (about 150 ms), and a plain resize that does not cross 760 px does not reload any pane. (never checked)
+5. **Navigation on a phone.** The session switcher inside the pane can open another chat; the old dropdown above the pane is gone. (never checked)
