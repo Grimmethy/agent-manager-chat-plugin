@@ -41,6 +41,32 @@ session). Please re-check them on your machine; items 4-6 and 8 have never been 
 Also report: the `claude --version`, how many sessions were open, and any `status` or `kind`
 value that is not `busy|idle|waiting` / `interactive`.
 
+## Item 8: read-only inbox-socket investigation (owner step)
+
+READ-ONLY investigation of the inbox socket. Two prohibitions, no exceptions:
+
+- **Nothing is sent into any existing foreground terminal** -- and no bytes are written to the
+  socket by the investigator; the only traffic observed is a message the tool itself sends.
+- `--allow-send` on `session_agent.py` stays **OFF** until the Item 8 answer below is written.
+
+Procedure (one machine, two owner-started sessions, the agent running with its default flags):
+
+1. **Locate the socket.** From the session's registry entry, note `messagingSocketPath` and
+   record its filesystem permissions (`ls -l` on that path).
+2. **Observe a self-sent message.** With two owner-started sessions open, let the tool itself
+   send a message from one session to the other (e.g. an idle notification through the peer
+   channel) and watch it arrive in the receiver's transcript/registry.
+3. **Capture the wire shape.** Record exactly what the tool itself produced: the message
+   envelope (the JSON line(s) the sender wrote, field names and newline framing), the auth
+   line (if any -- and whether a sender that is not a child process needs one), and the
+   acknowledgement (any reply/ack/error line, and whether the connection closes afterwards).
+
+Report shapes only -- no transcript text, tokens, session ids or full paths.
+
+### Item 8 answer
+
+Status: never checked
+
 ## Model swap (manual)
 
 HUB0008 10/11 (header provider label, Swap menu, one-click swap offer). Manual items only
