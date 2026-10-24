@@ -34,7 +34,7 @@ def _enforce_one_live(accounts: list) -> list:
 
 def _save(storage_dir: Path, accounts: list) -> None:
     storage_dir = Path(storage_dir)
-    storage_dir.mkdir(parents=True, exist_ok=True)
+    storage_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(storage_dir, 0o700)
     target = storage_dir / _ACCOUNTS_FILE
     fd, tmp = tempfile.mkstemp(prefix=".accounts.", suffix=".tmp", dir=str(storage_dir))
