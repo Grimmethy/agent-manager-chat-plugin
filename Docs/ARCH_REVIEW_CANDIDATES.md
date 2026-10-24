@@ -699,3 +699,29 @@ Benefits:
 Makes the distinct error-handling contracts of each module explicit and intentional, rather than implicit side-effects of duplicated code. Developers can easily understand and audit why `claude_client.py` fails loudly with specific error messages while `model_stats_client.py` swallows errors and returns `None`. This clarity reduces the risk of accidental divergence or misunderstanding of the modules' behavior, and it preserves the design rationale of each module without introducing unnecessary indirection.
 
 NOTE: Flag 1 was addressed by removing the proposal to introduce `NodeScriptError` and instead preserving `claude_client.py`'s direct use of `ClaudeClientError` with specific stderr text. Flag 2 was addressed by ensuring the `run_node_script` utility does not impose a unified error policy, allowing each module to retain its distinct operational contract.
+
+### AC-53 · Duplicated SSE event-parsing comprehension across test methods
+Strength: Worth exploring
+Files: test_chat_routes.py
+
+Problem:
+The extraction of SSE `data:` lines from a raw HTTP response body is copy-pasted verbatim in two separate test methods (`MessageRouteErrorTest.test_a_crashed_turn_streams_an_error_event_and_persists_an_error_entry` and `SwapOfferErrorTest._post_message`). Both use the identical list comprehension `[json.loads(line[len("data: "):]) for line in body.splitlines() if line.startswith("data: ")]`. Because the logic is not isolated in a shared helper, any future change to the SSE framing convention (e.g., a different prefix, multi-line data payloads, or a `event:` header) would require locating and updating every copy by hand, and a missed copy would silently produce wrong assertions rather than a clear failure.
+
+Solution:
+Introduce a small module-level helper in `test_chat_routes.py` (e.g., `def _parse_sse_events(body: str) -> list[dict]:`) that encapsulates the line-splitting, prefix-stripping, and JSON-decoding steps. Replace both inline comprehensions with calls to this helper. If the SSE contract is already defined elsewhere in the project, the helper can also be the single place where framing assumptions are documented.
+
+Benefits:
+A single source of truth for SSE parsing in the test suite means a framing change is a one-line edit. New tests that need to decode a streamed response can reuse the helper instead of re-deriving the logic, reducing the chance of a subtle mismatch (e.g., off-by-one in the prefix length) going unnoticed.
+
+### AC-54 · `save_proposal` reaches into a hard-coded session sub-path
+Strength: Strong
+Files: template_store.py
+
+Problem:
+`save_proposal` in `template_store.py` navigates directly into `session["transcript"][entry_index]["templates"][tpl_index]` with no intermediate accessor. The function therefore assumes a very specific nested shape of the chat-session object. If the transcript becomes a different container type, templates are relocated to a sibling key, or the index is out of range, the call raises an unhandled `KeyError` or `IndexError` that propagates to the caller with no context about which structural assumption was violated. The template store is thus tightly coupled to one particular session layout, making it fragile to any refactoring of the session model.
+
+Solution:
+Introduce a thin accessor (or a small dataclass / protocol) that the template store depends on instead of the raw session dict. For example, define a `TemplateSlot` protocol with `get_template(entry_index, tpl_index)` and `set_template(entry_index, tpl_index, value)` methods, and have the chat-session object implement it. `save_proposal` then calls through the protocol, and the session object is responsible for validating indices. On failure the accessor should raise `LookupError` (or a subclass thereof) with a descriptive message naming the missing key or out-of-range index—this preserves the existing contract that `test_bad_index_raises` in `test_template_store.py` asserts (`pytest.raises(LookupError)`). The current implementation already catches `IndexError`, `KeyError`, and `TypeError` and re-raises them as `LookupError`; the protocol simply moves that responsibility to the session object so the template store no longer needs to know which sub-path to walk.
+
+Benefits:
+The template store no longer breaks when the session's internal representation changes; only the session object's accessor implementation needs updating. Errors remain `LookupError` (satisfying the existing test suite) but become self-describing (naming the missing key or out-of-range index) rather than bare `KeyError`/`IndexError` traces. The protocol also makes the contract explicit and testable in isolation, and it opens the door to alternative session backends (e.g., a database-backed transcript) without touching template-store code.
