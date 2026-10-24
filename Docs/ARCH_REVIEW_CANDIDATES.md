@@ -738,3 +738,44 @@ Route the sort key in `orderSessions` through the same `Date.parse`-based numeri
 
 Benefits:
 `nextSelectionAfterClose` and any other consumer of `orderSessions` will always agree with `secondsSince` on which timestamp is more recent, eliminating a class of wrong-row-selection bugs that surface whenever session timestamps carry mixed UTC offsets. The fix is localized to the sort comparator and introduces no new API surface.
+
+### AC-56 · Centralize the Node CLI temp-file JSON invocation contract
+Strength: Strong
+Files: claude_client.py, model_stats_client.py, node_utils.py (new)
+
+Problem:
+`claude_client.py` and `model_stats_client.py` each independently implement the identical subprocess pattern: generate a UUID, serialize a JSON payload to a temporary file, invoke a `node` script located under `CORE_REPO_ROOT`, and unlink the file in a `finally` block. This duplication means any change to the temp-file lifecycle—adding a `0600` permission to prevent a local user from reading the payload before deletion, switching from a file-path argument to a stdin pipe, or adding structured logging—must be made in two places with no compiler or test to catch a missed update. The two implementations can silently drift, producing inconsistent behavior or a security gap in one path while the other is patched.
+
+Solution:
+Extract the shared pattern into a single utility function (e.g. `_run_node_cli(script_path, args, payload)`) placed in a new `node_utils.py` module. The function owns temp-file creation, the `subprocess.run` call, and the `unlink` cleanup. `claude_client.py` and `model_stats_client.py` then call this utility, passing only their specific script path and payload. The security hardening (file permissions, timeout enforcement) and any future protocol change (stdin pipe, structured logging) live in exactly one function.
+
+Benefits:
+The temp-file lifecycle is managed in a single location, eliminating the risk of divergent implementations. A protocol change to the Node CLI contract requires editing one function rather than hunting for every call site. Security best practices such as `os.chmod` on the temp file and subprocess timeout enforcement have one canonical home, and the two client modules become thinner, easier to review, and easier to unit-test by mocking a single seam. Placing the utility in a dedicated `node_utils.py` (rather than in `app.py`) keeps it free of Flask application dependencies, consistent with the decoupling goal in AC-002.
+
+### AC-57 · Decouple claude_client.py and model_stats_client.py from app.py's module-level state
+Strength: Strong
+Files: claude_client.py, model_stats_client.py, app.py, .venv/lib/python3.12/site-packages/flask/config.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` import `CORE_REPO_ROOT` directly from `app.py` (`from app import CORE_REPO_ROOT`). This forces the entire Flask application module to be imported—and its module-level side effects (such as `STATE_DIR.mkdir`, Flask app instantiation, and blueprint registration) to execute—before either low-level client can be used. A utility module that merely needs a filesystem path is thereby coupled to the application's initialization sequence, making it impossible to import, test, or reuse these clients in isolation (e.g. in a CLI tool, a test harness, or a different service) without triggering the full Flask app setup.
+
+Solution:
+Move the `CORE_REPO_ROOT` resolution logic into a small, dedicated `config.py` module. This module must encapsulate the *complete* resolution chain that currently lives in `app.py`: reading the `AGENT_MANAGER_CORE_REPO_ROOT` environment variable, applying the documented fail-open fallback to the hardcoded path when the variable is unset, and performing any file-existence checks that the current code performs. `config.py` exposes the resolved path as a module-level constant or a lazily-evaluated property. Both `app.py` and the two client modules import from `config.py` rather than one importing from the other. `app.py` still serves as the Flask entry point and blueprint loader, but the clients no longer depend on it for a configuration value.
+
+Benefits:
+`claude_client.py` and `model_stats_client.py` become standalone, importable modules with no Flask side effects, simplifying unit tests and enabling reuse outside the Flask process. The dependency graph becomes explicit: the clients depend on configuration, not on the application. It also removes the implicit requirement that `app.py`'s module-level code (directory creation, Flask app instantiation, blueprint registration) must succeed before any client function can be called, reducing the blast radius of a misconfigured environment. Because the full resolution logic (including the fail-open fallback) is preserved in `config.py`, the documented resilience contract is unchanged.
+
+### AC-58 · Make the fail-open CORE_REPO_ROOT fallback visible to operators
+Strength: Worth exploring
+Files: app.py (or config.py, per AC-002), claude_client.py, model_stats_client.py
+
+Problem:
+`app.py` defines `CORE_REPO_ROOT` with a hardcoded fallback path (`/media/model-cache/github/agent-manager`) when the `AGENT_MANAGER_CORE_REPO_ROOT` environment variable is unset. The source code explicitly documents this as an intentional fail-open design: the comment states the fallback exists so "a Chat turn still has SOMETHING to root itself at rather than erroring outright," mirroring the in-tree version's bare `PACKAGE_ROOT` fallback. This resilience contract is correct and must be preserved. However, when the fallback *is* engaged, there is no visible signal to the operator. The system silently runs in a degraded, machine-specific configuration. If the fallback directory does not exist on the current host, the failure surfaces later as an obscure `FileNotFoundError` or a `subprocess` error deep inside `claude_client.py` or `model_stats_client.py`, far from the root cause, and the operator has no prior indication that the configuration was not ideal.
+
+Solution:
+Preserve the fail-open fallback exactly as documented. In the `config.py` module (introduced by AC-002), when the environment variable is unset and the hardcoded fallback path is selected, emit a prominent one-time warning log (or structured event) at the point of resolution. The message should clearly state: the variable name that is unset, the fallback path being used, and that the system is operating in a degraded, non-portable configuration. For example: `"WARNING: AGENT_MANAGER_CORE_REPO_ROOT is unset; falling back to /media/model-cache/github/agent-manager. This is a machine-specific path and may not exist on this host."` The log fires once at import/first-use time, not on every call. No exception is raised; the system continues to function per the fail-open contract.
+
+Benefits:
+The documented fail-open resilience is fully preserved—the system still degrades gracefully and a Chat turn still has a root path to work with. Operators gain an immediate, self-explanatory signal that the configuration is not ideal, turning a silent, machine-specific assumption into a visible, actionable warning. When the fallback directory does not exist, the operator has already seen the warning and can diagnose the missing directory rather than encountering an opaque `FileNotFoundError` deep in a subprocess call. The error-handling philosophy is aligned: the system does not crash, but it does not hide the degraded state either.
+
+NOTE: Flag #3 was not applied because it explicitly states the issue is "not a problem" and requires no change. Flag #4 was addressed by removing the "or in `app.py`" alternative from AC-001's solution and committing to `node_utils.py`, which is consistent with AC-002's decoupling goal.
