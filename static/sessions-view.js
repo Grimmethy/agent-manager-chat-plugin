@@ -171,6 +171,16 @@ export function filterRows(rows, query) {
   return rows.filter((r) => !!r && (has(r.name) || has(r.cwd) || has(r.host)));
 }
 
+// Same filter for the CHAT rows (the switcher box is labelled 'Filter chats'): case-insensitive substring of
+// the trimmed query against the full title and the provider/model label ('Local · qwen3'). An empty or
+// whitespace-only query returns `rows` itself; a null row or a missing field never throws.
+export function filterChats(rows, query) {
+  const needle = String(query == null ? '' : query).trim().toLowerCase();
+  if (needle === '') return rows;
+  const has = (value) => String(value == null ? '' : value).toLowerCase().includes(needle);
+  return rows.filter((r) => !!r && (has(r.title) || has(providerLabel(r)) || has(r.model)));
+}
+
 // Ctrl+1..9 jump: the key of the nth row of the order GIVEN (the caller passes the order on
 // screen), or null for n outside 1-9 or past the end. The key is host/id when the row has a
 // host and just the id otherwise: the same form the attention code uses for newly waiting
