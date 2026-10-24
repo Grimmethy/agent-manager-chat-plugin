@@ -1009,3 +1009,20 @@ Replace the manual loop inside `_resolve_host` with a call to `agent_hosts.get_h
 
 Benefits:
 Host-lookup logic lives in exactly one place (`agent_hosts.get_host`), so any future normalization, aliasing, or deprecation rules are applied uniformly. `agent_client` retains only the policy it uniquely owns (auto-select when no name is given, error wrapping for the caller). The two modules no longer need to be kept in lockstep by convention.
+
+### AC-76 · Minor host-lookup consolidation opportunity
+Strength: Minor
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_client._resolve_host(name)` and `agent_hosts.get_host(name)` both contain a short `for host in hosts(): if host.name == name` loop. The two functions are **not** the same lookup duplicated: `get_host` handles the single case "find a named host or return `None`," while `_resolve_host` additionally handles the `name=None` single-host convenience and raises a helpful multi-host-ambiguity error. Those extra cases are legitimate HTTP-layer policy and belong in `agent_client`. The only shared logic is the three-line name-match loop, which is idiomatic to repeat in each module that needs it, and the match key (`host.name`) is a stable field on the `Host` namedtuple, so independent drift is unlikely. This is a small consolidation opportunity, not an architectural defect.
+
+Solution (optional, low-priority):
+If the team prefers a single source for the name-match, `agent_client._resolve_host` can delegate the `name=<string>` branch to `agent_hosts.get_host(name)` and keep the `name=None` convenience and the `AgentError` raise as a thin wrapper. The `for`-loop in `get_host` remains the one place that implements "match by name." This is a two-line change in `_resolve_host` and is safe to defer.
+
+Benefits:
+Marginal: one fewer copy of a three-line pattern to update if the match key ever changes. The error-contract split (`None` vs. `AgentError`) and the `name=None` policy remain where they belong. No behavioral change.
+
+---
+
+*AC-001 from the prior draft has been removed.* Its central claim—that `agent_client._headers()` is dead code "never called anywhere in the community"—is incorrect: the function is invoked by `app.py` on the singular-config path (exercised by `test_wrong_token_is_unreachable_not_an_error`), and in that path the global token is correctly scoped to the single configured host, so the "wrong credential to the wrong host" hazard does not materialise. The proposed solution (delete `_headers()`, re-source the token exclusively through `agent_hosts.read_token`) would break the `app.py` caller without specifying how it would obtain the Authorization header, making the fix internally inconsistent. The residual observation (two modules each call `os.environ.get` for the same variable) is a one-liner idiom that does not rise to a "Strong" finding.
