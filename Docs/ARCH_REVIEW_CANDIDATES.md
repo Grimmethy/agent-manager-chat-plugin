@@ -829,3 +829,42 @@ The module defines two status-word helpers: `statusWord(row)` maps the boolean `
 Because the two functions serve independent domains with independent vocabularies, there is no single source of truth to unify and no risk of them drifting out of sync. Renaming `Busy` in the chat context is a one-line edit to `statusWord`; renaming it in the terminal context is a one-line edit to `STATUS_WORDS`. A hypothetical global rename across both is a trivial find-and-replace, not an architectural defect.
 
 No change is warranted. The existing separation is appropriate.
+
+### AC-63 · Centralize HTTP error-handling in a single `_request` helper
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+The four public functions (`get_roots`, `preempt`, `reserve`, `stream_local_turn`) each independently wrap their `requests` calls in a `try/except requests.RequestException` block, call `raise_for_status()`, and raise `InternalApiError` with a hand-crafted message. This shallow-interface duplication means that any cross-cutting transport concern—retries with back-off, circuit breaking, centralized request logging, or a unified timeout policy—must be added in four separate places, and a change to the error-handling contract (e.g., adding a `request_id` to every raised exception) requires touching every public function. The transport layer is effectively re-implemented per call site rather than being a single, testable seam.
+
+Solution:
+Introduce a private `_request(method, url, **kwargs)` helper inside `internal_api_client.py` that performs the `requests` call, wraps it in a single `try/except requests.RequestException`, calls `raise_for_status()`, and raises `InternalApiError` with a consistent message that includes the URL and status code. Each public function then delegates its HTTP call to `_request` and focuses solely on parsing the response payload. For `stream_local_turn`, the helper can expose a `_stream_request` variant that yields the response iterator, keeping the same error-raising contract at the connection-establishment phase while allowing the generator to handle mid-stream errors separately.
+
+Benefits:
+Adding retries, a circuit breaker, or structured logging becomes a one-line change in `_request` rather than a four-function refactor. The error contract is uniform and easier to test: a single unit test on `_request` covers the connection-failure and HTTP-error paths for all four public functions. New public endpoints added to the client automatically inherit the same error-handling behavior without copy-paste risk.
+
+### AC-64 · Unify the error-propagation contract between streaming and non-streaming calls
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+`get_roots`, `preempt`, and `reserve` signal internal-API failures by raising `InternalApiError`, while `stream_local_turn` catches the same class of `requests.RequestException` and instead yields a `{"type": "error", ...}` dictionary into the generator stream. Consumers of this module therefore face a split-brain contract: for three functions they must `try/except InternalApiError`, but for the fourth they must inspect every yielded dict for an error type. The routing layer that dispatches to these functions must maintain two separate failure-handling paths for what is logically the same "internal API is unreachable or returned an error" condition, and a new caller who is unfamiliar with the module will inevitably miss the yield-based error path.
+
+Solution:
+Adopt a single contract: all four functions raise `InternalApiError` for connection and HTTP-status failures (i.e., failures that occur before or at the moment the response is established). For `stream_local_turn`, the helper establishes the connection and raises `InternalApiError` on failure before the generator begins yielding; once the stream is open, mid-stream transport errors can still be surfaced as yielded error dicts (since the caller is already inside a `for` loop), but the initial "cannot reach the service" case follows the same raise-based contract as the other three functions. Document this two-phase contract (raise-before-yield vs. yield-during-stream) in the module docstring.
+
+Benefits:
+Callers can wrap every call to the client in a single `try/except InternalApiError` block for the "service is down" case, reducing the routing layer's branching logic. The contract is easier to communicate in code review and onboarding. It also makes it straightforward to add a global retry decorator that operates on the raised-exception path without needing to inspect generator yields.
+
+### AC-65 · Decouple `test_claude_client_account.py` from `app.py` module internals
+Strength: Worth exploring
+Files: test_claude_client_account.py, app.py
+
+Problem:
+The test file imports `app` solely to read the `CORE_REPO_ROOT` constant, and includes a fallback that fabricates a fake `app` module if the import fails. This couples the test to the internal structure of `app.py`—specifically, that `CORE_REPO_ROOT` exists as a module-level attribute at import time. If `app.py` reorders its initialization, moves the constant to a sub-module, or guards it behind a lazy property, the test's fallback silently activates and the test exercises a fake path that may not reflect the real value, masking a genuine regression. The test is no longer independent of application internals, violating the principle that tests should inject their dependencies rather than reach into production module state.
+
+Solution:
+Extract `CORE_REPO_ROOT` (or the path it represents) into a small, importable configuration module (e.g., `config.py` or a `paths.py`) that has no side effects and no dependency on the Flask/Django app lifecycle. Both `app.py` and `test_claude_client_account.py` import from that shared module. In the test, if the value must be overridden for a specific scenario, use `unittest.mock.patch` on the configuration module's attribute rather than constructing a fake `app` module. Remove the fallback import logic entirely.
+
+Benefits:
+The test no longer depends on `app.py`'s import order or internal structure; it depends only on a stable, side-effect-free configuration module. The fake-module fallback is eliminated, removing a silent-failure mode where a broken import is masked by the fallback. Refactoring `app.py` (splitting it, renaming it, changing its init sequence) can no longer break the test in a non-obvious way.
