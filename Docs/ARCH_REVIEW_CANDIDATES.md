@@ -606,3 +606,29 @@ This eliminates the ~12 lines of duplicated protocol code while preserving `writ
 
 Benefits:
 A single implementation of the atomic-write protocol means any future durability, concurrency, or schema change is made in exactly one place. The subtle divergence risk (one path gets a new key or flag, the other doesn't) is eliminated. The module's public surface and test coverage remain unchanged—`write_snapshot` still accepts the same arguments, still returns `False` on a no-op (as asserted by `test_writes_only_when_window_or_model_changed`), and still produces the same on-disk result on a real write—so no caller or test needs modification.
+
+### AC-46 · Centralize the Node subprocess invocation pattern in a shared helper
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` independently implement the identical "write JSON payload to a temp file, execute `node <script> <file>`, and clean up the temp file" pattern. Each module duplicates the `tempfile` creation, `json.dumps` serialization, `subprocess.run` configuration (including timeout and argument assembly), and the `finally`-block cleanup of the temporary file. This duplication means any change to the invocation contract—adding a timeout, switching to stdin instead of a file, adjusting environment variables—must be made in two places, and the two copies can silently drift apart.
+
+Solution:
+Introduce a single shared utility function (e.g., `run_node_cli(script_path, args, payload)`) in a new `node_bridge.py` module (or within `app.py` if a separate module is undesirable). This function owns the full temp-file lifecycle: it serializes the payload, writes it to a temp file, invokes the Node script via `subprocess.run` with a configurable timeout, captures and parses stdout, and guarantees temp-file cleanup in a `finally` block. Both `claude_client.py` and `model_stats_client.py` are refactored to call this helper instead of inlining the pattern.
+
+Benefits:
+Eliminates duplicated boilerplate across the two modules, ensures consistent timeout, environment, and cleanup behavior for every Node bridge call, and provides a single choke point where cross-cutting concerns—structured logging, metrics emission, or future transport changes—can be added once and apply everywhere.
+
+### AC-47 · Unify the error-handling contract for Node subprocess failures
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+`claude_client.py` raises a custom `ClaudeClientError` with distinct messages for timeouts and non-zero exits, while `model_stats_client.py` silently swallows all errors (logging only a warning) so that stats recording never breaks the main feature. The two modules thus present fundamentally different failure semantics for the same underlying operation. The deliberate "swallow" choice in `model_stats_client.py` is implicit—there is no shared location documenting why it differs from `claude_client.py`—making it easy for a future contributor to "fix" the inconsistency by propagating the error and inadvertently breaking the stats path, or to miss a real subprocess failure because the logging level is insufficient.
+
+Solution:
+Define a standardized `NodeBridgeError` in the shared `node_bridge.py` helper (from AC-001) that is raised for every failure mode: timeout, non-zero exit, and JSON parse error on stdout. `claude_client.py` catches `NodeBridgeError` and re-raises it as `ClaudeClientError`, preserving its current caller-facing contract. `model_stats_client.py` catches `NodeBridgeError`, logs a warning with the original message, and returns a safe default. The intentional divergence is now explicit, localized to the two call-sites, and the shared helper guarantees that no failure mode can slip through unhandled.
+
+Benefits:
+Provides a single, auditable point for Node subprocess error handling. Makes the deliberate choice to swallow errors in `model_stats_client.py` explicit rather than implicit, reducing the risk of accidental error propagation or inconsistent logging. Any new consumer of the Node bridge inherits a well-defined error type and must consciously choose its propagation strategy, preventing future silent-failure regressions.
