@@ -110,3 +110,12 @@ Manual browser checks (layoutForWidth itself is unit-tested). None have ever bee
 3. **Load at phone width.** Loading the page already narrow shows the single active pane and no preset buttons. (never checked)
 4. **Resize is debounced.** Dragging the window edge across 760 px renders once after the drag settles (about 150 ms), and a plain resize that does not cross 760 px does not reload any pane. (never checked)
 5. **Navigation on a phone.** The session switcher inside the pane can open another chat; the old dropdown above the pane is gone. (never checked)
+
+## Layout templates menu (piece 7/10)
+
+Manual browser checks (the template functions are unit-tested; the menu and storage are not). None have ever been checked.
+
+1. **Built-ins.** The toolbar's Templates menu lists 'driver + 2 workers' and 'monitor grid'; choosing one switches to the 2x2 grid with the open chats first and empty 'New chat' slots after them, and saves that layout. (never checked)
+2. **Save current as.** 'Save current as…' opens an inline name box (no browser pop-up); typing a name and pressing Enter or Save adds it to the menu, Escape closes the box without saving; an empty name saves nothing. (never checked)
+3. **Persists per browser.** After a reload the saved template is still in the menu (localStorage key 'chat-workspace-templates'); in another browser profile it is not. (never checked)
+4. **Storage blocked.** With site storage blocked the menu still works and the built-ins show; a saved template lasts until reload. (never checked)

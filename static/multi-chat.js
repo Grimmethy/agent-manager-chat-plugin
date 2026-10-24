@@ -195,6 +195,8 @@ export function deserializeTemplates(json) {
 // ============================================================================
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   const STORAGE_KEY = 'chat-workspace-layout';
+  const TEMPLATES_KEY = 'chat-workspace-templates';
+  const TEMPLATE_NAME_MAX = 40;
   const MOBILE_MAX_WIDTH = 760;
 
   // Must be set BEFORE './chat.js' is imported: its mountChat() early-returns
@@ -215,6 +217,27 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       raw = null;
     }
     return raw == null ? defaultState() : deserialize(raw);
+  }
+
+  // Saved templates (HUB0010 7/10): the built-ins plus whatever the user saved in this
+  // browser. Every storage access is guarded; without storage the templates just last
+  // until reload.
+  function loadTemplates() {
+    const merged = copyTemplates(DEFAULT_TEMPLATES);
+    let raw = null;
+    try {
+      raw = window.localStorage.getItem(TEMPLATES_KEY);
+    } catch (e) {
+      raw = null;
+    }
+    if (raw != null) Object.assign(merged, deserializeTemplates(raw));
+    return merged;
+  }
+
+  function persistTemplates(templates) {
+    try {
+      window.localStorage.setItem(TEMPLATES_KEY, serializeTemplates(templates));
+    } catch (e) { /* storage disabled/unavailable: the template just won't persist */ }
   }
 
   function injectStyles() {
@@ -272,6 +295,85 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function markPreset() {
       for (const p of PRESETS) presetButtons[p].setAttribute('aria-pressed', String(state.preset === p));
     }
+
+    // --- toolbar: templates menu + inline "save current as" (no window.prompt) ---
+    let templates = loadTemplates();
+    const tplBox = document.createElement('div');
+    tplBox.className = 'multi-chat-templates';
+    const tplSelect = document.createElement('select');
+    tplSelect.className = 'multi-chat-template-select';
+    tplSelect.setAttribute('aria-label', 'Layout templates');
+    const tplSaveBtn = document.createElement('button');
+    tplSaveBtn.type = 'button';
+    tplSaveBtn.className = 'secondary multi-chat-template-save-btn';
+    tplSaveBtn.textContent = 'Save current as…';
+    const tplSaveRow = document.createElement('span');
+    tplSaveRow.className = 'multi-chat-template-save';
+    tplSaveRow.hidden = true;
+    const tplName = document.createElement('input');
+    tplName.type = 'text';
+    tplName.className = 'multi-chat-template-name';
+    tplName.maxLength = TEMPLATE_NAME_MAX;
+    tplName.placeholder = 'Template name';
+    tplName.setAttribute('aria-label', 'Template name');
+    const tplOk = document.createElement('button');
+    tplOk.type = 'button';
+    tplOk.className = 'multi-chat-template-ok';
+    tplOk.textContent = 'Save';
+    tplSaveRow.appendChild(tplName);
+    tplSaveRow.appendChild(tplOk);
+    tplBox.appendChild(tplSelect);
+    tplBox.appendChild(tplSaveBtn);
+    tplBox.appendChild(tplSaveRow);
+    toolbar.appendChild(tplBox);
+
+    function refreshTemplateMenu() {
+      tplSelect.innerHTML = '';
+      const head = document.createElement('option');
+      head.value = '';
+      head.textContent = 'Templates…';
+      tplSelect.appendChild(head);
+      for (const name of Object.keys(templates)) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        tplSelect.appendChild(opt);
+      }
+      tplSelect.value = '';
+    }
+    refreshTemplateMenu();
+
+    tplSelect.onchange = () => {
+      const name = tplSelect.value;
+      tplSelect.value = '';
+      if (!name) return;
+      const openList = state.panes.filter((p) => typeof p === 'string' && p.length > 0);
+      state = applyTemplate(templates, name, state, openList);
+      activeId = firstOpenPane(state) || activeId;
+      saveLayout(state);
+      render();
+    };
+    function closeTemplateSave() {
+      tplSaveRow.hidden = true;
+      tplName.value = '';
+    }
+    tplSaveBtn.onclick = () => {
+      tplSaveRow.hidden = !tplSaveRow.hidden;
+      if (!tplSaveRow.hidden) tplName.focus();
+    };
+    function commitTemplate() {
+      const name = tplName.value.trim().slice(0, TEMPLATE_NAME_MAX);
+      if (!name || name === '__proto__') return; // empty names and the one name that would rewrite the object's prototype
+      templates = saveTemplate(templates, name, state);
+      persistTemplates(templates);
+      refreshTemplateMenu();
+      closeTemplateSave();
+    }
+    tplOk.onclick = commitTemplate;
+    tplName.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commitTemplate(); }
+      else if (e.key === 'Escape') closeTemplateSave();
+    });
 
     // --- one ChatPane inside a framed slot (close = DOM unmount, no API) ----
     let ChatPane = null;
