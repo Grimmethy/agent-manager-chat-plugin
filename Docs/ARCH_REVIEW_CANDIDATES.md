@@ -725,3 +725,16 @@ Introduce a thin accessor (or a small dataclass / protocol) that the template st
 
 Benefits:
 The template store no longer breaks when the session's internal representation changes; only the session object's accessor implementation needs updating. Errors remain `LookupError` (satisfying the existing test suite) but become self-describing (naming the missing key or out-of-range index) rather than bare `KeyError`/`IndexError` traces. The protocol also makes the contract explicit and testable in isolation, and it opens the door to alternative session backends (e.g., a database-backed transcript) without touching template-store code.
+
+### AC-55 · Inconsistent timestamp comparison in session ordering
+Strength: Strong
+Files: (single file containing `secondsSince`, `orderSessions`, `nextSelectionAfterClose`)
+
+Problem:
+The file defines two different interpretations of "which timestamp is later." `secondsSince` correctly normalizes timestamps through `Date.parse`, handling ISO strings with arbitrary UTC offsets, `Date` objects, and raw millisecond values. However, `orderSessions`—which `nextSelectionAfterClose` delegates to for selecting the most recent remaining chat after a session close—sorts using raw lexicographic string comparison on the timestamp key. When two ISO strings carry different UTC offsets (e.g. `…T10:00:00+02:00` vs `…T09:00:00Z`), the string comparator and `Date.parse` disagree on ordering, causing `nextSelectionAfterClose` to potentially select the wrong row.
+
+Solution:
+Route the sort key in `orderSessions` through the same `Date.parse`-based numeric comparison that `secondsSince` already establishes. Concretely, replace the lexicographic `key(a) < key(b)` comparison with a numeric comparison of `Date.parse(key(a))` versus `Date.parse(key(b))`, falling back to the existing behavior for unparseable values. This gives the file a single, consistent interpretation of timestamp ordering.
+
+Benefits:
+`nextSelectionAfterClose` and any other consumer of `orderSessions` will always agree with `secondsSince` on which timestamp is more recent, eliminating a class of wrong-row-selection bugs that surface whenever session timestamps carry mixed UTC offsets. The fix is localized to the sort comparator and introduces no new API surface.
