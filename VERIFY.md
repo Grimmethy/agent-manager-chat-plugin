@@ -135,3 +135,12 @@ Manual checks for dockview popout windows. None have ever been checked, and none
 
 1. **Popout keeps streaming.** A pane popped out into its own window keeps streaming a running reply while the main window is in the background. (never checked)
 2. **Closing a popout never ends a session.** Closing the popout window only removes the pane from the layout; the chat is still listed in the switcher and nothing was POSTed to `api/chat/<id>/close`. (never checked)
+
+## Dockview adapter (HUB0019 4/4)
+
+Manual checks for the `static/dockview-grid.js` adapter (`static/vendor/dockview.js` is loaded from `chat.html` via a script tag before it). Manual items only -- the unit tests cover the adapter's grid logic, not the rendered panes. Each item is marked (never checked).
+
+1. **Panes render side by side.** With two or more chats open, the adapter lays them out as real dockview panes side by side: each chat is visible at the same time, the panes can be re-ordered by dragging, and resizing the divider changes the pane widths. (never checked)
+2. **Popout window streaming.** A pane popped out into its own window keeps receiving live message/stream updates for a running reply, including while the main window is in the background. (never checked)
+3. **Closing a popout does not end a session.** Closing the popout window removes only that pane from the layout; the chat stays listed in the switcher, can be re-opened in a pane, and no close request was POSTed to the server. (never checked)
+4. **Fallback when the vendored file is removed.** With `static/vendor/dockview.js` removed (or 404), the page still loads and all chats remain usable as plain panes with no unhandled errors in the console -- the adapter's fallback path, not a crash. (never checked)
