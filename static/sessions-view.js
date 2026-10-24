@@ -227,6 +227,14 @@ export function applyTerminalEvent(rows, event, data) {
   return next;
 }
 
+// The empty-state line for the terminal group: names the host(s) that were asked (the `hosts` array GET api/chat/terminal-sessions
+// already returns) so an operator can tell the feature is pointed at the wrong machine. Plain text, the caller escapes it. Non-string and
+// blank entries are ignored; no usable host gives the plain 'No terminal sessions'. No URL or token ever reaches this.
+export function emptyLabel(hosts) {
+  const names = Array.isArray(hosts) ? hosts.filter((h) => typeof h === 'string' && h.trim() !== '') : [];
+  return names.length ? 'No terminal sessions on ' + names.join(', ') : 'No terminal sessions';
+}
+
 // The line naming the hosts whose session agent could not be reached. GET api/chat/terminal-sessions reports each as {host, reason} (agent_client.list_all);
 // an older shape, a bare host name, still works. Returns plain text ('grimm (ConnectionError), wok'), '' when nothing usable: the caller escapes it.
 export function skippedLabel(skipped) {

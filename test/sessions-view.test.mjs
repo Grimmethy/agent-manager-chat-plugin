@@ -4,7 +4,7 @@ import {
   truncateTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
   orderSessions, nextSelectionAfterClose, formatRow,
   formatTokens, contextLabel, terminalTimer, STALE_BUSY_SECS, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
-  filterRows, filterChats, jumpTarget,
+  filterRows, filterChats, emptyLabel, jumpTarget,
 } from '../static/sessions-view.js';
 import { rowKey, hostsOf, filterByHost } from '../static/sessions-view.js';
 import { skippedLabel } from '../static/sessions-view.js';
@@ -300,6 +300,19 @@ test('jumpTarget prefixes the host when the row has one and not otherwise', () =
   assert.equal(jumpTarget(rows, 2), 'b');
   assert.equal(jumpTarget(rows, 3), 'c');
   assert.equal(jumpTarget(rows, 4), 'd');
+});
+
+test('emptyLabel names the hosts that were asked', () => {
+  assert.equal(emptyLabel(['default']), 'No terminal sessions on default');
+  assert.equal(emptyLabel(['wok', 'grimm']), 'No terminal sessions on wok, grimm');
+});
+
+test('emptyLabel falls back to the plain text for no, bad or blank host lists', () => {
+  assert.equal(emptyLabel([]), 'No terminal sessions');
+  assert.equal(emptyLabel(undefined), 'No terminal sessions');
+  assert.equal(emptyLabel(null), 'No terminal sessions');
+  assert.equal(emptyLabel('wok'), 'No terminal sessions');
+  assert.equal(emptyLabel(['', null, 7, 'wok']), 'No terminal sessions on wok');
 });
 
 const CHAT_ROWS = [
