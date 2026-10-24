@@ -66,10 +66,12 @@ HUB0008 10/11 (header provider label, Swap menu, one-click swap offer). Manual i
 
 ## Multi-host terminal sessions (manual)
 
-HUB0017 3/3. Manual items only. Each item is marked (never checked).
+HUB0005 7/7, replacing the shorter HUB0017 list. Two machines, wok and grimm, each running `session_agent.py`, with the example `AGENT_MANAGER_SESSION_AGENT_URLS` from the README set in the plugin's environment (plugin on its default port 7442). Do not paste token text, token file paths or session ids anywhere: report pass or fail per item. Each item is marked (never checked).
 
-1. With `AGENT_MANAGER_SESSION_AGENT_URLS` set to two or more agent endpoints, the `GET` terminal-sessions list response includes `hosts` (array of host names) and `skipped` (array of unreachable host names); every row carries a `host` field populated by `formatTerminalRow` (never checked).
-2. The UI opens one SSE stream per host at `api/chat/terminal-sessions/events?host=<name>` (falling back to `api/chat/terminal-sessions/events` when only a single host is configured), and rows from different hosts interleave correctly without loss (never checked).
-3. Each terminal row displays its host in a small badge using the `.terminal-row-host-badge` CSS class; rows without a host field show no badge (never checked).
-4. The host filter dropdown is populated via `hostsOf(rows)` and filtering works via `filterByHost(rows, selectedHost)` in `static/sessions-view.js`: selecting a host shows only that host's rows, "All" resets the filter (never checked).
-5. Hosts listed in the `skipped` array are visible in the UI (e.g. a muted line or badge) so the operator knows a host was unreachable (never checked).
+1. **Both hosts listed.** `curl -s localhost:7442/api/chat/terminal-sessions` answers `enabled` true, `reachable` true, `hosts` `["wok","grimm"]` in that order, `skipped` `[]`, and every row in `sessions` has `host` set to `wok` or `grimm` (never checked).
+2. **One agent down, the other stays live.** Stop the agent on grimm. Within one poll the same request answers `reachable` true, `skipped` with one entry `{"host":"grimm","reason":...}`, and still lists wok's sessions; the chat panel shows wok's rows and a line saying grimm was skipped that names grimm (and its reason), not a bare object. Start it again: grimm's rows return and `skipped` is `[]` (never checked).
+3. **Both agents down.** Stop both: `reachable` false, `sessions` `[]`, `skipped` has both hosts, and the panel says "Session agent unreachable" (never checked).
+4. **A session ending on one host disappears only there.** End a terminal session on grimm: its row disappears from the panel within a few seconds and no wok row changes, including a wok session that happens to share the same session id (never checked).
+5. **The events route.** With two hosts configured, `curl -N 'localhost:7442/api/chat/terminal-sessions/events'` answers 400; `?host=wok` streams events tagged `wok`; `?host=nobody` answers 404; `?host=grimm` with grimm stopped answers 502 (never checked).
+6. **Host badge and filter.** Each terminal row shows its host in a small badge (`.terminal-row-host-badge`); the filter lists `grimm` and `wok` sorted plus All; choosing one shows only that host's rows and All resets it (never checked).
+7. **Tokens stay server-side.** Search every response body and the event stream from items 1 to 6 for the token file paths and for the first characters of each token: neither appears (never checked).
