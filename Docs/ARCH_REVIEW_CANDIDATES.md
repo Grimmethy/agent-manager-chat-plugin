@@ -937,3 +937,16 @@ Collapse the duplication by having `write_snapshot` delegate its write step to `
 
 Benefits:
 The atomic-write protocol lives in exactly one place, so protocol changes (fsync, tmp-naming, retry, permission bits) are a single edit. The read-compare flow in `write_snapshot` is preserved unchanged, so callers see identical behavior. The file shrinks by roughly the length of the duplicated block, and the two functions now have a clear single-responsibility boundary: `_atomic_write` owns the I/O ceremony, `write_snapshot` owns the snapshot-specific policy.
+
+### AC-71 · Duplicated per-host token resolution in agent_client.py
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+In `agent_client.py`, the logic for resolving a per-host authentication token and constructing the `Authorization: Bearer …` header is duplicated across two functions. `list_all()` iterates over `agent_hosts.hosts()`, calls `agent_hosts.read_token(host)` for each host, and manually builds the `headers` dictionary. `open_events()` calls `_resolve_host(host)` and then repeats the same token-reading and header-construction steps. Meanwhile, the module-level `_headers()` helper exists but is never called by either of these multi-host-aware functions, leaving it as dead code and creating a confusing parallel path for header construction.
+
+Solution:
+Extract the repeated token-resolution-and-header-construction logic into a single internal helper (e.g., `_host_headers(host)`) that calls `agent_hosts.read_token(host)` and returns the fully formed `headers` dict. Both `list_all()` and `open_events()` would then call this helper instead of duplicating the steps. The existing unused `_headers()` function can either be deleted or repurposed as this shared helper, eliminating the dead code path.
+
+Benefits:
+Removes the duplicated token-resolution logic so that the two functions cannot diverge in how they handle missing tokens, token format, or header construction. Cleans up the module by eliminating (or repurposing) the unused `_headers()` function, reducing cognitive load for future maintainers and making the single source of truth for Bearer-header construction explicit.
