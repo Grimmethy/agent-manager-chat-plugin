@@ -868,3 +868,44 @@ Extract `CORE_REPO_ROOT` (or the path it represents) into a small, importable co
 
 Benefits:
 The test no longer depends on `app.py`'s import order or internal structure; it depends only on a stable, side-effect-free configuration module. The fake-module fallback is eliminated, removing a silent-failure mode where a broken import is masked by the fallback. Refactoring `app.py` (splitting it, renaming it, changing its init sequence) can no longer break the test in a non-obvious way.
+
+### AC-66 · Row-filtering predicate duplicated across handoff and chat_sessions
+Strength: Worth exploring (conditional — see caveat)
+Files: handoff.py, chat_sessions.py, test_chat_routes_swap.py
+
+**Caveat:** `chat_sessions.py` is not included in the files provided for this review. The duplication claim rests on `handoff.py`'s module docstring (which describes the two-skip rule and references the chat-sessions path) and on comments in `test_chat_routes_swap.py`. Before acting on this item, confirm that `chat_sessions._build_local_messages` (or an equivalent function) actually exists and implements the same two-skip logic. The proposal below assumes that verification passes.
+
+Problem:
+`handoff._is_plain_row` implements a two-skip rule (drop rows where `"error"` is truthy, drop rows where `"marker" is True`). `handoff.py`'s docstring states that the same rule is applied in the chat-sessions message-construction path, but the rule lives in two separate code paths held together only by that prose comment. There is no shared predicate, no single test that asserts the two filters agree on an arbitrary row, and no import-time link between them. If a third row type (e.g. a `"system"` notice) is introduced and one filter is updated without the other, the handoff transcript and the local-model message construction will silently diverge, producing inconsistent token counts or missing context with no error.
+
+Solution:
+Extract the predicate into a single public helper (e.g. `handoff.is_plain_row(row) -> bool`) that `handoff.transcript_tokens` / `build_handoff` call directly. If the chat-sessions module does contain a duplicate of the same two-skip logic, have that function import and call `handoff.is_plain_row` rather than re-implementing the check. Add a unit test (using the existing `unittest` convention, as in `test_chat_routes_swap.py`) that feeds a row containing a novel field through both call sites and asserts they produce the same keep/drop decision, so any future divergence is caught at test time.
+
+Benefits:
+The "which rows count as plain content" rule now has exactly one definition. Adding a new row type requires touching one function instead of two, and the agreement test makes any accidental asymmetry a red build rather than a silent runtime divergence. The docstring comment in `handoff.py` can be shortened to point at the shared helper (`"See is_plain_row for the canonical rule"`) rather than restating the rule in prose, reducing the chance that the comment and the code drift apart.
+
+### AC-67 · model_stats_client duplicates its error-swallowing wrapper twice
+Strength: Worth exploring
+Files: model_stats_client.py
+
+Problem:
+Two public functions in `model_stats_client.py`—`_run_event` and `get_turns_summary`—each independently wrap their `subprocess.run` call in its own try/except, with slightly different exception tuples (one includes `json.JSONDecodeError`, the other does not) and each calling `logger.warning` with its own message. A third function, `record_outcome`, delegates to `_run_event` rather than calling `subprocess.run` directly, so it inherits the wrapper rather than duplicating it. The module docstring states the contract—"never let stats recording break the real feature"—but that contract is implemented in two separate try/except blocks. A new event type added later will either copy-paste one of the two patterns (drifting the exception tuple or the log message) or omit an exception type, turning a non-fatal stats failure into an unhandled exception that propagates into the feature code.
+
+Solution:
+Introduce a single `_safe_run(cmd, *, timeout, description, cleanup=None)` helper inside `model_stats_client.py` that owns the `subprocess.run` invocation, the full exception tuple (`OSError`, `subprocess.SubprocessError`, `json.JSONDecodeError`), and the `logger.warning` call. The optional `cleanup` parameter (a callable or a temp-file path) lets `_run_event` pass its temp-file removal logic without forcing `get_turns_summary` to deal with a file it never creates. Have `_run_event` and `get_turns_summary` delegate to `_safe_run`, passing only their specific command, description string, and (for `_run_event`) the cleanup callback. `record_outcome` continues to call `_run_event` as before. The "never break the feature" contract then lives in exactly one function.
+
+Benefits:
+Adding a new stats event is a one-line call to `_safe_run` with no risk of forgetting an exception type or duplicating cleanup logic. The exception tuple is defined once, so a new failure mode (e.g. a `TimeoutError` variant) is added in one place. Reviewers can verify the "stats never crash the feature" guarantee by reading a single function rather than auditing two near-identical blocks.
+
+### AC-68 · Inconsistent env-var read timing between ollama_client and handoff
+Strength: Worth exploring
+Files: ollama_client.py, handoff.py
+
+Problem:
+`ollama_client.py` captures `MODEL = os.environ.get("LOCAL_MODEL")` at module import time, freezing the value for the process lifetime. `handoff.py`'s `window_tokens` reads `AGENT_MANAGER_CHAT_*_WINDOW_TOKENS` on every call, explicitly documented as "read per call." Both are configuration for the same chat-swap feature and are consumed by the same code paths (the swap route calls `handoff.needs_summary` and passes `ollama_client.MODEL` to the reserve call). An operator or test that changes `LOCAL_MODEL` after import will see `handoff` pick up new window sizes while `ollama_client` still uses the old model name, with no error, no log, and no indication that the two modules disagree.
+
+Solution:
+Pick one env-var semantics for the chat-swap feature and apply it consistently. If per-call is chosen (matching `handoff`'s existing documented behavior), change `ollama_client` to read `LOCAL_MODEL` inside `generate()` rather than at module load. If at-import is chosen, change `handoff.window_tokens` to read once at module load and document the reload requirement. Add a `unittest`-based test that (1) sets the env var, (2) imports both modules, (3) changes the env var again, (4) calls `importlib.reload(ollama_client)` to re-execute its module-level code (necessary because `MODEL` is bound at import time and a plain re-import would return the cached module), and (5) asserts that both `ollama_client.MODEL` and `handoff.window_tokens(...)` observe the same updated value, locking the contract in code.
+
+Benefits:
+Operators and tests get a single, predictable rule for how configuration changes propagate: either both modules see the new value immediately or both require a process restart. The inconsistency is eliminated at the source, and the agreement test (using `importlib.reload` to force re-evaluation of the import-time binding) makes any future regression—e.g. someone re-introducing a module-level constant in one file—a red build rather than a silent mismatch in production.
