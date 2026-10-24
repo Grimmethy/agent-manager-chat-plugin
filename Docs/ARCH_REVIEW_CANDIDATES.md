@@ -950,3 +950,16 @@ Extract the repeated token-resolution-and-header-construction logic into a singl
 
 Benefits:
 Removes the duplicated token-resolution logic so that the two functions cannot diverge in how they handle missing tokens, token format, or header construction. Cleans up the module by eliminating (or repurposing) the unused `_headers()` function, reducing cognitive load for future maintainers and making the single source of truth for Bearer-header construction explicit.
+
+### AC-72 · Route handler reaches into accounts.py private validation helper
+Strength: Strong
+Files: routes/accounts.py, accounts.py
+
+Problem:
+The `api_chat_accounts_make_live` handler in `routes/accounts.py` calls `accounts._valid_label(label)` to decide whether to return a 400 Bad Request before attempting the state change. This crosses the module boundary: `accounts.py`'s docstring defines its public surface as persistence operations (every function takes a `storage_dir`), and `_valid_label` is an internal helper with no contract guarantee. The route is forced to pre-validate because `accounts.make_live` only raises `KeyError` for unknown labels, so an invalid label currently falls through to a 404 instead of a 400. If the label-validation rules in `accounts.py` ever change (e.g., allowing Unicode, changing max length), the route handler silently diverges and misclassifies errors.
+
+Solution:
+Have `accounts.make_live` (and any other public mutation that accepts a label) raise `ValueError` when the label fails validation, in addition to raising `KeyError` for an unknown-but-valid label. The route handler then simply catches `ValueError` → 400 and `KeyError` → 404, removing the need to call `_valid_label` directly. No new public function is added to `accounts.py`; the existing public mutation API gains a more precise exception contract, and the routing layer interprets exceptions rather than reaching into private helpers.
+
+Benefits:
+The routing layer no longer depends on a private symbol, so refactoring `accounts.py`'s internals (renaming, splitting, or changing `_valid_label`) cannot silently break the route. Error semantics become self-documenting: the domain module declares *what* is wrong (invalid vs. missing) via exception type, and the routing layer maps that to HTTP status codes. A single source of truth for label validation lives in `accounts.py`, eliminating the risk of the two modules drifting out of sync.
