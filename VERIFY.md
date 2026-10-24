@@ -63,3 +63,13 @@ HUB0008 10/11 (header provider label, Swap menu, one-click swap offer). Manual i
 9. Swapping a chat that holds the local reservation to Claude releases the reservation; swapping to local never acquires one (never checked).
 10. The first Claude turn after a swap shows the hand-off in the model's view (header, summary if any, the last `CHAT_RECENT_TURNS_KEPT` rows); a long transcript gets a summary and a failed summarizer does not block the swap (never checked).
 11. `limit-error-samples.jsonl` appears in the storage directory after a real Claude limit error, and its text shows whether the assumed phrases in `limit_errors.py` match; send the shapes to the owner (never checked).
+
+## Multi-host terminal sessions (manual)
+
+HUB0017 3/3. Manual items only. Each item is marked (never checked).
+
+1. With `AGENT_MANAGER_SESSION_AGENT_URLS` set to two or more agent endpoints, the `GET` terminal-sessions list response includes `hosts` (array of host names) and `skipped` (array of unreachable host names); every row carries a `host` field populated by `formatTerminalRow` (never checked).
+2. The UI opens one SSE stream per host at `api/chat/terminal-sessions/events?host=<name>` (falling back to `api/chat/terminal-sessions/events` when only a single host is configured), and rows from different hosts interleave correctly without loss (never checked).
+3. Each terminal row displays its host in a small badge using the `.terminal-row-host-badge` CSS class; rows without a host field show no badge (never checked).
+4. The host filter dropdown is populated via `hostsOf(rows)` and filtering works via `filterByHost(rows, selectedHost)` in `static/sessions-view.js`: selecting a host shows only that host's rows, "All" resets the filter (never checked).
+5. Hosts listed in the `skipped` array are visible in the UI (e.g. a muted line or badge) so the operator knows a host was unreachable (never checked).
