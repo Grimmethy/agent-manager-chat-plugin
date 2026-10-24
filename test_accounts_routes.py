@@ -8,8 +8,11 @@ that no response body ever contains 'tokenFile' or the fake token.
 Run: python -m unittest test_accounts_routes -v
 """
 import json
+import os
+import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -57,8 +60,10 @@ class TwoAccountsTest(AccountsRouteTestBase):
         body = self._get().get_json()
         self.assertEqual([a["label"] for a in body["accounts"]], ["acct-a", "acct-b"])
         self.assertEqual(body["live"], "acct-a")
-        self.assertEqual(body["accounts"][0], {"label": "acct-a", "host": "host-a.example", "live": True})
-        self.assertEqual(body["accounts"][1], {"label": "acct-b", "host": "host-b.example", "live": False})
+        self.assertEqual(body["accounts"][0],
+                         {"label": "acct-a", "host": "host-a.example", "live": True, "usage": None})
+        self.assertEqual(body["accounts"][1],
+                         {"label": "acct-b", "host": "host-b.example", "live": False, "usage": None})
 
     def test_make_live_switches(self):
         r = self._make_live("acct-b")
@@ -103,6 +108,70 @@ class TokenHygieneTest(AccountsRouteTestBase):
         # sanity: the fake token IS in the on-disk registry (so the above is meaningful)
         self.assertIn(FAKE_TOKEN, self._registry())
         self.assertIn("tokenFile", self._registry())
+
+
+class UsageExposureTest(AccountsRouteTestBase):
+    """GET /api/chat/accounts exposes per-account usage snapshots read from
+    <AM_STATUSLINE_DIR>/limits.<label>.json (HUB0007 4/4)."""
+
+    def setUp(self):
+        super().setUp()
+        accounts.add(self.storage, "acct-a", "host-a.example", str(self.storage / "tok-a"))
+        self.statusline_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.statusline_dir, ignore_errors=True)
+        patcher = mock.patch.dict(os.environ, {"AM_STATUSLINE_DIR": str(self.statusline_dir)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_snapshot(self, label, five_hour, weekly, observed):
+        payload = {"fiveHour": five_hour, "weekly": weekly, "observedAt": observed}
+        (self.statusline_dir / ("limits.%s.json" % label)).write_text(
+            json.dumps(payload), encoding="utf-8")
+
+    def test_usage_present_with_valid_snapshot(self):
+        now = time.time()
+        self._write_snapshot(
+            "acct-a",
+            {"usedPercentage": 42.5, "resetsAt": now + 3600},
+            {"usedPercentage": 7.0, "resetsAt": now + 86400},
+            now,
+        )
+        r = self._get()
+        self.assertEqual(r.status_code, 200)
+        account = r.get_json()["accounts"][0]
+        self.assertEqual(account["label"], "acct-a")
+        self.assertIsNotNone(account["usage"])
+        self.assertEqual(account["usage"]["fiveHour"]["percent"], 42.5)
+        self.assertEqual(account["usage"]["fiveHour"]["resetsAt"], now + 3600)
+        self.assertFalse(account["usage"]["fiveHour"]["reset"])
+        self.assertEqual(account["usage"]["weekly"]["percent"], 7.0)
+        self.assertFalse(account["usage"]["stale"])
+
+    def test_usage_none_without_snapshot(self):
+        # AM_STATUSLINE_DIR exists but holds no limits.<label>.json
+        r = self._get()
+        self.assertEqual(r.status_code, 200)
+        account = r.get_json()["accounts"][0]
+        self.assertIn("usage", account)
+        self.assertIsNone(account["usage"])
+
+    def test_no_token_secret_or_credential_keys_in_response(self):
+        now = time.time()
+        # A snapshot carrying credential-looking fields, plus credential strings in
+        # the registry, to prove the body strips all of it.
+        self._write_snapshot(
+            "acct-a",
+            {"usedPercentage": 42.5, "resetsAt": now + 3600, "api_key": "FAKE-CREDENTIAL-123"},
+            {"usedPercentage": 7.0, "resetsAt": now + 86400, "secret": "FAKE-CREDENTIAL-456"},
+            now,
+        )
+        token_path = str(self.statusline_dir / "secrets" / "FAKE-CREDENTIAL-789")
+        accounts.add(self.storage, "acct-b", "host-b.example", token_path)
+
+        body = self._get().get_data(as_text=True)
+        self.assertIn("usage", body)  # sanity: usage IS exposed ...
+        for word in ("token", "secret", "credential", "api_key", "password", "tokenfile"):
+            self.assertNotIn(word, body.lower())
 
 
 if __name__ == "__main__":
