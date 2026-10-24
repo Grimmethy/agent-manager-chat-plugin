@@ -6,6 +6,7 @@ import {
   formatTokens, contextLabel, terminalTimer, STALE_BUSY_SECS, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
 } from '../static/sessions-view.js';
 import { rowKey, hostsOf, filterByHost } from '../static/sessions-view.js';
+import { skippedLabel } from '../static/sessions-view.js';
 
 const NOW = Date.parse('2026-10-19T12:00:00Z');
 
@@ -206,3 +207,23 @@ test('filterByHost keeps one host\'s rows, and everything when no host is given'
   assert.equal(filterByHost(rows, undefined), rows);
   assert.deepEqual(filterByHost(rows, 'nobody'), []);
 });
+
+test('skippedLabel names each skipped host with its reason, never [object Object]', () => {
+  assert.equal(skippedLabel([{ host: 'grimm', reason: 'ConnectionError' }]), 'grimm (ConnectionError)');
+  assert.equal(skippedLabel([{ host: 'grimm', reason: 'Timeout' }, { host: 'wok', reason: 'unexpected shape' }]), 'grimm (Timeout), wok (unexpected shape)');
+  assert.ok(!skippedLabel([{ host: 'grimm', reason: 'x' }]).includes('[object Object]'));
+});
+
+test('skippedLabel accepts the older bare host name, skips unusable entries, and gives an empty string for nothing', () => {
+  assert.equal(skippedLabel(['grimm', { host: 'wok' }]), 'grimm, wok');
+  assert.equal(skippedLabel([{ host: '', reason: 'x' }, {}, null, 7, '']), '');
+  assert.equal(skippedLabel([]), '');
+  assert.equal(skippedLabel(undefined), '');
+  assert.equal(skippedLabel('grimm'), '');
+  assert.equal(skippedLabel([{ host: 'wok', reason: '' }]), 'wok');
+});
+
+test('skippedLabel returns raw text (the caller escapes it)', () => {
+  assert.equal(skippedLabel([{ host: '<b>', reason: 'x&y' }]), '<b> (x&y)');
+});
+

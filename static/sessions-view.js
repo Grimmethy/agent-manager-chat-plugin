@@ -195,3 +195,18 @@ export function applyTerminalEvent(rows, event, data) {
   next[i] = data;
   return next;
 }
+
+// The line naming the hosts whose session agent could not be reached. GET api/chat/terminal-sessions reports each as {host, reason} (agent_client.list_all);
+// an older shape, a bare host name, still works. Returns plain text ('grimm (ConnectionError), wok'), '' when nothing usable: the caller escapes it.
+export function skippedLabel(skipped) {
+  if (!Array.isArray(skipped)) return '';
+  const parts = [];
+  for (const s of skipped) {
+    if (typeof s === 'string' && s !== '') parts.push(s);
+    else if (s && typeof s === 'object' && typeof s.host === 'string' && s.host !== '') {
+      parts.push(typeof s.reason === 'string' && s.reason !== '' ? `${s.host} (${s.reason})` : s.host);
+    }
+  }
+  return parts.join(', ');
+}
+

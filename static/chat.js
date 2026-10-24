@@ -24,7 +24,7 @@
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
 import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
-  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost } from "./sessions-view.js";
+  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel } from "./sessions-view.js";
 // HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
 // (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
 // split. providerLabel drives the header label, swapOptions builds the Swap menu,
@@ -837,8 +837,9 @@ class SessionSwitcher {
           }).join('')
         + '</div>';
     }
-    const skippedLine = (t.skipped && t.skipped.length)
-      ? `<div class="chat-switcher-empty">Some hosts were skipped: ${t.skipped.map(escapeHtml).join(', ')}</div>`
+    const skippedText = skippedLabel(t.skipped);
+    const skippedLine = skippedText
+      ? `<div class="chat-switcher-empty">Some hosts were skipped: ${escapeHtml(skippedText)}</div>`
       : '';
     return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${filterHtml}${body}${skippedLine}`;
   }
