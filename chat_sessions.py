@@ -54,7 +54,12 @@ PROVIDER_CLAUDE = "claude"
 # -- this is the whole point of the Chat panel (Brain Dump #153: "make edits to the
 # system"). cwd is the live repoRoot, not an isolated worktree -- see this module's own
 # header on the trust model this mirrors (this actual terminal session).
-CHAT_CLAUDE_ALLOWED_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
+# SendMessage and ListAgents (appended, 2026-09-13, HUB0009 9/13) are Claude Code's
+# own cross-session messaging tools -- the multi-chat drive link relies on them. A
+# driven session treats a peer message as NOT coming from the owner: it cannot
+# approve permission prompts, change settings or CLAUDE.md, or run slash commands,
+# and each session's message queue holds at most 50 messages.
+CHAT_CLAUDE_ALLOWED_TOOLS = "Read,Grep,Glob,Edit,Write,Bash,SendMessage,ListAgents"
 CHAT_CLAUDE_MAX_TURNS = 30
 # 2026-08-26, Grimmethy: "Seems like qwen got hung up" -- root-caused live, not actually
 # hung: model-stats.db showed 4 real completed calls (65s/16s/75s/102s), zero errors, zero
