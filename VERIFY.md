@@ -128,3 +128,10 @@ Manual browser checks (filterRows and jumpTarget are unit-tested; the box and th
 2. **No match.** A query that matches nothing shows 'No sessions match' instead of the list. (never checked)
 3. **Ctrl+1..9 jump.** With the menu open, Ctrl+1 to Ctrl+9 highlights that terminal row of the list as shown (after any host or text filter) and scrolls it into view; a number past the end does nothing, and the browser keeps the key. With the menu closed nothing happens. The browser itself may claim Ctrl+number for switching tabs; if so, note which browser. (never checked)
 4. **Read-only rows.** Jumping only highlights a row: terminal sessions still cannot be opened from the switcher. (never checked)
+
+## Popout panes (piece 10/10)
+
+Manual checks for dockview popout windows. None have ever been checked, and none can be until something defines `window.DockviewGrid`: `static/vendor/dockview.js` is vendored, but `multi-chat.js` falls back to plain panes while that global is missing, so no popout exists to test. The first two items are what to check once it does.
+
+1. **Popout keeps streaming.** A pane popped out into its own window keeps streaming a running reply while the main window is in the background. (never checked)
+2. **Closing a popout never ends a session.** Closing the popout window only removes the pane from the layout; the chat is still listed in the switcher and nothing was POSTed to `api/chat/<id>/close`. (never checked)
