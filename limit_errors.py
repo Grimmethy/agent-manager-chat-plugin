@@ -35,7 +35,8 @@ def record_sample(storage_dir, error_text):
     <storage_dir>/limit-error-samples.jsonl (file mode 0600). Called only for failed
     Claude turns, and the ERROR TEXT ONLY is stored -- never a prompt."""
     storage_dir = os.path.abspath(str(storage_dir))
-    os.makedirs(storage_dir, exist_ok=True)
+    os.makedirs(storage_dir, exist_ok=True, mode=0o700)
+    os.chmod(storage_dir, 0o700)  # makedirs' mode is ignored when the dir pre-exists
     line = {
         "at": datetime.now(timezone.utc).isoformat(),
         "text": str(error_text)[:500],
