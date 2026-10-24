@@ -54,6 +54,18 @@ body {
 
 .chat-reserve-btn.active { background: var(--warn); color: #1a1300; border-color: var(--warn); }
 
+/* HUB0008 10/11 (model swap): header provider label + Swap menu + the failed-turn
+   one-click offer. Reuses the existing :root palette and the .chat-switcher-menu /
+   .chat-switcher-row tokens -- no new colors or design tokens. */
+.chat-provider-label { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.chat-provider-label[hidden] { display: none; }
+.chat-swap-slot { position: relative; }
+.chat-swap-menu { position: absolute; top: calc(100% + 4px); right: 0; min-width: 200px; max-height: 60vh; overflow-y: auto; background: var(--panel); border: 2px solid var(--border); border-radius: 6px; z-index: 100; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
+.chat-swap-menu[hidden] { display: none; }
+.chat-swap-offer { padding: 10px 12px; background: var(--panel); border: 2px solid var(--warn); border-radius: 6px; }
+.chat-swap-offer-text { font-size: 13px; }
+.chat-swap-offer-actions { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; }
+
 .chat-context-log-panel {
   border-bottom: 2px solid var(--border); background: var(--panel);
   max-height: 40vh; display: flex; flex-direction: column;

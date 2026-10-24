@@ -40,3 +40,26 @@ session). Please re-check them on your machine; items 4-6 and 8 have never been 
 
 Also report: the `claude --version`, how many sessions were open, and any `status` or `kind`
 value that is not `busy|idle|waiting` / `interactive`.
+
+## Model swap (manual)
+
+HUB0008 10/11 (header provider label, Swap menu, one-click swap offer). Manual items only
+-- there is no automated DOM test for chat.js. Each item is marked (never checked).
+
+1. The chat header shows the loaded session's provider label (e.g. `Claude · opus · work`,
+   `Claude · sonnet · live account`, or `Local · <model>`) (never checked).
+2. The Swap button opens a menu listing the registered Claude accounts (minus the one the
+   session already uses) plus `Local model`; a local session's menu lists the accounts only
+   (never checked).
+3. Choosing a Swap menu entry performs the swap and the transcript re-renders showing the
+   swap marker row the server appended to the session (never checked).
+4. A failed Claude turn whose error carries a swap offer shows the offer text with one
+   button per offered option; errors without an offer show nothing extra (never checked).
+5. Clicking a swap-offer button performs the same swap and the offer disappears afterwards
+   (never checked).
+6. A chat whose JSON has no `schemaVersion` loads and, after its next write, carries `schemaVersion` 2 with `account`, `swaps` and `summary` added and its transcript unchanged (never checked).
+7. `POST /api/chat/<id>/swap` with `{"provider": "claude"}` or `{"provider": "local"}` answers with the updated session, appends one marker row and one `swaps` entry, keeps every earlier row, and leaves `claudeSessionId` empty (never checked).
+8. A swap with an unknown `account` answers 400 and an unknown or closed chat answers 404 (never checked).
+9. Swapping a chat that holds the local reservation to Claude releases the reservation; swapping to local never acquires one (never checked).
+10. The first Claude turn after a swap shows the hand-off in the model's view (header, summary if any, the last `CHAT_RECENT_TURNS_KEPT` rows); a long transcript gets a summary and a failed summarizer does not block the swap (never checked).
+11. `limit-error-samples.jsonl` appears in the storage directory after a real Claude limit error, and its text shows whether the assumed phrases in `limit_errors.py` match; send the shapes to the owner (never checked).
