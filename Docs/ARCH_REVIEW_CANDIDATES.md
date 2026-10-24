@@ -924,3 +924,16 @@ Benefits:
 Ensures consistent user experience by preventing contradictory labels for the same provider across different UI components. Reduces code duplication and eliminates the risk of the two implementations diverging further over time. Clarifies the codebase structure by establishing a single source of truth for provider labeling, making it easier for developers to understand and maintain the logic. Removes the naming collision, improving code readability and reducing the chance of import or reference errors.
 
 NOTE: The critique regarding `chat.js` was not applied because the file was not provided in the inputs, and the corrected draft removes all unverified claims about `chat.js` imports or aliases, focusing instead on the verifiable divergence in fallback logic and naming collision between the two provided files.
+
+### AC-70 · Duplicated atomic-write protocol in `write_snapshot` and `_atomic_write`
+Strength: Strong
+Files: (single module containing `write_snapshot` and `_atomic_write`; path not confirmed in pre-check)
+
+Problem:
+`write_snapshot` and `_atomic_write` each independently implement the same seven-step atomic-write sequence—`os.makedirs`, build a `.{pid}.tmp` path, `os.open` with `O_WRONLY|O_CREAT|O_EXCL` and mode `0o600`, `os.fdopen` + `json.dump`, `os.replace`, and `os.unlink` cleanup on failure. The only differences are the serialized object (`{**rec, "observedAt": …}` vs. a caller-supplied `obj`) and the return value (`True`/`False` vs. the destination path). Because the protocol is copy-pasted rather than shared, any future change to the write protocol—adding an `fsync` before `os.replace`, switching the tmp-name scheme to a UUID to avoid PID-reuse collisions on long-lived systems, adding a retry on `EINTR`, or changing the directory-creation mode—must be made in two places in the same file, and a change to one will silently desynchronize the other.
+
+Solution:
+Collapse the duplication by having `write_snapshot` delegate its write step to `_atomic_write`. Concretely, after the existing read-compare guard, `write_snapshot` would call `_atomic_write(directory, rec["sessionId"] + ".json", {**rec, "observedAt": int(time.time())})` and return `True` on success or `False` if the target already existed with identical content (preserving its current short-circuit). `_atomic_write` remains the single implementation of the open-write-replace-cleanup sequence, and `write_snapshot` retains only its domain-specific read-compare-then-decide logic.
+
+Benefits:
+The atomic-write protocol lives in exactly one place, so protocol changes (fsync, tmp-naming, retry, permission bits) are a single edit. The read-compare flow in `write_snapshot` is preserved unchanged, so callers see identical behavior. The file shrinks by roughly the length of the duplicated block, and the two functions now have a clear single-responsibility boundary: `_atomic_write` owns the I/O ceremony, `write_snapshot` owns the snapshot-specific policy.
