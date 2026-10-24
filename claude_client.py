@@ -46,7 +46,8 @@ class ClaudeClientError(RuntimeError):
 def generate(prompt: str, model: str = None, effort: str = None, think: bool = False,
              temperature: float = None, num_predict: int = None,
              cwd: str = None, allowed_tools: str = None, max_turns: int = None,
-             resume: str = None, add_dirs: list = None, allow_amplification: bool = False) -> dict:
+             resume: str = None, add_dirs: list = None, allow_amplification: bool = False,
+             token_file: str = None) -> dict:
     """Same return shape as ollama_client.generate(): {"response": str, "thinking": str}.
     `think`/`temperature`/`num_predict` are accepted but ignored -- they're Ollama sampling
     knobs with no Claude Code CLI equivalent; kept in the signature only so callers built
@@ -74,7 +75,14 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
     `allow_amplification` (2026-09-08, Incident Amplification, see
     src/incident-amplification-marker.js's own header) opts this call into the AMPLIFY:
     marker convention -- off by default, unlike SIDE-FINDING which is always on;
-    Chat panel only."""
+    Chat panel only.
+
+    `token_file` (HUB0008 2/11 -- pick the Claude account per call): path to a 0600
+    file holding a Claude OAuth token. When given, it is read at call time (stripped)
+    and handed to the `node` child as CLAUDE_CODE_OAUTH_TOKEN in the child env only --
+    os.environ itself, the request JSON and any log line never see it. When None,
+    nothing changes. An unreadable or empty file raises ClaudeClientError with a fixed
+    message that names neither the path nor any content."""
     request = {"prompt": prompt}
     if model:
         request["model"] = model
@@ -93,13 +101,32 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
     if allow_amplification:
         request["allowAmplification"] = True
 
+    # HUB0008 2/11: optional per-call Claude account. Read at call time and injected
+    # into the CHILD env only -- never os.environ, never the request JSON (already
+    # written above), never a log line or exception message. The error message is a
+    # fixed string on purpose: an unreadable/empty file must reveal neither the path
+    # nor any content. token_file None leaves child_env None and the call below is
+    # byte-identical to today's (no env keyword at all).
+    child_env = None
+    if token_file is not None:
+        try:
+            with open(token_file, encoding="utf-8") as _tf:
+                _token = _tf.read().strip()
+        except OSError:
+            raise ClaudeClientError("account token file is not readable")
+        if not _token:
+            raise ClaudeClientError("account token file is not readable")
+        child_env = {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": _token}
+
     tmp_path = Path(tempfile.gettempdir()) / f"claude-client-req-{uuid.uuid4().hex}.json"
     try:
         tmp_path.write_text(json.dumps(request), encoding="utf-8")
         try:
+            _run_kwargs = {"capture_output": True, "text": True, "timeout": SUBPROCESS_TIMEOUT_S}
+            if child_env is not None:
+                _run_kwargs["env"] = child_env
             result = subprocess.run(
-                ["node", str(CLAUDE_CLIENT_JS), str(tmp_path)],
-                capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S,
+                ["node", str(CLAUDE_CLIENT_JS), str(tmp_path)], **_run_kwargs
             )
         except subprocess.TimeoutExpired as e:
             # 2026-08-24 -- caught live via the Chat panel's sibling module
