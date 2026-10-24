@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  applyPreset, closePane, serialize, deserialize, firstOpenPane,
+  applyPreset, closePane, serialize, deserialize, firstOpenPane, layoutForWidth,
+  DEFAULT_TEMPLATES, saveTemplate, applyTemplate, serializeTemplates, deserializeTemplates,
 } from '../static/multi-chat.js';
 
 test('save (serialize): two open panes round-trip to JSON with preset and both session ids', () => {
@@ -94,4 +95,129 @@ test('no shared state: two independently created layout states do not affect eac
   const s2 = deserialize(stored);
   s1.panes.push('p3');
   assert.deepEqual(s2.panes, ['p1', 'p2']);
+});
+
+test('layoutForWidth: below the breakpoint collapses to the active pane in a 1-pane preset', () => {
+  const state = { preset: '2x2', panes: ['a', 'b', 'c', 'd'] };
+  assert.deepEqual(layoutForWidth(state, 'c', 400), { preset: '1', panes: ['c'] });
+  assert.deepEqual(layoutForWidth(state, 'c', 759), { preset: '1', panes: ['c'] });
+});
+
+test('layoutForWidth: at or above the breakpoint returns the very same state object', () => {
+  const state = { preset: '2col', panes: ['a', 'b'] };
+  assert.equal(layoutForWidth(state, 'a', 760), state);
+  assert.equal(layoutForWidth(state, 'a', 1200), state);
+  assert.equal(layoutForWidth(state, 'a', 500, 400), state, 'a custom breakpoint is honoured');
+  assert.deepEqual(layoutForWidth(state, 'b', 500, 600), { preset: '1', panes: ['b'] });
+});
+
+test('layoutForWidth: a null or unknown activeId falls back to the first open pane', () => {
+  const state = { preset: '2col', panes: [null, 'x', 'y'] };
+  assert.deepEqual(layoutForWidth(state, null, 300).panes, ['x']);
+  assert.deepEqual(layoutForWidth(state, 'gone', 300).panes, ['x']);
+  assert.deepEqual(layoutForWidth(state, undefined, 300).panes, ['x']);
+});
+
+test('layoutForWidth: no open panes gives an empty single-pane layout', () => {
+  assert.deepEqual(layoutForWidth({ preset: '1', panes: [] }, null, 300), { preset: '1', panes: [] });
+  assert.deepEqual(layoutForWidth({ preset: '2col', panes: [null, null] }, 'a', 300), { preset: '1', panes: [] });
+});
+
+test('layoutForWidth: never mutates its input and returns a new state when collapsing', () => {
+  const state = { preset: '2x2', panes: ['a', 'b', 'c', 'd'] };
+  const before = JSON.stringify(state);
+  const out = layoutForWidth(state, 'b', 300);
+  assert.equal(JSON.stringify(state), before);
+  assert.notEqual(out, state);
+  out.panes.push('z');
+  assert.deepEqual(state.panes, ['a', 'b', 'c', 'd']);
+});
+
+test('DEFAULT_TEMPLATES holds the two built-in recipes', () => {
+  assert.deepEqual(DEFAULT_TEMPLATES['driver + 2 workers'], { preset: '2x2', count: 3 });
+  assert.deepEqual(DEFAULT_TEMPLATES['monitor grid'], { preset: '2x2', count: 4 });
+});
+
+test('saveTemplate returns a new object with the preset and pane count, leaving the input alone', () => {
+  const templates = { a: { preset: '1', count: 1 } };
+  const before = JSON.stringify(templates);
+  const out = saveTemplate(templates, 'mine', { preset: '2col', panes: ['x', 'y'] });
+  assert.deepEqual(out, { a: { preset: '1', count: 1 }, mine: { preset: '2col', count: 2 } });
+  assert.equal(JSON.stringify(templates), before);
+  assert.notEqual(out, templates);
+  out.a.count = 9;
+  assert.equal(templates.a.count, 1);
+  assert.deepEqual(saveTemplate(templates, 'a', { preset: '1', panes: [] }).a, { preset: '1', count: 0 });
+});
+
+test('applyTemplate fills from the current panes first, then the open ids, and pads with null', () => {
+  const state = { preset: '1', panes: ['p1'] };
+  const out = applyTemplate(DEFAULT_TEMPLATES, 'driver + 2 workers', state, ['p1', 'o1', 'o2', 'o3']);
+  assert.deepEqual(out, { preset: '2x2', panes: ['p1', 'o1', 'o2', null] });
+});
+
+test('applyTemplate pads a short supply with null placeholders up to the slot count', () => {
+  const out = applyTemplate(DEFAULT_TEMPLATES, 'monitor grid', { preset: '1', panes: ['p1'] }, []);
+  assert.deepEqual(out, { preset: '2x2', panes: ['p1', null, null, null] });
+  const two = applyTemplate({ t: { preset: '2col', count: 2 } }, 't', { preset: '1', panes: [] }, []);
+  assert.deepEqual(two, { preset: '2col', panes: [null, null] });
+});
+
+test('applyTemplate reuses already placed panes once and skips null slots in the state', () => {
+  const state = { preset: '2col', panes: [null, 'a', 'a', 'b'] };
+  const out = applyTemplate(DEFAULT_TEMPLATES, 'monitor grid', state, ['b', 'c']);
+  assert.deepEqual(out.panes, ['a', 'b', 'c', null]);
+});
+
+test('applyTemplate caps a count above the preset slot count', () => {
+  const out = applyTemplate({ big: { preset: '2col', count: 9 } }, 'big', { preset: '1', panes: ['a', 'b', 'c'] }, ['d']);
+  assert.deepEqual(out, { preset: '2col', panes: ['a', 'b'] });
+});
+
+test('applyTemplate with an unknown name (or an inherited key) returns the state unchanged', () => {
+  const state = { preset: '2col', panes: ['a', 'b'] };
+  assert.equal(applyTemplate(DEFAULT_TEMPLATES, 'nope', state, ['c']), state);
+  assert.equal(applyTemplate(DEFAULT_TEMPLATES, 'constructor', state, ['c']), state);
+  assert.equal(applyTemplate({ bad: { preset: 'zzz', count: 1 } }, 'bad', state, ['c']), state);
+});
+
+test('applyTemplate ignores a template that is only inherited through the prototype', () => {
+  const inherited = Object.create({ t: { preset: '2col', count: 2 } });
+  const state = { preset: '1', panes: ['a'] };
+  assert.equal(applyTemplate(inherited, 't', state, ['b']), state);
+});
+
+test('applyTemplate never mutates its inputs and returns fresh arrays', () => {
+  const state = { preset: '1', panes: ['a'] };
+  const open = ['b', 'c'];
+  const templates = { t: { preset: '2col', count: 2 } };
+  const snap = JSON.stringify([state, open, templates]);
+  const out = applyTemplate(templates, 't', state, open);
+  assert.equal(JSON.stringify([state, open, templates]), snap);
+  out.panes.push('z');
+  assert.deepEqual(state.panes, ['a']);
+});
+
+test('serializeTemplates and deserializeTemplates round-trip', () => {
+  const templates = { a: { preset: '2col', count: 2 }, b: { preset: '2x2', count: 3 } };
+  assert.deepEqual(deserializeTemplates(serializeTemplates(templates)), templates);
+});
+
+test('deserializeTemplates falls back to a copy of the defaults for malformed JSON or a non-object', () => {
+  for (const bad of ['{nope', '', 'null', '5', '"s"', '[1,2]', undefined]) {
+    const out = deserializeTemplates(bad);
+    assert.deepEqual(out, DEFAULT_TEMPLATES);
+    assert.notEqual(out, DEFAULT_TEMPLATES);
+  }
+  const out = deserializeTemplates('{nope');
+  out['monitor grid'].count = 1;
+  assert.equal(DEFAULT_TEMPLATES['monitor grid'].count, 4, 'the fallback is a deep copy');
+});
+
+test('deserializeTemplates drops entries with a bad preset or a bad count', () => {
+  const json = JSON.stringify({
+    ok: { preset: '2col', count: 2 }, badPreset: { preset: '3x3', count: 2 }, noPreset: { count: 1 },
+    badCount: { preset: '1', count: 'x' }, negative: { preset: '1', count: -1 }, nul: null,
+  });
+  assert.deepEqual(deserializeTemplates(json), { ok: { preset: '2col', count: 2 } });
 });

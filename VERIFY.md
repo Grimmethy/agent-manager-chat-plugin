@@ -75,3 +75,63 @@ HUB0005 7/7, replacing the shorter HUB0017 list. Two machines, wok and grimm, ea
 5. **The events route.** With two hosts configured, `curl -N 'localhost:7442/api/chat/terminal-sessions/events'` answers 400; `?host=wok` streams events tagged `wok`; `?host=nobody` answers 404; `?host=grimm` with grimm stopped answers 502 (never checked).
 6. **Host badge and filter.** Each terminal row shows its host in a small badge (`.terminal-row-host-badge`); the filter lists `grimm` and `wok` sorted plus All; choosing one shows only that host's rows and All resets it (never checked).
 7. **Tokens stay server-side.** Search every response body and the event stream from items 1 to 6 for the token file paths and for the first characters of each token: neither appears (never checked).
+
+## Attention: amber flash + count badge in the chat switcher (piece 2/10)
+
+Manual DOM checks (no automated test for these). None have ever been checked.
+
+1. **Amber flash on newly waiting.** A terminal session that transitions to `waiting` shows
+   its switcher row flash amber for ~10 seconds, then settle to a steady amber highlight
+   while it stays `waiting`. (never checked)
+2. **Steady amber while waiting.** A session already `waiting` stays steady-amber on
+   subsequent updates without re-flashing. (never checked)
+3. **Title prefix.** While at least one session is `waiting`, the browser tab title reads
+   `(N) <original title>` where N is the waiting count; it restores to `<original title>`
+   when the count returns to 0. (never checked)
+4. **Parent postMessage.** Every time the waiting count changes, the switcher posts
+   `{ type: 'chat-attention', count: N }` to `window.parent` (the dashboard's tab badge
+   itself is a separate change in the dashboard repo). (never checked)
+
+## Attention: optional chime (piece 3/10)
+
+Manual browser checks (the decision itself, `shouldChime`, is unit-tested; the sound and the stored setting are not). None have ever been checked.
+
+1. **Off by default.** On a fresh profile the switcher menu ends with an unchecked "Chime when another chat needs me" box, and a session turning `waiting` makes no sound. (never checked)
+2. **Saved setting.** Ticking the box stores `chat-chime` = `1` in localStorage; after a reload it is still ticked, and unticking stores `0`. With storage blocked the page still works and the box just resets on reload. (never checked)
+3. **One short beep.** With the box ticked, a session newly turning `waiting` that is not on screen plays one short beep (about 0.2 s); a session already waiting does not repeat it. (never checked)
+4. **Silent when on screen.** In the multi-pane layout a newly waiting chat that is mounted in a pane does not chime. Terminal sessions never match chat panes, so every newly waiting terminal session chimes while the box is ticked. (never checked)
+
+## Phone width: one pane, the switcher is the navigation (piece 5/10)
+
+Manual browser checks (layoutForWidth itself is unit-tested). None have ever been checked.
+
+1. **Narrow window shows one pane.** With a 2-column or 2x2 layout saved, shrinking the window below 760 px shows only the active chat and the preset buttons (Single / Two columns / Grid 2x2) disappear. (never checked)
+2. **Widening restores the layout.** Widening back to 760 px or more brings the saved wide layout and the preset buttons back, without a reload, and `localStorage` key `chat-workspace-layout` was not changed by the narrow period. (never checked)
+3. **Load at phone width.** Loading the page already narrow shows the single active pane and no preset buttons. (never checked)
+4. **Resize is debounced.** Dragging the window edge across 760 px renders once after the drag settles (about 150 ms), and a plain resize that does not cross 760 px does not reload any pane. (never checked)
+5. **Navigation on a phone.** The session switcher inside the pane can open another chat; the old dropdown above the pane is gone. (never checked)
+
+## Layout templates menu (piece 7/10)
+
+Manual browser checks (the template functions are unit-tested; the menu and storage are not). None have ever been checked.
+
+1. **Built-ins.** The toolbar's Templates menu lists 'driver + 2 workers' and 'monitor grid'; choosing one switches to the 2x2 grid with the open chats first and empty 'New chat' slots after them, and saves that layout. (never checked)
+2. **Save current as.** 'Save current as…' opens an inline name box (no browser pop-up); typing a name and pressing Enter or Save adds it to the menu, Escape closes the box without saving; an empty name saves nothing. (never checked)
+3. **Persists per browser.** After a reload the saved template is still in the menu (localStorage key 'chat-workspace-templates'); in another browser profile it is not. (never checked)
+4. **Storage blocked.** With site storage blocked the menu still works and the built-ins show; a saved template lasts until reload. (never checked)
+
+## Filter and jump in the switcher (piece 9/10)
+
+Manual browser checks (filterRows and jumpTarget are unit-tested; the box and the shortcut are not). None have ever been checked.
+
+1. **Filter box.** The switcher menu starts with a 'Filter chats' box; typing narrows the terminal sessions by name, folder or host as you type (any case), the box keeps its text and focus while the list refreshes every 5 seconds, and clearing it restores the whole list. Chat rows are not filtered. (never checked)
+2. **No match.** A query that matches nothing shows 'No sessions match' instead of the list. (never checked)
+3. **Ctrl+1..9 jump.** With the menu open, Ctrl+1 to Ctrl+9 highlights that terminal row of the list as shown (after any host or text filter) and scrolls it into view; a number past the end does nothing, and the browser keeps the key. With the menu closed nothing happens. The browser itself may claim Ctrl+number for switching tabs; if so, note which browser. (never checked)
+4. **Read-only rows.** Jumping only highlights a row: terminal sessions still cannot be opened from the switcher. (never checked)
+
+## Popout panes (piece 10/10)
+
+Manual checks for dockview popout windows. None have ever been checked, and none can be until something defines `window.DockviewGrid`: `static/vendor/dockview.js` is vendored, but `multi-chat.js` falls back to plain panes while that global is missing, so no popout exists to test. The first two items are what to check once it does.
+
+1. **Popout keeps streaming.** A pane popped out into its own window keeps streaming a running reply while the main window is in the background. (never checked)
+2. **Closing a popout never ends a session.** Closing the popout window only removes the pane from the layout; the chat is still listed in the switcher and nothing was POSTed to `api/chat/<id>/close`. (never checked)

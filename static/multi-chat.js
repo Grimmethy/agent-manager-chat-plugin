@@ -104,11 +104,99 @@ export function firstOpenPane(state) {
   return ids.length ? ids[0] : null;
 }
 
+// Phone-width rule (HUB0010 4/10): below `breakpoint` px the workspace shows one pane, the
+// active chat (the first open pane when activeId is null or not open; none when nothing is
+// open). At or above it the same state object comes back unchanged. Never mutates `state`.
+export function layoutForWidth(state, activeId, width, breakpoint = 760) {
+  if (!(width < breakpoint)) return state;
+  const ids = openIds(state);
+  const keep = typeof activeId === 'string' && ids.includes(activeId) ? activeId : ids[0];
+  return { preset: '1', panes: keep === undefined ? [] : [keep] };
+}
+
+// Layout templates (HUB0010 6/10): named {preset, count} recipes. Plain data in, plain data
+// out; nothing here touches storage or the DOM, and no input is ever mutated.
+function slotsFor(preset) {
+  return preset === '2col' ? 2 : preset === '2x2' ? 4 : 1;
+}
+
+function idsOf(list) {
+  return Array.isArray(list) ? list.filter((p) => typeof p === 'string' && p.length > 0) : [];
+}
+
+function copyTemplates(templates) {
+  const out = {};
+  for (const name of Object.keys(templates)) out[name] = { preset: templates[name].preset, count: templates[name].count };
+  return out;
+}
+
+export const DEFAULT_TEMPLATES = {
+  'driver + 2 workers': { preset: '2x2', count: 3 },
+  'monitor grid': { preset: '2x2', count: 4 },
+};
+
+function ownTemplate(templates, name) {
+  if (!templates || typeof templates !== 'object' || !Object.prototype.hasOwnProperty.call(templates, name)) return null;
+  const t = templates[name];
+  return t && PRESETS.includes(t.preset) ? t : null;
+}
+
+// A NEW templates object with `name` set to the preset and pane count of `state`.
+export function saveTemplate(templates, name, state) {
+  const out = copyTemplates(templates && typeof templates === 'object' ? templates : {});
+  out[name] = { preset: state.preset, count: Array.isArray(state.panes) ? state.panes.length : 0 };
+  return out;
+}
+
+// A NEW state with the template's preset: panes come from state.panes first, then from
+// `openIdList` (ids not already used), up to the template's count (capped at the preset's
+// slot count), and null placeholders pad it to the slot count. An unknown name (or a
+// template with a bad preset) returns `state` unchanged.
+export function applyTemplate(templates, name, state, openIdList) {
+  const t = ownTemplate(templates, name);
+  if (!t) return state;
+  const slots = slotsFor(t.preset);
+  const want = Math.min(Number.isInteger(t.count) && t.count > 0 ? t.count : 0, slots);
+  const panes = [];
+  for (const id of idsOf(state && state.panes).concat(idsOf(openIdList))) {
+    if (panes.length >= want) break;
+    if (!panes.includes(id)) panes.push(id);
+  }
+  while (panes.length < slots) panes.push(null);
+  return { preset: t.preset, panes };
+}
+
+export function serializeTemplates(templates) {
+  return JSON.stringify(templates && typeof templates === 'object' ? templates : {});
+}
+
+// Malformed JSON, or anything that is not a plain object, gives a copy of DEFAULT_TEMPLATES.
+// Entries with an unknown preset, or a count that is not a whole number >= 0, are dropped.
+export function deserializeTemplates(json) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(json);
+  } catch (e) {
+    return copyTemplates(DEFAULT_TEMPLATES);
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return copyTemplates(DEFAULT_TEMPLATES);
+  const out = {};
+  for (const name of Object.keys(parsed)) {
+    const t = parsed[name];
+    if (t && PRESETS.includes(t.preset) && Number.isInteger(t.count) && t.count >= 0) {
+      out[name] = { preset: t.preset, count: t.count };
+    }
+  }
+  return out;
+}
+
 // ============================================================================
 // Browser-only adapter. Node imports of this module stop at the guard above.
 // ============================================================================
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   const STORAGE_KEY = 'chat-workspace-layout';
+  const TEMPLATES_KEY = 'chat-workspace-templates';
+  const TEMPLATE_NAME_MAX = 40;
   const MOBILE_MAX_WIDTH = 760;
 
   // Must be set BEFORE './chat.js' is imported: its mountChat() early-returns
@@ -131,6 +219,27 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     return raw == null ? defaultState() : deserialize(raw);
   }
 
+  // Saved templates (HUB0010 7/10): the built-ins plus whatever the user saved in this
+  // browser. Every storage access is guarded; without storage the templates just last
+  // until reload.
+  function loadTemplates() {
+    const merged = copyTemplates(DEFAULT_TEMPLATES);
+    let raw = null;
+    try {
+      raw = window.localStorage.getItem(TEMPLATES_KEY);
+    } catch (e) {
+      raw = null;
+    }
+    if (raw != null) Object.assign(merged, deserializeTemplates(raw));
+    return merged;
+  }
+
+  function persistTemplates(templates) {
+    try {
+      window.localStorage.setItem(TEMPLATES_KEY, serializeTemplates(templates));
+    } catch (e) { /* storage disabled/unavailable: the template just won't persist */ }
+  }
+
   function injectStyles() {
     if (document.getElementById('multi-chat-style')) return;
     const style = document.createElement('style');
@@ -144,9 +253,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '.multi-chat-pane.wide, .multi-chat-placeholder.wide { flex-basis:100%; }' +
       '.multi-chat-pane-head { display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:4px 8px 0; }' +
       '.multi-chat-pane-body { flex:1; min-height:0; }' +
-      '.multi-chat-placeholder { border:2px dashed var(--border,#ccc); border-radius:8px; align-items:center; justify-content:center; background:transparent; }' +
-      '.multi-chat-mobile-bar { display:flex; align-items:center; gap:8px; padding:8px 12px; }' +
-      '.multi-chat-mobile-bar select { flex:1; min-width:0; }';
+      '.multi-chat-placeholder { border:2px dashed var(--border,#ccc); border-radius:8px; align-items:center; justify-content:center; background:transparent; }';
     document.head.appendChild(style);
   }
 
@@ -188,6 +295,85 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function markPreset() {
       for (const p of PRESETS) presetButtons[p].setAttribute('aria-pressed', String(state.preset === p));
     }
+
+    // --- toolbar: templates menu + inline "save current as" (no window.prompt) ---
+    let templates = loadTemplates();
+    const tplBox = document.createElement('div');
+    tplBox.className = 'multi-chat-templates';
+    const tplSelect = document.createElement('select');
+    tplSelect.className = 'multi-chat-template-select';
+    tplSelect.setAttribute('aria-label', 'Layout templates');
+    const tplSaveBtn = document.createElement('button');
+    tplSaveBtn.type = 'button';
+    tplSaveBtn.className = 'secondary multi-chat-template-save-btn';
+    tplSaveBtn.textContent = 'Save current as…';
+    const tplSaveRow = document.createElement('span');
+    tplSaveRow.className = 'multi-chat-template-save';
+    tplSaveRow.hidden = true;
+    const tplName = document.createElement('input');
+    tplName.type = 'text';
+    tplName.className = 'multi-chat-template-name';
+    tplName.maxLength = TEMPLATE_NAME_MAX;
+    tplName.placeholder = 'Template name';
+    tplName.setAttribute('aria-label', 'Template name');
+    const tplOk = document.createElement('button');
+    tplOk.type = 'button';
+    tplOk.className = 'multi-chat-template-ok';
+    tplOk.textContent = 'Save';
+    tplSaveRow.appendChild(tplName);
+    tplSaveRow.appendChild(tplOk);
+    tplBox.appendChild(tplSelect);
+    tplBox.appendChild(tplSaveBtn);
+    tplBox.appendChild(tplSaveRow);
+    toolbar.appendChild(tplBox);
+
+    function refreshTemplateMenu() {
+      tplSelect.innerHTML = '';
+      const head = document.createElement('option');
+      head.value = '';
+      head.textContent = 'Templates…';
+      tplSelect.appendChild(head);
+      for (const name of Object.keys(templates)) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        tplSelect.appendChild(opt);
+      }
+      tplSelect.value = '';
+    }
+    refreshTemplateMenu();
+
+    tplSelect.onchange = () => {
+      const name = tplSelect.value;
+      tplSelect.value = '';
+      if (!name) return;
+      const openList = state.panes.filter((p) => typeof p === 'string' && p.length > 0);
+      state = applyTemplate(templates, name, state, openList);
+      activeId = firstOpenPane(state) || activeId;
+      saveLayout(state);
+      render();
+    };
+    function closeTemplateSave() {
+      tplSaveRow.hidden = true;
+      tplName.value = '';
+    }
+    tplSaveBtn.onclick = () => {
+      tplSaveRow.hidden = !tplSaveRow.hidden;
+      if (!tplSaveRow.hidden) tplName.focus();
+    };
+    function commitTemplate() {
+      const name = tplName.value.trim().slice(0, TEMPLATE_NAME_MAX);
+      if (!name || name === '__proto__') return; // empty names and the one name that would rewrite the object's prototype
+      templates = saveTemplate(templates, name, state);
+      persistTemplates(templates);
+      refreshTemplateMenu();
+      closeTemplateSave();
+    }
+    tplOk.onclick = commitTemplate;
+    tplName.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commitTemplate(); }
+      else if (e.key === 'Escape') closeTemplateSave();
+    });
 
     // --- one ChatPane inside a framed slot (close = DOM unmount, no API) ----
     let ChatPane = null;
@@ -303,12 +489,18 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function render() {
       host.innerHTML = ''; // unmounts every previous pane's DOM -- no network
       markPreset();
-      const wide = state.preset === '1';
-      const mounted = mountedSet(state, activeId);
+      // HUB0010 5/10: below the breakpoint what is rendered is layoutForWidth's
+      // single-pane view of the layout. `state` (and the saved layout) keeps the wide
+      // layout, so widening the window brings it back; render never saves.
+      const mobile = isMobile();
+      const view = mobile ? layoutForWidth(state, activeId, window.innerWidth || 1024, MOBILE_MAX_WIDTH) : state;
+      toolbar.hidden = mobile; // phone width: the chat's own switcher is the navigation
+      const wide = view.preset === '1';
+      const mounted = mountedSet(view, activeId);
 
       // Open panes in recency order, each with a live ChatPane when it is in the
       // mount pool (active + two most recent); otherwise a "open" placeholder.
-      const open = state.panes.map((id) => {
+      const open = view.panes.map((id) => {
         if (id === null) return null;
         if (!mounted.has(id)) {
           return { id, placeholder: true, nodes: null };
@@ -316,29 +508,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         return { id, placeholder: false, nodes: null };
       }).filter(Boolean);
 
-      if (isMobile()) {
-        // Narrow viewport: one group with a switcher, per the design rule.
-        const bar = document.createElement('div');
-        bar.className = 'multi-chat-mobile-bar';
-        const select = document.createElement('select');
-        bar.appendChild(select);
-        for (const o of open) {
-          const opt = document.createElement('option');
-          opt.value = o.id;
-          opt.textContent = o.id;
-          if (o.id === activeId) opt.selected = true;
-          select.appendChild(opt);
-        }
-        const newOpt = document.createElement('option');
-        newOpt.value = '__new__';
-        newOpt.textContent = '+ New chat';
-        select.appendChild(newOpt);
-        select.onchange = () => {
-          if (select.value === '__new__') { openNewChat(); return; }
-          activeId = select.value;
-          render();
-        };
-        host.appendChild(bar);
+      if (mobile) {
+        // Narrow viewport: one pane; the switcher inside it is the only navigation.
         const target = open.find((o) => o.id === activeId) || open[0];
         if (!target) {
           host.appendChild(placeholder('+ New chat', openNewChat, true));
@@ -422,14 +593,19 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     // Re-render only when crossing the 760px boundary (a plain resize must not
-    // throw away in-flight pane state).
+    // throw away in-flight pane state); debounced 150 ms so a drag settles first.
     let lastMobile = isMobile();
+    let resizeTimer = null;
     window.addEventListener('resize', () => {
-      const mobile = isMobile();
-      if (mobile !== lastMobile) {
-        lastMobile = mobile;
-        render();
-      }
+      if (resizeTimer !== null) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        resizeTimer = null;
+        const mobile = isMobile();
+        if (mobile !== lastMobile) {
+          lastMobile = mobile;
+          render();
+        }
+      }, 150);
     });
 
     import('./chat.js')
