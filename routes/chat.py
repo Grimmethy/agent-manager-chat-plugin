@@ -499,10 +499,14 @@ def api_chat_swap(session_id):
 def api_drive_create():
     """HUB0009 6/13 (drive hub): create a drive link between two ACTIVE plugin chats.
 
-    Body: {driver: id, target: id, turnBudget?: int, timeBudgetMin?: int}.
+    Body: {driver: id, target: id, turnBudget?: int, timeBudgetMin?: int,
+    firstMessage?: string}.
     404 (JSON naming the missing id) when either side is not an active plugin
-    chat; 400 when driver and target are the same chat. Returns the created link.
-    No relay runs here (that is a later piece)."""
+    chat; 400 when driver and target are the same chat. When firstMessage is a
+    non-empty string the bounded relay (drive_relay.run) is started in a daemon
+    thread named 'drive-<link id>' before the link is returned; when it is
+    absent/null/empty no thread starts. Returns the created link with 201 in
+    both cases -- never waiting on the relay."""
     from app import CHAT_STORAGE_DIR
     from chat_sessions import get_session
     import drive_links
@@ -523,7 +527,37 @@ def api_drive_create():
         CHAT_STORAGE_DIR, driver, target,
         turn_budget=body.get("turnBudget", 10),
         time_budget_min=body.get("timeBudgetMin", 60))
-    return jsonify(link)
+    link_id = link.get("id")
+
+    # HUB0018 2/3: an optional firstMessage starts the relay. drive_relay.run
+    # (HUB0009 7/13) is pure and takes the send function injected --
+    # drive_send.default_send (HUB0018 1/3) is exactly its expected
+    # send(session_id, text, driven_by) shape, so it is passed directly.
+    # Absent / null / empty / whitespace-only firstMessage: no thread at all.
+    first_message = body.get("firstMessage")
+    if isinstance(first_message, str) and first_message.strip():
+        import threading
+        import drive_relay
+        import drive_send
+
+        def _drive():
+            try:
+                drive_relay.run(
+                    CHAT_STORAGE_DIR, link_id, first_message,
+                    drive_send.default_send)
+            except Exception as exc:  # noqa: BLE001 -- a relay crash must never
+                # kill the Flask worker. Stop the link and log only the
+                # exception type and the link id -- NEVER the message text.
+                try:
+                    drive_links.stop(CHAT_STORAGE_DIR, link_id, reason="error")
+                except Exception:  # noqa: BLE001 -- the stop is best-effort
+                    pass
+                logger.error("drive link %s relay failed: %s",
+                             link_id, type(exc).__name__)
+
+        threading.Thread(target=_drive, name=f"drive-{link_id}", daemon=True).start()
+
+    return jsonify(link), 201
 
 
 @chat_bp.route("/api/chat/drive", methods=["GET"])
