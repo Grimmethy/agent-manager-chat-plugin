@@ -24,12 +24,30 @@
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
 import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
-  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel } from "./sessions-view.js";
+  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel, filterRows, jumpTarget } from "./sessions-view.js";
 // HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
 // (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
 // split. providerLabel drives the header label, swapOptions builds the Swap menu,
 // swapBody builds each POST body, offerText renders the failed-turn one-click offer.
 import { providerLabel, swapOptions, offerText, swapBody } from "./swap-view.js";
+// Piece 2/10: the pure "needs you" attention logic (which rows newly became waiting,
+// how many are waiting) lives in attention-view.js (piece 1). This file only calls it
+// and applies the result to the DOM; keep the decision logic there.
+import { attentionStep, shouldChime } from "./attention-view.js";
+
+// HUB0010 3/10: the optional chime when another chat needs you. The decision (is any newly waiting key off screen, is the setting on) is
+// attention-view.js shouldChime; this file only stores the setting, finds what is on screen and plays one short beep. Every storage access is
+// guarded: the page works with storage blocked, the setting then just does not persist.
+const CHIME_KEY = 'chat-chime';
+const LAYOUT_KEY = 'chat-workspace-layout'; // multi-chat.js's saved layout
+
+function readChimeSetting() {
+  try { return window.localStorage.getItem(CHIME_KEY) === '1'; } catch (e) { return false; }
+}
+
+function writeChimeSetting(on) {
+  try { window.localStorage.setItem(CHIME_KEY, on ? '1' : '0'); } catch (e) { /* storage unavailable: the choice lasts until reload */ }
+}
 
 let toastHideTimer = null;
 
@@ -675,22 +693,48 @@ class SessionSwitcher {
     this._eventSignature = null;
     // Terminal-section host filter: '' means All.
     this.hostFilter = '';
+    // HUB0010 9/10: the type-to-filter query (terminal rows only), the terminal rows as
+    // last DISPLAYED (what Ctrl+1..9 counts), and the key of the row Ctrl+N jumped to.
+    this.filterQuery = '';
+    this.displayedTerminalRows = [];
+    this.jumpedKey = null;
     this.open = false;
     this.pollTimer = null;
+    // Attention state (piece 2/10): the previous {key: status} map returned by
+    // attentionStep (attention-view.js, piece 1), the set of keys that newly became
+    // waiting on the last step (drives the amber flash class), the count we last
+    // posted, and the page's original <title> so we can prefix/restore it. Holds only
+    // row identity + status strings -- never any token/credential.
+    this.attentionPrev = null;
+    this.attentionNewlyWaiting = new Set();
+    this.lastAttentionCount = null;
+    this.originalTitle = (typeof document !== 'undefined' && document) ? document.title : null;
+    // Chime (HUB0010 3/10): off by default, remembered under localStorage 'chat-chime'; the AudioContext is created lazily after a user gesture.
+    this.chimeEnabled = readChimeSetting();
+    this.audioCtx = null;
     this.slot.innerHTML = `
       <button type="button" class="secondary chat-switcher-btn" aria-haspopup="listbox" aria-expanded="false"></button>
       <div class="chat-switcher-menu" hidden></div>`;
     this.btn = this.slot.querySelector('.chat-switcher-btn');
     this.menu = this.slot.querySelector('.chat-switcher-menu');
+    // The filter box lives outside the list that render() rebuilds, so typing never
+    // loses its value or focus when the list refreshes.
+    this.menu.innerHTML = '<input type="text" class="chat-switcher-filter" placeholder="Filter chats" aria-label="Filter chats" autocomplete="off"><div class="chat-switcher-list"></div>';
+    this.filterInput = this.menu.querySelector('.chat-switcher-filter');
+    this.list = this.menu.querySelector('.chat-switcher-list');
+    this.filterInput.addEventListener('input', () => { this.filterQuery = this.filterInput.value; this.jumpedKey = null; this.render(); });
     this.btn.onclick = (e) => { e.stopPropagation(); this.setOpen(!this.open); };
     this.menu.addEventListener('click', (e) => this.onMenuClick(e));
+    this.menu.addEventListener('change', (e) => this.onMenuChange(e));
     document.addEventListener('click', (e) => { if (this.open && !this.slot.contains(e.target)) this.setOpen(false); });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.open) this.setOpen(false); });
+    document.addEventListener('keydown', (e) => this.onJumpKey(e));
     this.renderButton();
   }
 
   setOpen(open) {
     this.open = open;
+    if (!open) this.jumpedKey = null;
     this.menu.hidden = !open;
     this.btn.setAttribute('aria-expanded', String(open));
     clearInterval(this.pollTimer);
@@ -732,6 +776,7 @@ class SessionSwitcher {
         let data = null;
         try { data = JSON.parse(e.data); } catch (err) { return; }
         this.terminal.rows = applyTerminalEvent(this.terminal.rows, name, data);
+        this.applyAttention(); // piece 2/10: after each terminal-rows update
         this.render();
       });
     }
@@ -741,6 +786,51 @@ class SessionSwitcher {
     for (const host of Object.keys(this.hostEvents)) this.hostEvents[host].close();
     this.hostEvents = {};
     this._eventSignature = null;
+  }
+
+  // Piece 2/10: after EVERY terminal-rows update, run the pure attention step
+  // (attention-view.js, piece 1) and apply its result to the DOM:
+  //   - the amber classes come from this.attentionNewlyWaiting (used in
+  //     renderTerminalSection/renderTerminalRow below),
+  //   - the tab <title> becomes '(N) <original>' while anything is waiting and is
+  //     restored at 0,
+  //   - the parent (dashboard) is told the count via postMessage.
+  // NOTE: the dashboard's own tab BADGE is a separate change in the dashboard repo and
+  // is intentionally NOT implemented here -- we only post the count.
+  // All decision logic stays in attention-view.js; this method only reads its result
+  // and wires the DOM. Every browser API (document, window.parent, postMessage,
+  // location.origin) is guarded so nothing throws in a non-DOM / test environment.
+  applyAttention() {
+    if (typeof attentionStep !== 'function') return;
+    const rows = (this.terminal && Array.isArray(this.terminal.rows)) ? this.terminal.rows : [];
+    let res;
+    try {
+      res = attentionStep(this.attentionPrev, rows);
+    } catch (err) {
+      return; // never let attention break the switcher
+    }
+    this.attentionPrev = res.map;
+    this.attentionNewlyWaiting = new Set(res.newlyWaiting);
+    if (res.newlyWaiting.length) this.maybeChime(res.newlyWaiting);
+
+    // Tab title: '(N) <original>' while N > 0, restored when N is 0.
+    if (typeof document !== 'undefined' && document && this.originalTitle != null) {
+      document.title = res.count > 0 ? '(' + res.count + ') ' + this.originalTitle : this.originalTitle;
+    }
+
+    // Tell the dashboard on every change of count (its badge is a separate repo change).
+    if (res.count !== this.lastAttentionCount) {
+      this.lastAttentionCount = res.count;
+      try {
+        if (typeof window !== 'undefined' && window && window.parent &&
+            typeof window.parent.postMessage === 'function') {
+          const origin = (window.location && window.location.origin) ? window.location.origin : '*';
+          window.parent.postMessage({ type: 'chat-attention', count: res.count }, origin);
+        }
+      } catch (err) {
+        // postMessage to an opaque/unknown origin can throw SecurityError -- ignore.
+      }
+    }
   }
 
   async refresh() {
@@ -761,6 +851,7 @@ class SessionSwitcher {
     } catch (e) {
       // Same: keep what we had.
     }
+    this.applyAttention(); // piece 2/10: after each terminal-rows update
     // Host list can change between polls (agent added/removed): re-sync the streams.
     if (this.open) this.startEvents();
     this.render();
@@ -796,14 +887,20 @@ class SessionSwitcher {
   }
 
   // A terminal session row: display only (no select, no close) until a handoff exists.
-  // `showHost` gates the host badge: pointless when every row shares one host.
-  renderTerminalRow(fmt, showHost) {
+  // `showHost` gates the host badge: pointless when every row shares one host. `newlyWaiting` (piece 2/10): a row that just became waiting also flashes amber.
+  renderTerminalRow(fmt, newlyWaiting, showHost, jumped) {
     const ctx = fmt.context ? `<span class="chat-switcher-context">${escapeHtml(fmt.context)}</span>` : '';
     const step = fmt.step ? `<div class="chat-switcher-step">${escapeHtml(fmt.step)}</div>` : '';
     const badge = (showHost && fmt.host)
       ? `<span class="terminal-row-host-badge">${escapeHtml(fmt.host)}</span>`
       : '';
-    return `<div class="chat-switcher-trow" title="${escapeHtml(fmt.fullTitle)}">
+    // Piece 2/10: a waiting row is steady-amber (.waiting); a row that newly became
+    // waiting additionally flashes amber (.waiting-flash) for 10s via chat.css.
+    const trowCls = 'chat-switcher-trow'
+      + (fmt.waiting ? ' waiting' : '')
+      + (fmt.waiting && newlyWaiting ? ' waiting-flash' : '')
+      + (jumped ? ' jumped' : '');
+    return `<div class="${trowCls}" title="${escapeHtml(fmt.fullTitle)}">
       <div class="chat-switcher-title">${escapeHtml(fmt.title)}${badge}</div>
       <div class="chat-switcher-meta">
         <span class="chat-switcher-status${fmt.busy ? ' busy' : ''}${fmt.waiting ? ' waiting' : ''}">${escapeHtml(fmt.status)}</span>
@@ -823,10 +920,20 @@ class SessionSwitcher {
     let selectedHost = multiHost ? this.hostFilter : '';
     if (selectedHost && !hosts.includes(selectedHost)) selectedHost = '';
     let body;
+    // What is on screen, in order (host filter, then the text filter): Ctrl+1..9 counts these.
+    const displayed = (t.reachable && t.rows.length) ? filterRows(filterByHost(rows, selectedHost), this.filterQuery) : [];
+    this.displayedTerminalRows = displayed;
     if (!t.reachable) body = '<div class="chat-switcher-empty">Session agent unreachable</div>';
     else if (!t.rows.length) body = '<div class="chat-switcher-empty">No terminal sessions</div>';
-    else body = filterByHost(rows, selectedHost)
-      .map((r) => this.renderTerminalRow(formatTerminalRow(r, now), multiHost)).join('');
+    else if (!displayed.length) body = '<div class="chat-switcher-empty">No sessions match</div>';
+    else body = displayed.map((r) => {
+      // Piece 2/10: match this row against the newly-waiting keys from the last
+      // attention step (key rule mirrors attention-view.js keyOf: host/id when a host
+      // is present, else the id) to add the amber-flash class.
+      const key = r.host ? (r.host || '') + '/' + r.id : r.id;
+      const newly = (r.status === 'waiting') && this.attentionNewlyWaiting.has(key);
+      return this.renderTerminalRow(formatTerminalRow(r, now), newly, multiHost, key === this.jumpedKey);
+    }).join('');
     let filterHtml = '';
     if (multiHost) {
       const options = [''].concat(hosts);
@@ -844,13 +951,103 @@ class SessionSwitcher {
     return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${filterHtml}${body}${skippedLine}`;
   }
 
+  // The chime setting row at the foot of the switcher menu.
+  renderChimeSetting() {
+    return `<label class="chat-chime-setting"><input type="checkbox" class="chat-chime-input"${this.chimeEnabled ? ' checked' : ''}> Chime when another chat needs me</label>`;
+  }
+
+  // Keys of the chat panes on screen: the panes multi-chat.js mounts, or just the active chat when multi-chat.js is not loaded. chat.js must not import
+  // multi-chat.js statically (that module's browser adapter sets window.__CHAT_MULTI_PANES__ and imports this file), so it is loaded on demand, and only
+  // when the flag shows it is already running: the import then returns the same module instance.
+  async onScreenKeys() {
+    const active = this.getSelectedId();
+    const fallback = active ? [active] : [];
+    try {
+      if (typeof window === 'undefined' || !window.__CHAT_MULTI_PANES__) return fallback;
+      let raw = null;
+      try { raw = window.localStorage.getItem(LAYOUT_KEY); } catch (e) { raw = null; }
+      if (raw == null) return fallback;
+      const mc = await import('./multi-chat.js');
+      return [...mc.mountedSet(mc.deserialize(raw), active)];
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  ensureAudio() {
+    try {
+      if (this.audioCtx) {
+        if (this.audioCtx.state === 'suspended') this.audioCtx.resume();
+        return this.audioCtx;
+      }
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return null;
+      this.audioCtx = new Ctx();
+      return this.audioCtx;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // One short beep (880 Hz, about 200 ms); no audio file. Silent when audio is unavailable or blocked.
+  beep() {
+    try {
+      const ctx = this.ensureAudio();
+      if (!ctx) return;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = 880;
+      gain.gain.value = 0.08;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.2);
+    } catch (e) { /* never let a chime break the switcher */ }
+  }
+
+  async maybeChime(newlyWaiting) {
+    try {
+      if (!this.chimeEnabled) return;
+      const keys = await this.onScreenKeys();
+      if (shouldChime(newlyWaiting, keys, this.chimeEnabled)) this.beep();
+    } catch (e) { /* attention must never break the switcher */ }
+  }
+
+  onMenuChange(e) {
+    const box = e.target.closest ? e.target.closest('.chat-chime-input') : null;
+    if (!box) return;
+    this.chimeEnabled = !!box.checked;
+    writeChimeSetting(this.chimeEnabled);
+    if (this.chimeEnabled) this.ensureAudio(); // the change event is the user gesture that lets audio start
+  }
+
   render() {
     this.renderButton();
     const now = Date.now();
     const selectedId = this.getSelectedId();
-    this.menu.innerHTML = `<div class="chat-switcher-new" role="option">+ New chat</div>`
+    this.list.innerHTML = `<div class="chat-switcher-new" role="option">+ New chat</div>`
       + this.rows.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('')
-      + this.renderTerminalSection(now);
+      + this.renderTerminalSection(now)
+      + this.renderChimeSetting();
+  }
+
+  // Ctrl+1..Ctrl+9 while the switcher is open: jump to the nth DISPLAYED terminal row. Terminal
+  // rows are read-only (no hand-off exists yet), so "select" means highlight the row and scroll it
+  // into view. Nothing else is touched, and the key is left alone (no preventDefault) unless a
+  // row was actually found.
+  onJumpKey(e) {
+    try {
+      if (!this.open || !e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+      if (typeof e.key !== 'string' || !/^[1-9]$/.test(e.key)) return;
+      const key = jumpTarget(this.displayedTerminalRows, Number(e.key));
+      if (key === null) return;
+      e.preventDefault();
+      this.jumpedKey = key;
+      this.render();
+      const el = this.list.querySelector('.chat-switcher-trow.jumped');
+      if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'nearest' });
+    } catch (err) { /* a shortcut must never break the switcher */ }
   }
 
   async onMenuClick(e) {

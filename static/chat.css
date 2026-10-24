@@ -44,6 +44,21 @@ body {
 .chat-switcher-step { font-size: 11px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-switcher-empty { padding: 8px 12px; font-size: 12px; color: var(--muted); }
 .chat-switcher-status.waiting { color: var(--accent); }
+
+/* Piece 2/10: "needs you" amber highlight for waiting terminal rows. A row that is
+   waiting is steady-amber (.waiting); a row that *newly* became waiting additionally
+   flashes amber for 10s (.waiting-flash, driven by chat.js from attention-view.js).
+   The flash animation ends back on the steady amber, so waiting rows stay amber after
+   the 10s. Uses the existing --warn (amber) token. */
+.chat-switcher-trow.waiting { background: color-mix(in srgb, var(--warn) 14%, transparent); border-left: 3px solid var(--warn); padding-left: 9px; }
+.chat-chime-setting { display: block; padding: 8px 12px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted, inherit); cursor: pointer; }
+.chat-chime-setting input { margin-right: 6px; vertical-align: middle; }
+.chat-switcher-trow.waiting-flash { animation: chat-amber-flash 10s ease-in-out; }
+@keyframes chat-amber-flash {
+  0%   { background: var(--warn); color: #1a1300; }
+  50%  { background: color-mix(in srgb, var(--warn) 40%, transparent); }
+  100% { background: color-mix(in srgb, var(--warn) 14%, transparent); }
+}
 .chat-switcher-close { padding: 2px 8px; line-height: 1.2; }
 
 /* Same flexbox-trap fix the in-tree version's own CSS comment documents: min-height:0 on
@@ -146,3 +161,16 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 
 /* HUB0017: host badge on terminal rows */
 .terminal-row-host-badge { display: inline-block; padding: 1px 6px; margin-left: 6px; font-size: 0.75em; font-weight: 600; line-height: 1.4; color: var(--text, #e0e0e0); background: var(--panel, #3a3a4a); border-radius: 4px; vertical-align: baseline; white-space: nowrap; }
+
+/* phone width (HUB0010 5/10): multi-chat.js sets [hidden] on the preset toolbar below 760px; its own display:flex would otherwise win */
+.multi-chat-toolbar[hidden] { display: none; }
+
+/* layout templates menu (HUB0010 7/10) */
+.multi-chat-templates { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.multi-chat-template-save { display: inline-flex; align-items: center; gap: 4px; }
+.multi-chat-template-save[hidden] { display: none; }
+.multi-chat-template-name { width: 11em; min-width: 0; }
+
+/* filter box and Ctrl+1..9 jump (HUB0010 9/10) */
+.chat-switcher-filter { display: block; box-sizing: border-box; width: calc(100% - 16px); margin: 8px; }
+.chat-switcher-trow.jumped { outline: 2px solid var(--accent); outline-offset: -2px; }

@@ -161,6 +161,27 @@ export function filterByHost(rows, host) {
   return rows.filter((r) => (r.host || '') === host);
 }
 
+// Type-to-filter (HUB0010 8/10): case-insensitive substring match of the trimmed query
+// against a row's name, cwd and host (a missing field counts as empty). An empty or
+// whitespace-only query returns `rows` itself, in the order given.
+export function filterRows(rows, query) {
+  const needle = String(query == null ? '' : query).trim().toLowerCase();
+  if (needle === '') return rows;
+  const has = (value) => String(value == null ? '' : value).toLowerCase().includes(needle);
+  return rows.filter((r) => !!r && (has(r.name) || has(r.cwd) || has(r.host)));
+}
+
+// Ctrl+1..9 jump: the key of the nth row of the order GIVEN (the caller passes the order on
+// screen), or null for n outside 1-9 or past the end. The key is host/id when the row has a
+// host and just the id otherwise: the same form the attention code uses for newly waiting
+// sessions (not rowKey, which always carries the slash).
+export function jumpTarget(rows, n) {
+  if (!Array.isArray(rows) || !Number.isInteger(n) || n < 1 || n > 9) return null;
+  const row = rows[n - 1];
+  if (!row) return null;
+  return row.host ? row.host + '/' + row.id : row.id;
+}
+
 // Waiting (needs you) first, then busy, then idle; ties by host, then title, so the list
 // does not jump.
 export function orderTerminalSessions(rows) {
