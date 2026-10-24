@@ -495,6 +495,91 @@ def api_chat_swap(session_id):
     return jsonify(_public_session(updated))
 
 
+@chat_bp.route("/api/chat/drive", methods=["POST"])
+def api_drive_create():
+    """HUB0009 6/13 (drive hub): create a drive link between two ACTIVE plugin chats.
+
+    Body: {driver: id, target: id, turnBudget?: int, timeBudgetMin?: int}.
+    404 (JSON naming the missing id) when either side is not an active plugin
+    chat; 400 when driver and target are the same chat. Returns the created link.
+    No relay runs here (that is a later piece)."""
+    from app import CHAT_STORAGE_DIR
+    from chat_sessions import get_session
+    import drive_links
+
+    body = request.get_json(silent=True) or {}
+    driver = (body.get("driver") or "").strip()
+    target = (body.get("target") or "").strip()
+    for label, sid in (("driver", driver), ("target", target)):
+        if not sid:
+            abort(400, description=f"{label} is required")
+    for label, sid in (("driver", driver), ("target", target)):
+        s = get_session(CHAT_STORAGE_DIR, sid)
+        if not s or s.get("status") != "active":
+            return jsonify({"error": f"no active plugin chat '{sid}' for {label}"}), 404
+    if driver == target:
+        abort(400, description="driver and target must be different chats")
+    link = drive_links.create(
+        CHAT_STORAGE_DIR, driver, target,
+        turn_budget=body.get("turnBudget", 10),
+        time_budget_min=body.get("timeBudgetMin", 60))
+    return jsonify(link)
+
+
+@chat_bp.route("/api/chat/drive", methods=["GET"])
+def api_drive_list():
+    """HUB0009 6/13: every drive link (active and stopped)."""
+    from app import CHAT_STORAGE_DIR
+    import drive_links
+    return jsonify({"links": drive_links.list_links(CHAT_STORAGE_DIR)})
+
+
+@chat_bp.route("/api/chat/drive/<link_id>/log", methods=["GET"])
+def api_drive_log(link_id):
+    """HUB0009 6/13: the last 50 drive-log entries for this link's pair (driver,
+    target) -- a record is the pair's when its from or to is either of them."""
+    from app import CHAT_STORAGE_DIR
+    import drive_links
+    import drive_log
+    link = drive_links.get(CHAT_STORAGE_DIR, link_id)
+    if link is None:
+        abort(404, description="no such drive link")
+    driver = link.get("driver")
+    target = link.get("target")
+    entries = []
+    seen = set()
+    for rec in drive_log.tail(CHAT_STORAGE_DIR, 50, pair=driver) + drive_log.tail(CHAT_STORAGE_DIR, 50, pair=target):
+        key = (rec.get("time"), rec.get("from"), rec.get("to"), rec.get("text"))
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(rec)
+    return jsonify({"entries": entries})
+
+
+@chat_bp.route("/api/chat/drive/<link_id>/stop", methods=["POST"])
+def api_drive_stop(link_id):
+    """HUB0009 6/13: stop a drive link. When the target is a LOCAL-provider plugin
+    chat, also request cancellation of its running turn (turn_cancel.request);
+    a Claude turn cannot be interrupted, so for a Claude target the response says
+    'cancelled': false and no cancel request is made. 404 for an unknown link."""
+    from app import CHAT_STORAGE_DIR
+    from chat_sessions import get_session, PROVIDER_LOCAL
+    import drive_links
+    import turn_cancel
+    link = drive_links.stop(CHAT_STORAGE_DIR, link_id, reason="user")
+    if link is None:
+        abort(404, description="no such drive link")
+    cancelled = False
+    target = link.get("target")
+    target_session = get_session(CHAT_STORAGE_DIR, target)
+    if target_session and target_session.get("provider") == PROVIDER_LOCAL:
+        turn_cancel.request(target)
+        cancelled = True
+    link["cancelled"] = cancelled
+    return jsonify(link)
+
+
 @chat_bp.route("/api/chat/<session_id>/template/save", methods=["POST"])
 def api_chat_template_save(session_id):
     """The Save button on a template proposal card. Body: {entry, index, key?, text?} --

@@ -582,5 +582,100 @@ class TerminalSessionsMultiHostRouteTest(unittest.TestCase):
         resp.close()
 
 
+DRIVER = "drive-driver"
+TARGET = "drive-target"
+
+
+def _plain_session(sid, provider):
+    root = str(app.CORE_REPO_ROOT)
+    return {
+        "id": sid, "provider": provider, "model": None, "effort": None,
+        "roots": [root], "repoRoot": root, "instancesDir": None,
+        "claudeSessionId": None, "transcript": [],
+        "status": "active", "startedAt": "2026-10-18T00:00:00Z", "endedAt": None,
+        "reserved": False,
+    }
+
+
+class DriveRouteTest(RouteTestBase):
+    """HUB0009 6/13: create, list, read the log of, and stop drive links.
+    Fake ids only -- no token or credential appears anywhere in these tests."""
+
+    def _store_pair(self, target_provider="local"):
+        chat_sessions._write_sessions(self.storage, {
+            DRIVER: _plain_session(DRIVER, "local"),
+            TARGET: _plain_session(TARGET, target_provider),
+        })
+
+    def _create(self):
+        resp = self.client.post("/api/chat/drive", json={"driver": DRIVER, "target": TARGET})
+        self.assertEqual(resp.status_code, 200)
+        return resp.get_json()
+
+    def test_create_then_list(self):
+        self._store_pair()
+        link = self._create()
+        self.assertEqual(link["driver"], DRIVER)
+        self.assertEqual(link["target"], TARGET)
+        self.assertTrue(link["active"])
+        self.assertTrue(link["id"].startswith("drive-"))
+        links = self.client.get("/api/chat/drive").get_json()["links"]
+        self.assertTrue(any(l["id"] == link["id"] for l in links))
+
+    def test_missing_chat_is_404_naming_it(self):
+        self._store_pair()
+        resp = self.client.post("/api/chat/drive", json={"driver": "nope", "target": TARGET})
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("nope", resp.get_json()["error"])
+        resp = self.client.post("/api/chat/drive", json={"driver": DRIVER, "target": "nope"})
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("nope", resp.get_json()["error"])
+
+    def test_same_driver_and_target_is_400(self):
+        self._store_pair()
+        resp = self.client.post("/api/chat/drive", json={"driver": DRIVER, "target": DRIVER})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_log_returns_the_pairs_entries(self):
+        self._store_pair()
+        link = self._create()
+        drive_log.append(self.storage, DRIVER, TARGET, "a-to-b")
+        drive_log.append(self.storage, TARGET, DRIVER, "b-to-a")
+        drive_log.append(self.storage, "unrelated", "someone-else", "other")
+        entries = self.client.get(f"/api/chat/drive/{link['id']}/log").get_json()["entries"]
+        self.assertEqual([e["text"] for e in entries], ["a-to-b", "b-to-a"])
+        self.assertEqual(self.client.get("/api/chat/drive/no-such-link/log").status_code, 404)
+
+    def test_stop_local_target_stops_and_cancels(self):
+        self._store_pair(target_provider="local")
+        link = self._create()
+        import turn_cancel
+        with mock.patch.object(turn_cancel, "request") as req:
+            resp = self.client.post(f"/api/chat/drive/{link['id']}/stop")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertFalse(body["active"])
+        self.assertEqual(body["stopReason"], "user")
+        self.assertTrue(body["cancelled"])
+        req.assert_called_once_with(TARGET)
+        import drive_links
+        self.assertFalse(drive_links.get(self.storage, link["id"])["active"])
+
+    def test_stop_claude_target_stops_but_does_not_cancel(self):
+        self._store_pair(target_provider="claude")
+        link = self._create()
+        import turn_cancel
+        with mock.patch.object(turn_cancel, "request") as req:
+            resp = self.client.post(f"/api/chat/drive/{link['id']}/stop")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertFalse(body["active"])
+        self.assertFalse(body["cancelled"])
+        req.assert_not_called()
+
+    def test_stop_unknown_link_is_404(self):
+        self.assertEqual(self.client.post("/api/chat/drive/no-such-link/stop").status_code, 404)
+
+
 if __name__ == "__main__":
     unittest.main()
