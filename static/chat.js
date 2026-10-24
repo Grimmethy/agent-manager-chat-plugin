@@ -24,7 +24,7 @@
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
 import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
-  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel, filterRows, jumpTarget } from "./sessions-view.js";
+  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel, filterRows, emptyLabel, jumpTarget } from "./sessions-view.js";
 // HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
 // (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
 // split. providerLabel drives the header label, swapOptions builds the Swap menu,
@@ -924,7 +924,7 @@ class SessionSwitcher {
     const displayed = (t.reachable && t.rows.length) ? filterRows(filterByHost(rows, selectedHost), this.filterQuery) : [];
     this.displayedTerminalRows = displayed;
     if (!t.reachable) body = '<div class="chat-switcher-empty">Session agent unreachable</div>';
-    else if (!t.rows.length) body = '<div class="chat-switcher-empty">No terminal sessions</div>';
+    else if (!t.rows.length) body = `<div class="chat-switcher-empty">${escapeHtml(emptyLabel(t.hosts))}</div>`;
     else if (!displayed.length) body = '<div class="chat-switcher-empty">No sessions match</div>';
     else body = displayed.map((r) => {
       // Piece 2/10: match this row against the newly-waiting keys from the last
