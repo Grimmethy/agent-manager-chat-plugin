@@ -120,7 +120,8 @@ def _migrate_legacy_store(storage_dir: Path):
         except (OSError, json.JSONDecodeError) as e:
             print(f"[chat-sessions] legacy store {legacy} unreadable, not migrated: {e}", file=sys.stderr, flush=True)
             return
-        sessions_dir(storage_dir).mkdir(parents=True, exist_ok=True)
+        sessions_dir(storage_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(sessions_dir(storage_dir), 0o700)
         for sid, session in (sessions or {}).items():
             try:
                 if not _session_path(storage_dir, sid).exists():
@@ -167,7 +168,11 @@ def _write_session(storage_dir: Path, session: dict):
     """Writes ONE session atomically: a unique temp file in the same directory, then
     os.replace, so a reader never sees half a file and two writers never share a temp."""
     p = _session_path(storage_dir, session["id"])
-    p.parent.mkdir(parents=True, exist_ok=True)
+    # mode=0o700 so the sessions dir is owner-only even under a permissive umask
+    # (mkdir's mode is ignored when exist_ok=True and the dir already exists, so
+    # chmod the existing dir too -- same pattern as accounts.py's _save).
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(p.parent, 0o700)
     fd, tmp = tempfile.mkstemp(prefix=f".{session['id']}.", suffix=".tmp", dir=p.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

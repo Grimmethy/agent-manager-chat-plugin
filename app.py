@@ -44,7 +44,10 @@ STATE_DIR = Path(os.environ.get(
     "AGENT_MANAGER_CHAT_STORAGE_DIR",
     str(Path.home() / ".local/state/agent-manager-chat-plugin/sessions"),
 )).resolve()
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+# Owner-only: this dir holds per-user session JSON (mode= is skipped when the dir
+# already exists, so chmod the existing dir too -- see accounts.py's _save).
+STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+os.chmod(STATE_DIR, 0o700)
 CHAT_STORAGE_DIR = STATE_DIR
 
 
