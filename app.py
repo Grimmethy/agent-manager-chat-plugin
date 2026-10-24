@@ -46,8 +46,16 @@ STATE_DIR = Path(os.environ.get(
 )).resolve()
 # Owner-only: this dir holds per-user session JSON (mode= is skipped when the dir
 # already exists, so chmod the existing dir too -- see accounts.py's _save).
+# chmod is best-effort: if the dir is owned by another user we log-and-continue
+# rather than crash the plugin at import time.
 STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-os.chmod(STATE_DIR, 0o700)
+try:
+    os.chmod(STATE_DIR, 0o700)
+except OSError:
+    # Dir pre-exists and is owned by another user (e.g. leftover from a
+    # previous install or a shared home). Best-effort: we still want to use
+    # the dir for session storage rather than crash at import time.
+    pass
 CHAT_STORAGE_DIR = STATE_DIR
 
 
