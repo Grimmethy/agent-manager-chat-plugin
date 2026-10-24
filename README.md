@@ -134,6 +134,30 @@ gets a read-only "Terminal sessions" group (status, timer, current step, context
 `GET api/chat/terminal-sessions` and the SSE passthrough `GET api/chat/terminal-sessions/events`
 (the token stays server-side). Unset URL = feature off; agent down = "Session agent unreachable".
 
+### Several session agents (multi-host)
+
+One chat panel can show terminal sessions from several machines, each running its own `session_agent.py`.
+
+| Variable | Meaning |
+|---|---|
+| `AGENT_MANAGER_SESSION_AGENT_URLS` | JSON list of `{host, url, tokenFile}` objects. `host` (the name shown in the badge and used in `?host=`) and `url` are required; `tokenFile` is optional. An entry missing `host` or `url` is skipped with a log warning, a duplicate `host` keeps the first, a trailing `/` on `url` is dropped. When this variable is set and non-empty it wins over the singular variables below. If its value is not a JSON list, the feature is off (it does not fall back to the singular variables). |
+| `AGENT_MANAGER_SESSION_AGENT_URL`, `AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE`, `AGENT_MANAGER_SESSION_AGENT_TOKEN` | The single-host form, unchanged: when the plural variable is unset they still work and give exactly one host named `default`. A token file wins over the static token. |
+
+- **Tokens** are read on every call (a rotated token file needs no restart), stay on the server, and each host's token is sent only to that host; a host with no token gets no `Authorization` header. No token, token path or `tokenFile` value appears in any response body or in the event stream.
+- **A host that is down is skipped, not fatal.** `GET api/chat/terminal-sessions` answers `{enabled, reachable, sessions, hosts, skipped}`: `hosts` are the configured names in config order, every row in `sessions` carries a `host`, `skipped` has one `{host, reason}` per host that failed (the reason is the exception class name, or `unexpected shape`), and `reachable` is true while at least one host answered. Hosts that answered are listed as usual.
+- **Events.** `GET api/chat/terminal-sessions/events?host=<name>` streams one host's events, tagged with that host. The `host` parameter is optional with a single configured host; with several it is required (400 when missing, 404 for an unknown name, 502 when that host cannot be reached).
+
+Worked example, wok (this machine) plus grimm. Token files live outside the repository, mode 0600. The grimm address below is the one in use when this was written: check `tailscale status` for the current one.
+
+```
+AGENT_MANAGER_SESSION_AGENT_URLS='[
+  {"host": "wok",   "url": "http://127.0.0.1:7450",      "tokenFile": "/home/wok/.local/state/agent-manager/session-agent.token"},
+  {"host": "grimm", "url": "http://100.96.112.78:7450",  "tokenFile": "/home/wok/.config/agent-manager-chat-plugin/grimm-session-agent.token"}
+]'
+```
+
+The first token file is the default `--token-file` of the local agent (`--token auto`). The second holds a copy of the token the grimm agent printed or wrote; copy it by hand, keep it 0600, and never commit it. On grimm the agent must listen beyond loopback and name the address it is reached by: `session_agent.py --bind 0.0.0.0 --token auto --allow-host 100.96.112.78` (a non-loopback bind refuses to start without a token).
+
 ## Model swap (multi-chat)
 
 A live chat can change the model behind it without losing the conversation. Nothing here is checked against a real swap yet; see the `Model swap (manual)` section of `VERIFY.md`.

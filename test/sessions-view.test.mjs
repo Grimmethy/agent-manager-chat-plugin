@@ -5,6 +5,8 @@ import {
   orderSessions, nextSelectionAfterClose, formatRow,
   formatTokens, contextLabel, terminalTimer, STALE_BUSY_SECS, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
 } from '../static/sessions-view.js';
+import { rowKey, hostsOf, filterByHost } from '../static/sessions-view.js';
+import { skippedLabel } from '../static/sessions-view.js';
 
 const NOW = Date.parse('2026-10-19T12:00:00Z');
 
@@ -142,3 +144,86 @@ test('busy with no transcript activity for a long time is flagged, not timed', (
     lastActivityAt: '2026-10-19T00:00:00Z' }, NOW), 'idle 12h'); // only busy rows are flagged
   assert.equal(STALE_BUSY_SECS, 3600);
 });
+
+test('host-aware events: the same session id on two hosts coexists', () => {
+  let rows = applyTerminalEvent([], 'session.updated', { id: 'a', host: 'h1', status: 'idle' });
+  rows = applyTerminalEvent(rows, 'session.updated', { id: 'a', host: 'h2', status: 'busy' });
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map(rowKey).sort(), ['h1/a', 'h2/a']);
+});
+
+test('host-aware events: session.removed with a host removes only that host\'s row', () => {
+  const rows = [{ id: 'a', host: 'h1' }, { id: 'a', host: 'h2' }, { id: 'b', host: 'h1' }];
+  const next = applyTerminalEvent(rows, 'session.removed', { id: 'a', host: 'h1' });
+  assert.deepEqual(next, [{ id: 'a', host: 'h2' }, { id: 'b', host: 'h1' }]);
+  assert.equal(rows.length, 3, 'the input is not mutated');
+});
+
+test('host-aware events: session.updated with a host replaces only that host\'s row', () => {
+  const rows = [{ id: 'a', host: 'h1', status: 'idle' }, { id: 'a', host: 'h2', status: 'idle' }];
+  const next = applyTerminalEvent(rows, 'session.updated', { id: 'a', host: 'h2', status: 'busy' });
+  assert.deepEqual(next, [{ id: 'a', host: 'h1', status: 'idle' }, { id: 'a', host: 'h2', status: 'busy' }]);
+});
+
+test('legacy events with no host behave exactly as before (id-only matching)', () => {
+  let rows = applyTerminalEvent([], 'session.updated', { id: 'a', status: 'idle' });
+  rows = applyTerminalEvent(rows, 'session.updated', { id: 'a', status: 'busy' });
+  assert.deepEqual(rows, [{ id: 'a', status: 'busy' }]);
+  assert.deepEqual(applyTerminalEvent(rows, 'session.removed', { id: 'a' }), []);
+  // a hostless event cannot say which host it means, so it matches the id on every host
+  assert.deepEqual(applyTerminalEvent([{ id: 'a', host: 'h1' }, { id: 'a', host: 'h2' }, { id: 'b', host: 'h1' }], 'session.removed', { id: 'a' }), [{ id: 'b', host: 'h1' }]);
+});
+
+test('formatTerminalRow carries host and a host-qualified key', () => {
+  const withHost = formatTerminalRow({ id: 'a', host: 'h1', status: 'idle' }, NOW);
+  assert.equal(withHost.host, 'h1');
+  assert.equal(withHost.key, 'h1/a');
+  const legacy = formatTerminalRow({ id: 'a', status: 'idle' }, NOW);
+  assert.equal(legacy.host, '');
+  assert.equal(legacy.key, '/a');
+  assert.equal(rowKey({ id: 'a', host: 'h1' }), 'h1/a');
+});
+
+test('orderTerminalSessions breaks status ties by host, then name', () => {
+  const rows = [
+    { id: '1', host: 'hB', name: 'a', status: 'idle' },
+    { id: '2', host: 'hA', name: 'z', status: 'idle' },
+    { id: '3', host: 'hA', name: 'b', status: 'idle' },
+    { id: '4', host: 'hZ', name: 'a', status: 'waiting' },
+  ];
+  assert.deepEqual(orderTerminalSessions(rows).map((r) => r.id), ['4', '3', '2', '1']);
+});
+
+test('hostsOf returns the sorted, unique, non-empty hosts', () => {
+  assert.deepEqual(hostsOf([{ host: 'b' }, { host: 'a' }, { host: 'b' }, {}, { host: '' }]), ['a', 'b']);
+  assert.deepEqual(hostsOf([]), []);
+});
+
+test('filterByHost keeps one host\'s rows, and everything when no host is given', () => {
+  const rows = [{ id: '1', host: 'h1' }, { id: '2', host: 'h2' }, { id: '3' }];
+  assert.deepEqual(filterByHost(rows, 'h1').map((r) => r.id), ['1']);
+  assert.deepEqual(filterByHost(rows, '').map((r) => r.id), ['1', '2', '3']);
+  assert.equal(filterByHost(rows, null), rows);
+  assert.equal(filterByHost(rows, undefined), rows);
+  assert.deepEqual(filterByHost(rows, 'nobody'), []);
+});
+
+test('skippedLabel names each skipped host with its reason, never [object Object]', () => {
+  assert.equal(skippedLabel([{ host: 'grimm', reason: 'ConnectionError' }]), 'grimm (ConnectionError)');
+  assert.equal(skippedLabel([{ host: 'grimm', reason: 'Timeout' }, { host: 'wok', reason: 'unexpected shape' }]), 'grimm (Timeout), wok (unexpected shape)');
+  assert.ok(!skippedLabel([{ host: 'grimm', reason: 'x' }]).includes('[object Object]'));
+});
+
+test('skippedLabel accepts the older bare host name, skips unusable entries, and gives an empty string for nothing', () => {
+  assert.equal(skippedLabel(['grimm', { host: 'wok' }]), 'grimm, wok');
+  assert.equal(skippedLabel([{ host: '', reason: 'x' }, {}, null, 7, '']), '');
+  assert.equal(skippedLabel([]), '');
+  assert.equal(skippedLabel(undefined), '');
+  assert.equal(skippedLabel('grimm'), '');
+  assert.equal(skippedLabel([{ host: 'wok', reason: '' }]), 'wok');
+});
+
+test('skippedLabel returns raw text (the caller escapes it)', () => {
+  assert.equal(skippedLabel([{ host: '<b>', reason: 'x&y' }]), '<b> (x&y)');
+});
+

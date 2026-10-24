@@ -143,3 +143,6 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 .tpl-note { margin-top: 6px; font-size: 12px; }
 .tpl-note.tpl-saved { color: var(--ok); }
 .tpl-note.tpl-failed { color: var(--bad); }
+
+/* HUB0017: host badge on terminal rows */
+.terminal-row-host-badge { display: inline-block; padding: 1px 6px; margin-left: 6px; font-size: 0.75em; font-weight: 600; line-height: 1.4; color: var(--text, #e0e0e0); background: var(--panel, #3a3a4a); border-radius: 4px; vertical-align: baseline; white-space: nowrap; }
