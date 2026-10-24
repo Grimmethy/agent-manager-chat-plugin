@@ -51,6 +51,8 @@ body {
    The flash animation ends back on the steady amber, so waiting rows stay amber after
    the 10s. Uses the existing --warn (amber) token. */
 .chat-switcher-trow.waiting { background: color-mix(in srgb, var(--warn) 14%, transparent); border-left: 3px solid var(--warn); padding-left: 9px; }
+.chat-chime-setting { display: block; padding: 8px 12px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted, inherit); cursor: pointer; }
+.chat-chime-setting input { margin-right: 6px; vertical-align: middle; }
 .chat-switcher-trow.waiting-flash { animation: chat-amber-flash 10s ease-in-out; }
 @keyframes chat-amber-flash {
   0%   { background: var(--warn); color: #1a1300; }

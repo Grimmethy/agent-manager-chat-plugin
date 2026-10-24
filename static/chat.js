@@ -33,7 +33,21 @@ import { providerLabel, swapOptions, offerText, swapBody } from "./swap-view.js"
 // Piece 2/10: the pure "needs you" attention logic (which rows newly became waiting,
 // how many are waiting) lives in attention-view.js (piece 1). This file only calls it
 // and applies the result to the DOM; keep the decision logic there.
-import { attentionStep } from "./attention-view.js";
+import { attentionStep, shouldChime } from "./attention-view.js";
+
+// HUB0010 3/10: the optional chime when another chat needs you. The decision (is any newly waiting key off screen, is the setting on) is
+// attention-view.js shouldChime; this file only stores the setting, finds what is on screen and plays one short beep. Every storage access is
+// guarded: the page works with storage blocked, the setting then just does not persist.
+const CHIME_KEY = 'chat-chime';
+const LAYOUT_KEY = 'chat-workspace-layout'; // multi-chat.js's saved layout
+
+function readChimeSetting() {
+  try { return window.localStorage.getItem(CHIME_KEY) === '1'; } catch (e) { return false; }
+}
+
+function writeChimeSetting(on) {
+  try { window.localStorage.setItem(CHIME_KEY, on ? '1' : '0'); } catch (e) { /* storage unavailable: the choice lasts until reload */ }
+}
 
 let toastHideTimer = null;
 
@@ -690,6 +704,9 @@ class SessionSwitcher {
     this.attentionNewlyWaiting = new Set();
     this.lastAttentionCount = null;
     this.originalTitle = (typeof document !== 'undefined' && document) ? document.title : null;
+    // Chime (HUB0010 3/10): off by default, remembered under localStorage 'chat-chime'; the AudioContext is created lazily after a user gesture.
+    this.chimeEnabled = readChimeSetting();
+    this.audioCtx = null;
     this.slot.innerHTML = `
       <button type="button" class="secondary chat-switcher-btn" aria-haspopup="listbox" aria-expanded="false"></button>
       <div class="chat-switcher-menu" hidden></div>`;
@@ -697,6 +714,7 @@ class SessionSwitcher {
     this.menu = this.slot.querySelector('.chat-switcher-menu');
     this.btn.onclick = (e) => { e.stopPropagation(); this.setOpen(!this.open); };
     this.menu.addEventListener('click', (e) => this.onMenuClick(e));
+    this.menu.addEventListener('change', (e) => this.onMenuChange(e));
     document.addEventListener('click', (e) => { if (this.open && !this.slot.contains(e.target)) this.setOpen(false); });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.open) this.setOpen(false); });
     this.renderButton();
@@ -780,6 +798,7 @@ class SessionSwitcher {
     }
     this.attentionPrev = res.map;
     this.attentionNewlyWaiting = new Set(res.newlyWaiting);
+    if (res.newlyWaiting.length) this.maybeChime(res.newlyWaiting);
 
     // Tab title: '(N) <original>' while N > 0, restored when N is 0.
     if (typeof document !== 'undefined' && document && this.originalTitle != null) {
@@ -914,13 +933,85 @@ class SessionSwitcher {
     return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${filterHtml}${body}${skippedLine}`;
   }
 
+  // The chime setting row at the foot of the switcher menu.
+  renderChimeSetting() {
+    return `<label class="chat-chime-setting"><input type="checkbox" class="chat-chime-input"${this.chimeEnabled ? ' checked' : ''}> Chime when another chat needs me</label>`;
+  }
+
+  // Keys of the chat panes on screen: the panes multi-chat.js mounts, or just the active chat when multi-chat.js is not loaded. chat.js must not import
+  // multi-chat.js statically (that module's browser adapter sets window.__CHAT_MULTI_PANES__ and imports this file), so it is loaded on demand, and only
+  // when the flag shows it is already running: the import then returns the same module instance.
+  async onScreenKeys() {
+    const active = this.getSelectedId();
+    const fallback = active ? [active] : [];
+    try {
+      if (typeof window === 'undefined' || !window.__CHAT_MULTI_PANES__) return fallback;
+      let raw = null;
+      try { raw = window.localStorage.getItem(LAYOUT_KEY); } catch (e) { raw = null; }
+      if (raw == null) return fallback;
+      const mc = await import('./multi-chat.js');
+      return [...mc.mountedSet(mc.deserialize(raw), active)];
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  ensureAudio() {
+    try {
+      if (this.audioCtx) {
+        if (this.audioCtx.state === 'suspended') this.audioCtx.resume();
+        return this.audioCtx;
+      }
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return null;
+      this.audioCtx = new Ctx();
+      return this.audioCtx;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // One short beep (880 Hz, about 200 ms); no audio file. Silent when audio is unavailable or blocked.
+  beep() {
+    try {
+      const ctx = this.ensureAudio();
+      if (!ctx) return;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = 880;
+      gain.gain.value = 0.08;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.2);
+    } catch (e) { /* never let a chime break the switcher */ }
+  }
+
+  async maybeChime(newlyWaiting) {
+    try {
+      if (!this.chimeEnabled) return;
+      const keys = await this.onScreenKeys();
+      if (shouldChime(newlyWaiting, keys, this.chimeEnabled)) this.beep();
+    } catch (e) { /* attention must never break the switcher */ }
+  }
+
+  onMenuChange(e) {
+    const box = e.target.closest ? e.target.closest('.chat-chime-input') : null;
+    if (!box) return;
+    this.chimeEnabled = !!box.checked;
+    writeChimeSetting(this.chimeEnabled);
+    if (this.chimeEnabled) this.ensureAudio(); // the change event is the user gesture that lets audio start
+  }
+
   render() {
     this.renderButton();
     const now = Date.now();
     const selectedId = this.getSelectedId();
     this.menu.innerHTML = `<div class="chat-switcher-new" role="option">+ New chat</div>`
       + this.rows.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('')
-      + this.renderTerminalSection(now);
+      + this.renderTerminalSection(now)
+      + this.renderChimeSetting();
   }
 
   async onMenuClick(e) {

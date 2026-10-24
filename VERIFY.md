@@ -91,3 +91,12 @@ Manual DOM checks (no automated test for these). None have ever been checked.
 4. **Parent postMessage.** Every time the waiting count changes, the switcher posts
    `{ type: 'chat-attention', count: N }` to `window.parent` (the dashboard's tab badge
    itself is a separate change in the dashboard repo). (never checked)
+
+## Attention: optional chime (piece 3/10)
+
+Manual browser checks (the decision itself, `shouldChime`, is unit-tested; the sound and the stored setting are not). None have ever been checked.
+
+1. **Off by default.** On a fresh profile the switcher menu ends with an unchecked "Chime when another chat needs me" box, and a session turning `waiting` makes no sound. (never checked)
+2. **Saved setting.** Ticking the box stores `chat-chime` = `1` in localStorage; after a reload it is still ticked, and unticking stores `0`. With storage blocked the page still works and the box just resets on reload. (never checked)
+3. **One short beep.** With the box ticked, a session newly turning `waiting` that is not on screen plays one short beep (about 0.2 s); a session already waiting does not repeat it. (never checked)
+4. **Silent when on screen.** In the multi-pane layout a newly waiting chat that is mounted in a pane does not chime. Terminal sessions never match chat panes, so every newly waiting terminal session chimes while the box is ticked. (never checked)
