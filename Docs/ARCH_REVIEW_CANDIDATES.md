@@ -632,3 +632,42 @@ Define a standardized `NodeBridgeError` in the shared `node_bridge.py` helper (f
 
 Benefits:
 Provides a single, auditable point for Node subprocess error handling. Makes the deliberate choice to swallow errors in `model_stats_client.py` explicit rather than implicit, reducing the risk of accidental error propagation or inconsistent logging. Any new consumer of the Node bridge inherits a well-defined error type and must consciously choose its propagation strategy, preventing future silent-failure regressions.
+
+### AC-48 · Decouple save_proposal from the session object
+Strength: Worth exploring
+Files: template_store.py
+
+Problem:
+The `save_proposal` function in `template_store.py` accepts `session`, `entry_index`, and `tpl_index` to locate and mutate a specific proposal within the nested session structure. This requires `template_store` to understand the internal layout of the session object (specifically the path `session["transcript"][entry_index]["templates"][tpl_index]`). While the function does not persist the session (the caller handles that), it is tightly coupled to the session's structure for the mutation step. If the session layout changes (e.g., `transcript` is renamed or `templates` is moved), `save_proposal` will break. The multi-index access pattern is also prone to `IndexError` or `KeyError` if indices are stale or incorrect, and the function’s responsibility is mixed: it both navigates the session structure and updates the proposal.
+
+Solution:
+Change `save_proposal` to accept the `proposal` dictionary directly instead of the `session` and indices. The caller (the route handler) should extract the proposal from the session using the indices it already has from the UI context, then pass the proposal object to `save_proposal`. The function updates the proposal's status and message fields in place and returns the updated proposal. This decouples `template_store` from the session's internal structure and shifts the index-lookup responsibility to the caller, which already has the indices and is responsible for session persistence.
+
+Benefits:
+The `template_store` module becomes more modular and easier to unit-test in isolation, since a test can construct a minimal proposal dict without fabricating an entire session tree. The routing layer retains sole responsibility for session structure navigation and persistence, which is its domain. The function signature is cleaner, and the index-lookup logic is centralized in the caller, reducing the risk of `template_store` breaking due to session layout changes.
+
+### AC-49 · Replace check-then-add with an atomic save in save_template
+Strength: Worth exploring
+Files: template_store.py
+
+Problem:
+The `save_template` function performs a two-step process: it first issues a `GET`-like request (`action: "get"`) to check whether the key already exists, then issues a `POST` request (`action: "add"`) to create it. Between these two round-trips there is a race window in which another process could insert the same key, causing the subsequent `add` to fail or silently overwrite. The pattern also doubles the network overhead for what is logically a single operation. The "already exists" handling is in the first interaction (the `get` call), but the overall flow is not atomic.
+
+Solution:
+If the target `/api/entry` endpoint supports an atomic upsert or `add_if_not_exists` action, replace the two-step sequence with that single call. If the API does not offer such an action, the current two-step flow should be explicitly documented as a known limitation with a TODO referencing the API gap. The draft’s proposed alternative of relying on a 409 Conflict error from the `add` call is not recommended because the `add` endpoint may not return a 409 for "already exists"—it may return a different error or succeed with an overwrite (which the current code explicitly prevents).
+
+Benefits:
+Eliminates the race condition window, reducing the chance of a spurious failure under concurrent writes. Cuts one network round-trip from the happy path, lowering latency. Consolidates the "already exists" decision into a single atomic operation, making the function easier to reason about and test.
+
+### AC-50 · Extract duplicated SSE event parsing into a shared test helper
+Strength: Worth exploring
+Files: test_chat_routes.py
+
+Problem:
+Multiple test methods in `test_chat_routes.py` (e.g. `test_a_crashed_turn_streams_an_error_event_and_persists_an_error_entry`, `test_classified_claude_error_gets_swapoffer_and_a_0600_sample`) each manually split the response body, strip the `data: ` SSE prefix, and `json.loads` each line to extract events. This parsing logic is copy-pasted across several tests. While the logic is trivial and identical in all copies, a change to the SSE wire format (e.g. adding an `event:` field or changing the delimiter) would require touching every test individually. Centralizing the parsing logic reduces the risk of divergence and makes the tests easier to maintain.
+
+Solution:
+Introduce a small helper function (e.g. `parse_sse_events(response) -> list[dict]`) at the top of `test_chat_routes.py`. The helper accepts the raw response object, splits on the SSE line delimiter, strips the `data: ` prefix, deserialises each payload, and returns a list of event dictionaries. Every test that currently inlines this logic is refactored to call the helper. Since the tests are in a single file, a shared test-utility module is not necessary.
+
+Benefits:
+Removes the duplicated parsing code, making each test body shorter and focused on its actual assertion. A future change to the SSE format requires updating exactly one function rather than N test methods. Reduces the risk of a test passing while inadvertently skipping or mis-parsing an event due to a subtle copy-paste divergence in the inline logic.
