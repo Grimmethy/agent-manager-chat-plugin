@@ -24,7 +24,7 @@
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
 import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
-  formatTerminalRow, orderTerminalSessions, applyTerminalEvent } from "./sessions-view.js";
+  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost } from "./sessions-view.js";
 // HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
 // (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
 // split. providerLabel drives the header label, swapOptions builds the Swap menu,
@@ -668,8 +668,13 @@ class SessionSwitcher {
     this.getRoots = getRoots || (() => []);
     this.rows = [];
     // Read-only terminal sessions from the optional session agent (see agent_client.py).
-    this.terminal = { enabled: false, reachable: false, rows: [] };
-    this.events = null;
+    this.terminal = { enabled: false, reachable: false, rows: [], hosts: [], skipped: [] };
+    // One EventSource per host (HUB0017), keyed by host name; '' is the single-host
+    // fallback stream. Closed together by stopEvents().
+    this.hostEvents = {};
+    this._eventSignature = null;
+    // Terminal-section host filter: '' means All.
+    this.hostFilter = '';
     this.open = false;
     this.pollTimer = null;
     this.slot.innerHTML = `
@@ -697,13 +702,33 @@ class SessionSwitcher {
     }
   }
 
-  // Live terminal-session updates while the dropdown is open. EventSource reconnects by
-  // itself; the 5s refresh() above is the fallback when the stream is down.
+  // Live terminal-session updates while the dropdown is open. One EventSource per host
+  // (HUB0017); each reconnects by itself, and the 5s refresh() above is the fallback
+  // when a stream is down. A single host uses the plain single-host URL.
   startEvents() {
-    if (this.events || !this.terminal.enabled || !this.terminal.reachable || typeof EventSource === 'undefined') return;
-    this.events = new EventSource('api/chat/terminal-sessions/events');
+    if (!this.terminal.enabled || !this.terminal.reachable || typeof EventSource === 'undefined') return;
+    const hosts = (Array.isArray(this.terminal.hosts) && this.terminal.hosts.length)
+      ? this.terminal.hosts
+      : hostsOf(this.terminal.rows);
+    if (!hosts.length) return;
+    const signature = hosts.join('\u0000');
+    if (this._eventSignature === signature) return; // streams already match the host list
+    this.stopEvents(); // host list changed: close all, reopen fresh
+    this._eventSignature = signature;
+    if (hosts.length === 1) {
+      this.openEventStream(hosts[0], 'api/chat/terminal-sessions/events');
+    } else {
+      for (const host of hosts) {
+        this.openEventStream(host, 'api/chat/terminal-sessions/events?host=' + encodeURIComponent(host));
+      }
+    }
+  }
+
+  openEventStream(host, url) {
+    const events = new EventSource(url);
+    this.hostEvents[host] = events;
     for (const name of ['session.updated', 'session.removed']) {
-      this.events.addEventListener(name, (e) => {
+      events.addEventListener(name, (e) => {
         let data = null;
         try { data = JSON.parse(e.data); } catch (err) { return; }
         this.terminal.rows = applyTerminalEvent(this.terminal.rows, name, data);
@@ -713,8 +738,9 @@ class SessionSwitcher {
   }
 
   stopEvents() {
-    if (this.events) this.events.close();
-    this.events = null;
+    for (const host of Object.keys(this.hostEvents)) this.hostEvents[host].close();
+    this.hostEvents = {};
+    this._eventSignature = null;
   }
 
   async refresh() {
@@ -725,10 +751,18 @@ class SessionSwitcher {
     }
     try {
       const t = await fetchJson('api/chat/terminal-sessions');
-      this.terminal = { enabled: !!t.enabled, reachable: !!t.reachable, rows: Array.isArray(t.sessions) ? t.sessions : [] };
+      this.terminal = {
+        enabled: !!t.enabled,
+        reachable: !!t.reachable,
+        rows: Array.isArray(t.sessions) ? t.sessions : [],
+        hosts: Array.isArray(t.hosts) ? t.hosts : [],
+        skipped: Array.isArray(t.skipped) ? t.skipped : [],
+      };
     } catch (e) {
       // Same: keep what we had.
     }
+    // Host list can change between polls (agent added/removed): re-sync the streams.
+    if (this.open) this.startEvents();
     this.render();
     return this.rows;
   }
@@ -762,11 +796,15 @@ class SessionSwitcher {
   }
 
   // A terminal session row: display only (no select, no close) until a handoff exists.
-  renderTerminalRow(fmt) {
+  // `showHost` gates the host badge: pointless when every row shares one host.
+  renderTerminalRow(fmt, showHost) {
     const ctx = fmt.context ? `<span class="chat-switcher-context">${escapeHtml(fmt.context)}</span>` : '';
     const step = fmt.step ? `<div class="chat-switcher-step">${escapeHtml(fmt.step)}</div>` : '';
+    const badge = (showHost && fmt.host)
+      ? `<span class="terminal-row-host-badge">${escapeHtml(fmt.host)}</span>`
+      : '';
     return `<div class="chat-switcher-trow" title="${escapeHtml(fmt.fullTitle)}">
-      <div class="chat-switcher-title">${escapeHtml(fmt.title)}</div>
+      <div class="chat-switcher-title">${escapeHtml(fmt.title)}${badge}</div>
       <div class="chat-switcher-meta">
         <span class="chat-switcher-status${fmt.busy ? ' busy' : ''}${fmt.waiting ? ' waiting' : ''}">${escapeHtml(fmt.status)}</span>
         <span>${escapeHtml(fmt.timer)}</span>${ctx}
@@ -777,11 +815,32 @@ class SessionSwitcher {
   renderTerminalSection(now) {
     const t = this.terminal;
     if (!t.enabled) return '';
+    const rows = orderTerminalSessions(t.rows);
+    // Host badge + All/each-host filter only make sense with more than one host.
+    const hosts = hostsOf(rows);
+    const multiHost = hosts.length > 1;
+    // A stale filter (e.g. its host vanished from the list) would empty the rows; clamp.
+    let selectedHost = multiHost ? this.hostFilter : '';
+    if (selectedHost && !hosts.includes(selectedHost)) selectedHost = '';
     let body;
     if (!t.reachable) body = '<div class="chat-switcher-empty">Session agent unreachable</div>';
     else if (!t.rows.length) body = '<div class="chat-switcher-empty">No terminal sessions</div>';
-    else body = orderTerminalSessions(t.rows).map((r) => this.renderTerminalRow(formatTerminalRow(r, now))).join('');
-    return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${body}`;
+    else body = filterByHost(rows, selectedHost)
+      .map((r) => this.renderTerminalRow(formatTerminalRow(r, now), multiHost)).join('');
+    let filterHtml = '';
+    if (multiHost) {
+      const options = [''].concat(hosts);
+      filterHtml = '<div class="chat-switcher-host-filter">'
+        + options.map((h) => {
+            const active = (selectedHost || '') === (h || '');
+            return `<button type="button" class="secondary chat-switcher-host-filter-btn${active ? ' active' : ''}" data-host-filter="${escapeHtml(h || '')}">${h ? escapeHtml(h) : 'All'}</button>`;
+          }).join('')
+        + '</div>';
+    }
+    const skippedLine = (t.skipped && t.skipped.length)
+      ? `<div class="chat-switcher-empty">Some hosts were skipped: ${t.skipped.map(escapeHtml).join(', ')}</div>`
+      : '';
+    return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${filterHtml}${body}${skippedLine}`;
   }
 
   render() {
@@ -795,6 +854,13 @@ class SessionSwitcher {
 
   async onMenuClick(e) {
     e.stopPropagation();
+    // Host filter (terminal section): pick All / one host and re-render only.
+    const hostFilterBtn = e.target.closest('.chat-switcher-host-filter-btn');
+    if (hostFilterBtn) {
+      this.hostFilter = hostFilterBtn.dataset.hostFilter || '';
+      this.render();
+      return;
+    }
     if (e.target.closest('.chat-switcher-new')) {
       this.setOpen(false);
       await this.onNew();
