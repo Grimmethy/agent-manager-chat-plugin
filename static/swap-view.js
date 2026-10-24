@@ -15,9 +15,10 @@ export function providerLabel(session) {
   if (s.provider === 'claude') {
     // 'live account' only when account is null/undefined.
     const account = s.account != null ? s.account : 'live account';
-    return 'Claude · ' + s.model + ' · ' + account;
+    // A session with no pinned model (null/undefined/'') leaves the model part out instead of printing 'null'.
+    return s.model ? 'Claude · ' + s.model + ' · ' + account : 'Claude · ' + account;
   }
-  if (s.provider === 'local') return 'Local · ' + s.model;
+  if (s.provider === 'local') return s.model ? 'Local · ' + s.model : 'Local';
   return 'Unknown';
 }
 
