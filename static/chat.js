@@ -816,6 +816,7 @@ class SessionSwitcher {
 }
 
 function mountChat() {
+  if (window.__CHAT_MULTI_PANES__) return;
   // #chat-panel (in templates/chat.html) is the sole id-based contract between
   // this file and the template; every other selector here is class-based.
   const root = document.getElementById('chat-panel');
@@ -878,3 +879,5 @@ function mountChat() {
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mountChat);
 else mountChat();
+
+export { ChatPane, SessionSwitcher, showToast };
