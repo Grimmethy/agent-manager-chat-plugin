@@ -48,10 +48,19 @@ def _as_aware(dt):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
+def _as_dt(now):
+    """UTC datetime or Unix epoch (int/float) -> aware UTC datetime (or None)."""
+    if now is None:
+        return None
+    if isinstance(now, (int, float)):
+        return datetime.fromtimestamp(now, timezone.utc)
+    return _as_aware(now)
+
+
 def _now_iso(now=None):
     if now is None:
         return datetime.now(timezone.utc).isoformat()
-    return now.isoformat()
+    return _as_dt(now).isoformat()
 
 
 def _valid_chat_id(x):
@@ -114,6 +123,7 @@ def stop(storage_dir, link_id, reason="user", now=None):
 
 
 def consume(storage_dir, link_id, now=None):
+    now = _as_dt(now)
     links = _read_links(storage_dir)
     link = next((l for l in links if l.get("id") == link_id), None)
     if link is None:

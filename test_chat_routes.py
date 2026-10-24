@@ -12,6 +12,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,8 @@ import chat_sessions  # noqa: E402
 import template_store  # noqa: E402
 import driven  # noqa: E402
 import drive_log  # noqa: E402
+import drive_links  # noqa: E402
+import drive_send  # noqa: E402
 
 SID = "chat-route-test"
 
@@ -116,6 +119,124 @@ class MessageRouteErrorTest(RouteTestBase):
         transcript = self._stored()["transcript"]
         self.assertEqual(transcript[-1], {"role": "assistant", "text": "Error: RuntimeError: boom", "error": True})
         self.assertEqual(transcript[-2]["text"], "hello")
+
+
+class _FakeSend:
+    """Call-recording stand-in for drive_send.default_send; fake token strings only."""
+
+    def __init__(self, reply="fake-reply-token"):
+        self.reply = reply
+        self.calls = []
+        self.raise_on_call = None
+
+    def send(self, session_id, text, driven_by):
+        self.calls.append((session_id, text, driven_by))
+        if self.raise_on_call is not None:
+            raise self.raise_on_call
+        return self.reply
+
+
+class DriveStartRouteTest(RouteTestBase):
+    """HUB0018 3/3: POST /api/chat/drive with a non-empty firstMessage starts the
+    bounded relay in a daemon thread and the link runs to a stop; without
+    firstMessage no thread starts and the send fake is never called. drive_send
+    is patched at the module attribute the route reads (drive_send.default_send);
+    every test ends its link so no relay thread can leak into another test's fake.
+    Fake token strings only -- no model calls."""
+
+    DRIVER = "chat-route-test"
+    TARGET = "chat-route-test-2"
+    FIRST = "fake-first-message"
+    REPLY = "fake-reply-token"
+
+    def setUp(self):
+        super().setUp()
+        for sid in (self.DRIVER, self.TARGET):
+            s = _session([])
+            s["id"] = sid  # _session() hardcodes the module-level SID; override per chat
+            chat_sessions._write_sessions(self.storage, {sid: s})
+        self.fake = _FakeSend(self.REPLY)
+        patcher = mock.patch.object(drive_send, "default_send", self.fake.send)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _wait_inactive(self, link_id, timeout=5.0):
+        """Poll the link until inactive (5 s budget, no fixed sleep)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            link = drive_links.get(self.storage, link_id)
+            if link is not None and link.get("active") is not True:
+                return link
+            time.sleep(0.05)
+        self.fail(f"link {link_id} still active after {timeout}s")
+        return None
+
+    def _wait_for_call(self, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self.fake.calls:
+            time.sleep(0.02)
+        self.assertTrue(self.fake.calls, "fake send was never called")
+
+    def _join_drive_thread(self, link_id, timeout=2.0):
+        """Join the relay thread after the link went inactive so no in-flight
+        turn can land (in a later test's mocks or storage) past this test's end."""
+        for th in threading.enumerate():
+            if th.name == f"drive-{link_id}" and th is not threading.current_thread():
+                th.join(timeout)
+
+    def test_first_message_runs_to_turn_budget_and_ends_inactive(self):
+        resp = self.client.post("/api/chat/drive", json={
+            "driver": self.DRIVER, "target": self.TARGET,
+            "turnBudget": 3, "firstMessage": self.FIRST})
+        self.assertEqual(resp.status_code, 201)
+        link_id = resp.get_json()["id"]
+        link = self._wait_inactive(link_id)
+        self._join_drive_thread(link_id)
+        self.assertEqual(len(self.fake.calls), 3)
+        self.assertEqual(self.fake.calls[0], (self.TARGET, self.FIRST, self.DRIVER))
+        self.assertEqual(self.fake.calls[1], (self.DRIVER, self.REPLY, self.TARGET))
+        self.assertEqual(self.fake.calls[2], (self.TARGET, self.REPLY, self.DRIVER))
+        self.assertEqual(link["stopReason"], "budget")
+
+    def test_without_first_message_no_thread_starts_and_fake_never_called(self):
+        resp = self.client.post("/api/chat/drive", json={
+            "driver": self.DRIVER, "target": self.TARGET})
+        self.assertEqual(resp.status_code, 201)
+        link = resp.get_json()
+        self.assertEqual(link["active"], True)
+        time.sleep(0.3)  # let a hypothetical (buggy) relay thread surface first
+        self.assertEqual(self.fake.calls, [])
+        named = [t.name for t in threading.enumerate()]
+        self.assertNotIn(f"drive-{link['id']}", named)
+        self.assertEqual(drive_links.get(self.storage, link["id"])["active"], True)
+
+    def test_stop_request_from_another_call_ends_the_link_early(self):
+        resp = self.client.post("/api/chat/drive", json={
+            "driver": self.DRIVER, "target": self.TARGET,
+            # 100000 so the budget cannot be exhausted before the Stop lands --
+            # the stop, not the budget, must be what ends the link.
+            "turnBudget": 100000, "firstMessage": self.FIRST})
+        self.assertEqual(resp.status_code, 201)
+        link_id = resp.get_json()["id"]
+        self._wait_for_call()
+        stop = self.client.post(f"/api/chat/drive/{link_id}/stop")
+        self.assertEqual(stop.status_code, 200)
+        link = self._wait_inactive(link_id)
+        self._join_drive_thread(link_id)
+        self.assertTrue(1 <= len(self.fake.calls) < 100000)
+        self.assertEqual(link["stopReason"], "user")
+
+    def test_exception_in_fake_ends_the_link_with_reason_error(self):
+        self.fake.raise_on_call = RuntimeError("fake relay crash")
+        resp = self.client.post("/api/chat/drive", json={
+            "driver": self.DRIVER, "target": self.TARGET,
+            "turnBudget": 5, "firstMessage": self.FIRST})
+        self.assertEqual(resp.status_code, 201)
+        link_id = resp.get_json()["id"]
+        link = self._wait_inactive(link_id)
+        self._join_drive_thread(link_id)
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(link["stopReason"], "error")
 
 
 class SwapOfferErrorTest(RouteTestBase):
@@ -609,7 +730,8 @@ class DriveRouteTest(RouteTestBase):
 
     def _create(self):
         resp = self.client.post("/api/chat/drive", json={"driver": DRIVER, "target": TARGET})
-        self.assertEqual(resp.status_code, 200)
+        # HUB0018 2/3: the route returns 201 for a created link in both cases.
+        self.assertEqual(resp.status_code, 201)
         return resp.get_json()
 
     def test_create_then_list(self):
