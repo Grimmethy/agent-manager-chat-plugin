@@ -1,12 +1,15 @@
 """Integration tests for the session-agent routes served by ``app``.
 
-These tests require a live ``session_agent`` server on loopback and are
-kept separate from the pure unit tests of ``agent_client`` so that the
-unit tests can run without the server stack.
-"""
+These run the real ``session_agent`` HTTP server on loopback, fed by the synthetic fixtures in
+test_fixtures/session_agent (no mocks of the HTTP layer), and drive ``app``'s /api/chat/terminal-sessions routes through the
+Flask test client. They are kept apart from the pure unit tests of ``agent_client`` in test_agent_client.py.
 
-import json
+The same seven tests still exist in test_agent_client.py (class AgentRouteTests) until the follow-up (AC-21) trims them there.
+
+Run: .venv/bin/python -m unittest test_app_integration -v
+"""
 import os
+import json
 import shutil
 import sys
 import tempfile
@@ -15,103 +18,105 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
-import agent_client  # noqa: E402
 import app  # noqa: E402
 import session_agent  # noqa: E402
 
-FIXTURE_HOME = Path(__file__).resolve().parent / "fixtures" / "home"
-TOKEN = "test-token-12345"
+FIXTURE_HOME = Path(__file__).parent / "test_fixtures" / "session_agent" / "claude_home"
+TOKEN = "synthetic-test-token"
 
 
 class AgentRouteIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self._tmp = Path(tempfile.mkdtemp(prefix="agent_route_"))
-        self._home = self._tmp / "home"
-        shutil.copytree(FIXTURE_HOME, self._home)
-
-        self._agent = session_agent.Agent(home=self._home)
-        self._server = session_agent.make_server("127.0.0.1", 0, self._agent)
-        self._port = self._server.server_address[1]
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
-
-        self._client = app.app.test_client()
-
-    def tearDown(self):
-        self._stop()
-        shutil.rmtree(self._tmp, ignore_errors=True)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        home = Path(tmp) / "claude_home"
+        shutil.copytree(FIXTURE_HOME, home)
+        self.agent = session_agent.Agent(home, token=TOKEN, lister=None, alive=lambda pid: pid != 1003)
+        self.agent.refresh()
+        self.srv = session_agent.make_server(self.agent, "127.0.0.1", 0)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self._stop)
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+        self.client = app.app.test_client()
 
     def _stop(self):
-        self._server.shutdown()
-        self._thread.join(timeout=5)
+        if self.agent.stop.is_set():
+            return
+        self.agent.stop.set()
+        self.srv.shutdown()
+        self.srv.server_close()
 
-    def env(self):
-        return {
-            "AGENT_URL": "http://127.0.0.1:{}".format(self._port),
-            "AGENT_TOKEN": TOKEN,
-        }
+    def env(self, url=True, token=TOKEN):
+        values = {"AGENT_MANAGER_SESSION_AGENT_URL": self.url if url else "",
+                  "AGENT_MANAGER_SESSION_AGENT_TOKEN": token or ""}
+        return mock.patch.dict(os.environ, values)
 
     def test_disabled_without_url(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            resp = self._client.get("/agent/sessions")
-        self.assertEqual(resp.status_code, 200)
-        data = resp.get_json()
-        self.assertFalse(data["enabled"])
+        with self.env(url=False):
+            body = self.client.get("/api/chat/terminal-sessions").get_json()
+            self.assertEqual(body, {"enabled": False, "reachable": False, "sessions": []})
+            self.assertEqual(self.client.get("/api/chat/terminal-sessions/events").status_code, 404)
 
     def test_lists_sessions(self):
-        with mock.patch.dict(os.environ, self.env()):
-            resp = self._client.get("/agent/sessions")
-        self.assertEqual(resp.status_code, 200)
-        data = resp.get_json()
-        self.assertIn("sessions", data)
+        with self.env():
+            body = self.client.get("/api/chat/terminal-sessions").get_json()
+        self.assertTrue(body["enabled"] and body["reachable"])
+        self.assertEqual({r["id"] for r in body["sessions"]}, {"sess-busy", "sess-wait", "sess-idle"})
 
     def test_wrong_token_is_unreachable_not_an_error(self):
-        env = self.env()
-        env["AGENT_TOKEN"] = "wrong-token"
-        with mock.patch.dict(os.environ, env):
-            resp = self._client.get("/agent/sessions")
+        with self.env(token="wrong"):
+            resp = self.client.get("/api/chat/terminal-sessions")
         self.assertEqual(resp.status_code, 200)
-        data = resp.get_json()
-        self.assertFalse(data["enabled"])
+        self.assertEqual(resp.get_json(), {"enabled": True, "reachable": False, "sessions": []})
 
     def test_agent_down(self):
         self._stop()
-        with mock.patch.dict(os.environ, self.env()):
-            resp = self._client.get("/agent/sessions")
-        self.assertEqual(resp.status_code, 200)
-        data = resp.get_json()
-        self.assertFalse(data["enabled"])
+        with self.env():
+            self.assertFalse(self.client.get("/api/chat/terminal-sessions").get_json()["reachable"])
+            self.assertEqual(self.client.get("/api/chat/terminal-sessions/events").status_code, 502)
 
     def test_events_passthrough_hides_token(self):
-        with mock.patch.dict(os.environ, self.env()):
-            resp = self._client.get("/agent/events")
-        self.assertEqual(resp.status_code, 200)
-        body = resp.get_data(as_text=True)
-        self.assertNotIn(TOKEN, body)
+        with self.env():
+            resp = self.client.get("/api/chat/terminal-sessions/events")
+            self.assertEqual(resp.mimetype, "text/event-stream")
+            stream = iter(resp.response)
+            text = b""
+            while text.count(b"event: session.updated") < 3:
+                text += next(stream)
+            resp.close()
+        self.assertNotIn(TOKEN.encode(), text)
+        first = [l for l in text.decode().splitlines() if l.startswith("data: ")][0]
+        self.assertIn("status", json.loads(first[6:]))
 
     def test_events_exclude_transcript_text(self):
-        with mock.patch.dict(os.environ, self.env()):
-            resp = self._client.get("/agent/events")
-        self.assertEqual(resp.status_code, 200)
-        data = resp.get_json()
-        for event in data.get("events", []):
-            self.assertNotIn("transcript", event.get("type", ""))
+        with self.env():
+            resp = self.client.get("/api/chat/terminal-sessions/events")
+            stream = iter(resp.response)
+            text = b""
+            while text.count(b"event: session.updated") < 3:
+                text += next(stream)
+            self.agent.hub.publish("transcript.append", {"id": "x", "entries": [{"text": "private-text"}]})
+            self.agent.hub.publish("session.removed", {"id": "sess-wait"})
+            while b"session.removed" not in text:
+                text += next(stream)
+            resp.close()
+        self.assertNotIn(b"private-text", text)
+        self.assertNotIn(b"transcript.append", text)
 
     def test_token_file_wins_and_is_read_per_call(self):
-        token_file = self._tmp / "agent_token"
-        token_file.write_text("file-token-67890")
-        env = self.env()
-        env["AGENT_TOKEN_FILE"] = str(token_file)
-        with mock.patch.dict(os.environ, env):
-            resp = self._client.get("/agent/sessions")
-        self.assertEqual(resp.status_code, 200)
-
-        token_file.write_text("rotated-token-abc")
-        with mock.patch.dict(os.environ, env):
-            resp2 = self._client.get("/agent/sessions")
-        self.assertEqual(resp2.status_code, 200)
+        tf = Path(tempfile.mkdtemp()) / "tok"
+        self.addCleanup(shutil.rmtree, tf.parent, True)
+        values = {"AGENT_MANAGER_SESSION_AGENT_URL": self.url, "AGENT_MANAGER_SESSION_AGENT_TOKEN": "wrong",
+                  "AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE": str(tf)}
+        with mock.patch.dict(os.environ, values):
+            tf.write_text("not-the-token\n")
+            self.assertFalse(self.client.get("/api/chat/terminal-sessions").get_json()["reachable"])
+            tf.write_text(TOKEN + "\n")  # e.g. the agent restarted with --token auto
+            self.assertTrue(self.client.get("/api/chat/terminal-sessions").get_json()["reachable"])
+            tf.unlink()  # unreadable file -> no header -> unreachable, not an error
+            self.assertFalse(self.client.get("/api/chat/terminal-sessions").get_json()["reachable"])
 
 
 if __name__ == "__main__":
