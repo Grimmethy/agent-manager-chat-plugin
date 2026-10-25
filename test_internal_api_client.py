@@ -94,15 +94,22 @@ class ReserveTest(unittest.TestCase):
             iac.reserve("s1", "", False)
             self.assertEqual(m.call_args.kwargs["json"], {"reservationId": "s1", "on": False, "model": ""})
 
-    def test_missing_model_raises_valueerror_before_any_request(self):
-        # model=None and LOCAL_MODEL unset -> ValueError, and no HTTP request is sent.
+    def test_claiming_without_a_model_raises_internalapierror_before_any_request(self):
+        # model=None and LOCAL_MODEL unset, on=True -> InternalApiError (the type the routes handle), and no HTTP request is sent.
         with mock.patch.dict("os.environ", {}, clear=True):
             with mock.patch("requests.post") as m_post:
-                with self.assertRaises(ValueError) as ctx:
+                with self.assertRaises(iac.InternalApiError) as ctx:
                     iac.reserve("s1", None, True)
                 self.assertIn("model", str(ctx.exception).lower())
                 self.assertIn("LOCAL_MODEL", str(ctx.exception))
                 m_post.assert_not_called()
+
+    def test_releasing_without_a_model_still_works_and_sends_no_model_key(self):
+        # The server only requires a model when claiming; a release (api_chat_close's best-effort call) must not start raising.
+        with mock.patch.dict("os.environ", {"AGENT_MANAGER_INTERNAL_TOKEN": "tok"}, clear=True):
+            with mock.patch("requests.post", return_value=_fake_response({"reservationId": "s1", "reserved": False})) as m:
+                self.assertEqual(iac.reserve("s1", None, False), {"reservationId": "s1", "reserved": False})
+                self.assertEqual(m.call_args.kwargs["json"], {"reservationId": "s1", "on": False})
 
     def test_local_model_env_var_fills_in_when_model_not_passed(self):
         with mock.patch.dict("os.environ", {

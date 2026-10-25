@@ -78,15 +78,17 @@ def preempt() -> list:
 def reserve(reservation_id: str, model: str = None, on: bool = True) -> dict:
     if model is None:
         model = os.environ.get("LOCAL_MODEL")
-    if model is None:
-        # The core dashboard's /api/internal/chat/reserve expects model to be
-        # present; omitting it used to fail server-side with a 500 or silently
-        # misbehave. Fail fast client-side with a self-explanatory error instead.
-        raise ValueError(
-            "reserve(): model is required by the server but was not provided -- "
+    if model is None and on:
+        # The core dashboard's /api/internal/chat/reserve requires a model when CLAIMING a reservation (400 "model is required when
+        # reserving"); a release does not need one. Fail fast client-side with a self-explanatory error, as InternalApiError so the
+        # routes' existing handlers (502 for reserve, best-effort log for close/release) apply -- a ValueError would escape them.
+        raise InternalApiError(
+            "reserve(): a model is required to claim a reservation but none was provided -- "
             "pass model= explicitly or set the LOCAL_MODEL environment variable."
         )
-    body = {"reservationId": reservation_id, "on": on, "model": model}
+    body = {"reservationId": reservation_id, "on": on}
+    if model is not None:
+        body["model"] = model
     try:
         # Genuinely blocking on the server side (single_flight_lock.acquire() can wait
         # for a worker lane's current call) -- no short client timeout here, mirroring
