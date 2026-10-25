@@ -607,6 +607,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // --- one ChatPane inside a framed slot (close = DOM unmount, no API) ----
     let ChatPane = null;
     let livePanes = []; // the ChatPane instances drawn by the current render, for the dashboard's refresh message
+    let pendingNewAt = -1; // the slot index the next render() fills with a brand-new chat (set by openNewChat), else -1
     let showToast = (msg) => console.error(msg);
     function mountPane(id, bodyEl, isNew) {
       const pane = new ChatPane(bodyEl, { onSessionChange: () => refreshSwitcher() }); // a new title or a busy flag shows up on the chat's button
@@ -762,7 +763,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       const flex = document.createElement('div');
       flex.className = 'multi-chat-flex';
       let filled = 0;
-      for (const id of state.panes) {
+      for (let i = 0; i < state.panes.length; i++) {
+        const id = state.panes[i];
+        if (id === null && i === pendingNewAt) {
+          pendingNewAt = -1;
+          const body = document.createElement('div');
+          body.className = 'multi-chat-pane-body';
+          mountPane(null, body, true);
+          flex.appendChild(paneSlot(wide, { id: '__new__', nodes: body }));
+          filled++;
+          continue;
+        }
         if (id === null) {
           flex.appendChild(placeholder('+ New chat', openNewChat, wide));
           continue;
@@ -791,33 +802,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function openNewChat() {
-      // Claim a null slot (most recent first); append one when every slot is
-      // filled (2x2). The pane is created first; its fresh id is recorded in the
-      // layout state once startNew() has resolved (see mountPane).
-      host.innerHTML = '';
-      livePanes = [];
-      renderTabs();
-      Promise.resolve().then(refreshSwitcher);
-      markPreset();
+      // Claim a null slot (most recent first); append one when every slot is filled (2x2). render() mounts a fresh chat in that slot
+      // next to every chat that is already open; its new id is recorded in the layout state once startNew() has resolved (see mountPane).
       const idx = state.panes.indexOf(null);
       if (idx === -1) state.panes.push(null);
-      const wide = state.preset === '1';
-      const flex = document.createElement('div');
-      flex.className = 'multi-chat-flex';
-      state.panes.forEach((id, i) => {
-        if (i === (idx === -1 ? state.panes.length - 1 : idx)) {
-          const body = document.createElement('div');
-          body.className = 'multi-chat-pane-body';
-          mountPane(null, body, true);
-          flex.appendChild(paneSlot(wide, { id: '__new__', nodes: body }));
-        } else if (id === null) {
-          flex.appendChild(placeholder('+ New chat', openNewChat, wide));
-        } else {
-          flex.appendChild(placeholder('Open chat…', () => { activeId = id; render(); }, wide));
-        }
-      });
-      host.appendChild(flex);
-      attachStrip(flex);
+      pendingNewAt = idx === -1 ? state.panes.length - 1 : idx;
+      render();
     }
 
     // Re-render only when crossing the 760px boundary (a plain resize must not

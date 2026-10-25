@@ -28,3 +28,11 @@ test('the session switcher is the "All chats" list: SessionSwitcher takes a fixe
   assert.match(chatJs, /buttonLabel \}\) \{/);
   assert.match(chatJs, /this\.buttonLabel \|\| \(row \? fullTitle\(row\.title\) : 'Chats'\)/);
 });
+
+test('+ new chat renders the whole strip (so every open chat stays mounted) with the new chat in the claimed slot', () => {
+  const fn = multiJs.slice(multiJs.indexOf('function openNewChat()'), multiJs.indexOf('// Re-render only when crossing'));
+  assert.match(fn, /pendingNewAt = idx === -1 \? state\.panes\.length - 1 : idx/);
+  assert.match(fn, /render\(\);/);
+  assert.doesNotMatch(fn, /Open chat/, 'openNewChat no longer builds "Open chat…" placeholders for the other panes');
+  assert.match(multiJs, /id === null && i === pendingNewAt/);
+});
