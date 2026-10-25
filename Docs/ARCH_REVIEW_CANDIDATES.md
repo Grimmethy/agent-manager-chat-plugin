@@ -1477,3 +1477,16 @@ Introduce a small configuration module (e.g., `config.py` or a `settings` datacl
 
 Benefits:
 Configuration resolution, validation, and defaulting live in one auditable location, making it trivial to add logging, a `--dry-run` check, or a test fixture that monkey-patches a single object. New environment variables can be added in one file without hunting for every `os.environ` call site. It also makes the set of required/optional variables self-documenting, reducing onboarding friction and the risk of a typo in a variable name going unnoticed until runtime.
+
+### AC-110 · Duplicated token resolution and header construction in agent_client.py
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+The logic to resolve the correct Bearer token for a given host and build the `Authorization` header is duplicated across both `list_all()` and `open_events()`. Each function independently calls `agent_hosts.read_token(host)` and conditionally assembles the `headers` dictionary, meaning any change to the authentication mechanism—such as adding a new header, switching token formats, or introducing a fallback—must be replicated in every call site. This duplication is a maintenance hazard: a fix applied to one function can easily be missed in the other, leading to subtle auth mismatches between endpoints.
+
+Solution:
+Introduce a private helper function in `agent_client.py` (e.g., `_auth_headers(host)`) that encapsulates the token retrieval via `agent_hosts.read_token(host)` and the conditional construction of the `headers` dictionary. Both `list_all()` and `open_events()` (and any future endpoint functions) call this single helper, eliminating the repeated logic.
+
+Benefits:
+Reduces code duplication and ensures that authentication changes are made in exactly one place. Improves readability by abstracting low-level HTTP setup details away from the endpoint-specific logic, and makes it straightforward to add new authenticated endpoints without re-implementing the header boilerplate.
