@@ -1771,3 +1771,16 @@ Rename the export in `static/swap-view.js` from `providerLabel` to `swapProvider
 
 Benefits:
 Callers in `chat.js` can import both functions by their natural names without an alias, eliminating a class of copy-paste or mis-remembering bugs. New contributors reading the import block see two distinct, self-describing names rather than a name plus an `as` clause. The rename is zero-risk (no logic change, no API surface change beyond the identifier) and costs a single search-and-replace across two files.
+
+### AC-132 · Centralize duplicated token-resolution and Authorization-header construction
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+The logic for resolving the correct Bearer token via `agent_hosts.read_token(host)` and conditionally building the `Authorization` header dictionary is duplicated across `list_all()` and `open_events()`. Both functions independently check whether a token was returned and assemble the `headers` dict in the same way. This tight coupling to the token-resolution mechanism in multiple call sites means any future change—supporting a new token type, adding an additional auth header, or handling a distinct error state when the token file is missing or unreadable—requires touching every function that makes an authenticated request, increasing the risk of inconsistency or a missed update.
+
+Solution:
+Introduce a small private helper, e.g. `_get_auth_headers(host)`, that encapsulates the token lookup and header construction in one place. Both `list_all()` and `open_events()` (and any future request-building method) would call this helper instead of repeating the `read_token` / conditional-`headers` pattern. The helper can also centralize error handling for the token-lookup step, returning an empty dict or raising a domain-specific exception as appropriate.
+
+Benefits:
+A single code path owns the auth-header contract, so adding a new header, swapping the token source, or changing the failure mode is a one-line change in the helper rather than a multi-site edit. It also makes the intent of each public method clearer, since the auth boilerplate is extracted, and reduces the chance that one call site drifts out of sync with another during refactoring.
