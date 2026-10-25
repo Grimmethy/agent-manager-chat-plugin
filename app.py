@@ -44,7 +44,20 @@ STATE_DIR = Path(os.environ.get(
     "AGENT_MANAGER_CHAT_STORAGE_DIR",
     str(Path.home() / ".local/state/agent-manager-chat-plugin/sessions"),
 )).resolve()
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+# Owner-only: this dir holds per-user session JSON (mode= is skipped when the dir
+# already exists, so chmod the existing dir too -- see accounts.py's _save).
+# chmod is best-effort: if the dir is owned by another user we log-and-continue
+# rather than crash the plugin at import time.
+STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+try:
+    os.chmod(STATE_DIR, 0o700)
+except OSError as _chmod_err:
+    # Dir pre-exists and is owned by another user (e.g. leftover from a
+    # previous install or a shared home). Best-effort: we still want to use
+    # the dir for session storage rather than crash at import time -- but say so,
+    # because a dir that stays world-readable holds private session JSON.
+    print(f"[state-dir] could not chmod {STATE_DIR} to 0700 (non-fatal): {_chmod_err}",
+          file=sys.stderr, flush=True)
 CHAT_STORAGE_DIR = STATE_DIR
 
 
@@ -161,13 +174,32 @@ def _chat_roots() -> list:
     in-tree version's own bare-PACKAGE_ROOT fallback had, so a Chat turn still has
     SOMETHING to root itself at rather than erroring outright."""
     from internal_api_client import InternalApiError, get_roots
+    roots = None
     try:
-        roots = get_roots()
-        if roots:
-            return roots
+        roots = get_roots() or None
     except InternalApiError:
         pass
-    return [os.path.realpath(str(CORE_REPO_ROOT))]
+    if roots is None:
+        roots = [os.path.realpath(str(CORE_REPO_ROOT))]
+    return _with_extra_roots(roots)
+
+
+def _with_extra_roots(roots: list) -> list:
+    """`roots` plus the repos named in AGENT_MANAGER_CHAT_EXTRA_ROOTS (paths separated by os.pathsep, e.g. the crosslister
+    repo, which is neither a plugin nor a project and so is not in core's list). Appended after the core roots, so roots[0]
+    stays the primary; an entry that is not an existing directory, or is already present (compared by realpath), is skipped.
+    Unset or empty returns `roots` unchanged."""
+    extra = [e.strip() for e in os.environ.get("AGENT_MANAGER_CHAT_EXTRA_ROOTS", "").split(os.pathsep) if e.strip()]
+    if not extra:
+        return roots
+    out = list(roots)
+    seen = {os.path.realpath(r) for r in out}
+    for e in extra:
+        real = os.path.realpath(e)
+        if os.path.isdir(real) and real not in seen:
+            out.append(real)
+            seen.add(real)
+    return out
 
 
 def _discuss_provider_args(body: dict = None):
@@ -232,8 +264,10 @@ def chat_page():
 
 
 from routes.chat import chat_bp  # noqa: E402
+from routes.accounts import accounts_bp  # noqa: E402
 
 app.register_blueprint(chat_bp)
+app.register_blueprint(accounts_bp)
 
 
 if __name__ == "__main__":

@@ -181,6 +181,36 @@ class TestChatRoots(unittest.TestCase):
             self.assertEqual(app._chat_roots(), [os.path.realpath(str(d))])
 
 
+class TestChatExtraRoots(unittest.TestCase):
+    """AGENT_MANAGER_CHAT_EXTRA_ROOTS adds repos that are neither plugins nor projects (e.g. crosslister) after core's roots."""
+
+    def _env(self, value):
+        return mock.patch.dict(os.environ, {"AGENT_MANAGER_CHAT_EXTRA_ROOTS": value} if value is not None else {}, clear=False)
+
+    def test_unset_leaves_the_core_roots_unchanged(self):
+        os.environ.pop("AGENT_MANAGER_CHAT_EXTRA_ROOTS", None)
+        with mock.patch("internal_api_client.get_roots", return_value=["/a", "/b"]):
+            self.assertEqual(app._chat_roots(), ["/a", "/b"])
+
+    def test_existing_extra_directories_are_appended_after_the_core_roots(self):
+        x, y = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+        with self._env(os.pathsep.join([str(x), str(y)])), mock.patch("internal_api_client.get_roots", return_value=["/a"]):
+            self.assertEqual(app._chat_roots(), ["/a", os.path.realpath(str(x)), os.path.realpath(str(y))])
+
+    def test_missing_paths_blank_entries_and_duplicates_are_skipped(self):
+        x = Path(tempfile.mkdtemp())
+        value = os.pathsep.join([str(x), "/no/such/dir-xyz", "", "  ", str(x), str(x) + "/../" + x.name])
+        with self._env(value), mock.patch("internal_api_client.get_roots", return_value=[os.path.realpath(str(x)), "/a"]):
+            self.assertEqual(app._chat_roots(), [os.path.realpath(str(x)), "/a"])
+
+    def test_extras_are_also_added_when_core_is_unreachable(self):
+        from internal_api_client import InternalApiError
+        core, x = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+        with self._env(str(x)), mock.patch.object(app, "CORE_REPO_ROOT", core), \
+             mock.patch("internal_api_client.get_roots", side_effect=InternalApiError("down")):
+            self.assertEqual(app._chat_roots(), [os.path.realpath(str(core)), os.path.realpath(str(x))])
+
+
 class TestDiscussProviderArgs(unittest.TestCase):
     def test_defaults_to_local_with_no_model_effort(self):
         provider, model, effort = app._discuss_provider_args({})
@@ -201,6 +231,36 @@ class TestDiscussProviderArgs(unittest.TestCase):
         with mock.patch.object(app, "claude_defaults", return_value={"model": "opus", "effort": "max"}):
             provider, model, effort = app._discuss_provider_args({"provider": "claude", "model": "sonnet", "effort": "low"})
             self.assertEqual((provider, model, effort), ("claude", "sonnet", "low"))
+
+
+class TestStateDirChmodIsBestEffort(unittest.TestCase):
+    """app.py chmods the session dir at import time; when that raises (a dir owned by another
+    user) the plugin must still import, and must say so on stderr."""
+
+    def _import_app_with_failing_chmod(self):
+        import subprocess
+        state = tempfile.mkdtemp()
+        code = ("import os\n"
+                "def boom(*a, **k):\n"
+                "    raise PermissionError(1, 'Operation not permitted')\n"
+                "os.chmod = boom\n"
+                "import app\n"
+                "print('imported', app.CHAT_STORAGE_DIR)\n")
+        env = dict(os.environ, AGENT_MANAGER_CHAT_STORAGE_DIR=state)
+        r = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).parent),
+                           env=env, capture_output=True, text=True, timeout=60)
+        return state, r
+
+    def test_a_failing_chmod_does_not_stop_the_import(self):
+        state, r = self._import_app_with_failing_chmod()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("imported", r.stdout)
+
+    def test_a_failing_chmod_is_logged_with_the_path_and_the_error(self):
+        state, r = self._import_app_with_failing_chmod()
+        self.assertIn("could not chmod", r.stderr)
+        self.assertIn(os.path.realpath(state), r.stderr)
+        self.assertIn("Operation not permitted", r.stderr)
 
 
 if __name__ == "__main__":

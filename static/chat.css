@@ -18,14 +18,23 @@ body {
 }
 
 #chat-panel {
-  height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden;
 }
+.multi-chat-toolbar { flex: 0 0 auto; }
+.multi-chat-host { flex: 1 1 auto; min-height: 0; overflow: hidden; }
 
 .chat-header {
   padding: 12px 16px; border-bottom: 2px solid var(--border);
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
 }
-.chat-switcher-slot { flex: 1; min-width: 0; position: relative; }
+.chat-switcher-slot { flex: 1 1 12rem; min-width: 0; position: relative; }
+.chat-switcher-slot:empty { display: none; }
+/* A pane's header is one line: the chat's title on the left (hidden when the pane carries its own switcher), then the action buttons, the close button last. */
+.chat-pane-title { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13px; }
+.chat-switcher-slot:not(:empty) ~ .chat-pane-title { display: none; }
+.chat-header { flex-wrap: nowrap; padding: 6px 8px; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.chat-header button, .multi-chat-close { height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap; }
+.chat-header .chat-provider-label { flex: 0 0 auto; }
 .chat-switcher-btn { width: 100%; text-align: left; font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-switcher-menu { position: absolute; top: calc(100% + 4px); left: 0; right: 0; min-width: 280px; max-height: 60vh; overflow-y: auto; background: var(--panel); border: 2px solid var(--border); border-radius: 6px; z-index: 100; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
 .chat-switcher-menu[hidden] { display: none; }
@@ -35,7 +44,7 @@ body {
 .chat-switcher-row:last-child { border-bottom: none; }
 .chat-switcher-row.selected { border-left: 3px solid var(--accent); padding-left: 9px; }
 .chat-switcher-main { flex: 1; min-width: 0; cursor: pointer; }
-.chat-switcher-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-switcher-title { font-size: 13px; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
 .chat-switcher-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--muted); margin-top: 2px; }
 .chat-switcher-status.busy { color: var(--warn); }
 .chat-switcher-group { padding: 6px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); background: var(--bg); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
@@ -44,6 +53,21 @@ body {
 .chat-switcher-step { font-size: 11px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-switcher-empty { padding: 8px 12px; font-size: 12px; color: var(--muted); }
 .chat-switcher-status.waiting { color: var(--accent); }
+
+/* Piece 2/10: "needs you" amber highlight for waiting terminal rows. A row that is
+   waiting is steady-amber (.waiting); a row that *newly* became waiting additionally
+   flashes amber for 10s (.waiting-flash, driven by chat.js from attention-view.js).
+   The flash animation ends back on the steady amber, so waiting rows stay amber after
+   the 10s. Uses the existing --warn (amber) token. */
+.chat-switcher-trow.waiting { background: color-mix(in srgb, var(--warn) 14%, transparent); border-left: 3px solid var(--warn); padding-left: 9px; }
+.chat-chime-setting { display: block; padding: 8px 12px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted, inherit); cursor: pointer; }
+.chat-chime-setting input { margin-right: 6px; vertical-align: middle; }
+.chat-switcher-trow.waiting-flash { animation: chat-amber-flash 10s ease-in-out; }
+@keyframes chat-amber-flash {
+  0%   { background: var(--warn); color: #1a1300; }
+  50%  { background: color-mix(in srgb, var(--warn) 40%, transparent); }
+  100% { background: color-mix(in srgb, var(--warn) 14%, transparent); }
+}
 .chat-switcher-close { padding: 2px 8px; line-height: 1.2; }
 
 /* Same flexbox-trap fix the in-tree version's own CSS comment documents: min-height:0 on
@@ -53,6 +77,18 @@ body {
 .chat-body .chat-transcript-host { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 
 .chat-reserve-btn.active { background: var(--warn); color: #1a1300; border-color: var(--warn); }
+
+/* HUB0008 10/11 (model swap): header provider label + Swap menu + the failed-turn
+   one-click offer. Reuses the existing :root palette and the .chat-switcher-menu /
+   .chat-switcher-row tokens -- no new colors or design tokens. */
+.chat-provider-label { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.chat-provider-label[hidden] { display: none; }
+.chat-swap-slot { position: relative; }
+.chat-swap-menu { position: absolute; top: calc(100% + 4px); right: 0; min-width: 200px; max-height: 60vh; overflow-y: auto; background: var(--panel); border: 2px solid var(--border); border-radius: 6px; z-index: 100; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
+.chat-swap-menu[hidden] { display: none; }
+.chat-swap-offer { padding: 10px 12px; background: var(--panel); border: 2px solid var(--warn); border-radius: 6px; }
+.chat-swap-offer-text { font-size: 13px; }
+.chat-swap-offer-actions { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; }
 
 .chat-context-log-panel {
   border-bottom: 2px solid var(--border); background: var(--panel);
@@ -131,3 +167,151 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 .tpl-note { margin-top: 6px; font-size: 12px; }
 .tpl-note.tpl-saved { color: var(--ok); }
 .tpl-note.tpl-failed { color: var(--bad); }
+
+/* HUB0017: host badge on terminal rows */
+.terminal-row-host-badge { display: inline-block; padding: 1px 6px; margin-left: 6px; font-size: 0.75em; font-weight: 600; line-height: 1.4; color: var(--text, #e0e0e0); background: var(--panel, #3a3a4a); border-radius: 4px; vertical-align: baseline; white-space: nowrap; }
+
+/* phone width (HUB0010 5/10): multi-chat.js sets [hidden] on the preset toolbar below 760px; its own display:flex would otherwise win */
+.multi-chat-toolbar[hidden] { display: none; }
+
+/* layout templates menu (HUB0010 7/10) */
+.multi-chat-templates { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.multi-chat-template-save { display: inline-flex; align-items: center; gap: 4px; }
+.multi-chat-template-save[hidden] { display: none; }
+.multi-chat-template-name { width: 11em; min-width: 0; }
+
+/* filter box and Ctrl+1..9 jump (HUB0010 9/10) */
+.chat-switcher-filter { display: block; box-sizing: border-box; width: calc(100% - 16px); margin: 8px; }
+.chat-switcher-trow.jumped { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* the filter box and the layout toolbar's Templates select / template-name box: dark like .chat-input, not the white browser default */
+.chat-switcher-filter, .multi-chat-template-select, .multi-chat-template-name {
+  background: var(--panel); color: var(--text); border: 2px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; font-size: 13px; font-family: inherit;
+}
+.multi-chat-template-select { color-scheme: dark; }
+
+/* Touch (coarse-pointer) devices: 44px minimum touch targets for the switcher's close
+   button, the header buttons, the send row's buttons, "+ New chat" and the chime label;
+   the chime checkbox itself grows to a 20px tap area. Fine-pointer (desktop) sizes are
+   untouched -- this block only applies to pointer: coarse. */
+@media (pointer: coarse) {
+  .chat-switcher-close,
+  .chat-header button,
+  .chat-send-row button,
+  .chat-switcher-new,
+  .multi-chat-close,
+  .multi-chat-layout-btn,
+  .multi-chat-preset-btn,
+  .multi-chat-tab,
+  .multi-chat-new-btn,
+  .multi-chat-switcher .chat-switcher-btn,
+  .multi-chat-strip-btn,
+  .cmd-confirm,
+  .cmd-deny,
+  .chat-chime-setting { min-height: 44px; min-width: 44px; }
+  .chat-chime-setting input { width: 20px; height: 20px; }
+}
+
+/* Multi-chat horizontal snap strip (owner 2026-10-24): one row, horizontal scroll,
+   scroll-snap. --strip-visible = panes per screen: 1 under 760px, 2 from 760px, 3 from 1400px
+   (the same numbers as stripVisibleCount in multi-chat.js). A pane fills the strip's height
+   and scrolls its own transcript; touch swipe works natively through scroll-snap. */
+.multi-chat-flex {
+  --strip-visible: 2;
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  padding: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  box-sizing: border-box;
+}
+/* The prev/next buttons, the arrow keys and touch swipe move the strip; no drag bar. */
+.multi-chat-flex::-webkit-scrollbar { display: none; }
+@media (max-width: 759px) { .multi-chat-flex { --strip-visible: 1; } }
+@media (max-width: 759px) { .multi-chat-layout { display: none; } }
+@media (min-width: 1400px) { .multi-chat-flex { --strip-visible: 3; } }
+.multi-chat-pane, .multi-chat-placeholder {
+  flex: 0 0 calc((100% - (var(--strip-visible, 2) - 1) * 8px) / var(--strip-visible, 2));
+  scroll-snap-align: start;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+.multi-chat-pane.wide, .multi-chat-placeholder.wide { flex-basis: 100%; }
+
+/* Pane strip navigation (toolbar): previous / next buttons around an 'n / m' label; hidden by the script when there is nothing to move to. */
+.multi-chat-strip-nav { display: inline-flex; align-items: center; gap: 6px; }
+.multi-chat-strip-nav[hidden] { display: none; }
+.multi-chat-strip-label { min-width: 4.5em; text-align: center; font-size: 12px; color: var(--muted); }
+.multi-chat-strip-btn:disabled { opacity: .4; cursor: default; }
+
+/* A pane fills the strip's height; its body is a column so the transcript takes whatever the one-line header leaves. */
+.multi-chat-pane-body { display: flex; flex-direction: column; }
+
+/* Layout control (end of the toolbar): one button; the presets and the templates live in its popover. */
+.multi-chat-layout { position: relative; flex: 0 0 auto; }
+.multi-chat-layout-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 100; min-width: 300px; display: flex; flex-direction: column; gap: 10px; padding: 10px; background: var(--panel); border: 2px solid var(--border); border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
+.multi-chat-layout-menu[hidden] { display: none; }
+.multi-chat-presets { display: flex; gap: 6px; }
+.multi-chat-presets .multi-chat-preset-btn { flex: 1 1 auto; padding: 0 8px; height: 30px; font-size: 12px; white-space: nowrap; }
+.multi-chat-layout-menu .multi-chat-templates { flex-direction: column; align-items: stretch; }
+.multi-chat-layout-menu .multi-chat-template-select, .multi-chat-layout-menu .multi-chat-template-save-btn { height: 30px; padding-top: 0; padding-bottom: 0; font-size: 12px; }
+.multi-chat-preset-btn[aria-pressed="true"] { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
+.multi-chat-layout-btn { height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap; }
+
+/* The top bar (owner 2026-10-24): the open chats as a row of buttons, "+" for a new chat, "All chats" for the rest, then the strip nav and Layout.
+   Every control in the bar is the same 30px-high button; the active chat and a pressed preset share one accent look. */
+.multi-chat-toolbar { position: relative; gap: 6px; padding: 6px 8px; }
+.multi-chat-toolbar button, .multi-chat-toolbar select { height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap; border-radius: 6px; }
+.multi-chat-tabs { display: flex; flex: 0 1 auto; min-width: 0; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.multi-chat-tabs::-webkit-scrollbar { display: none; }
+.multi-chat-tab { flex: 0 0 auto; max-width: 16em; overflow: hidden; text-overflow: ellipsis; }
+.multi-chat-tab[aria-selected="true"] { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
+.multi-chat-new-btn { flex: 0 0 auto; min-width: 30px; margin-right: auto; }
+/* The All chats list is anchored to the whole bar, not to its button: the button sits mid-bar and a 360px list under it would stick out of a 378px sidebar. */
+.multi-chat-switcher { position: static; flex: 0 0 auto; }
+.multi-chat-switcher .chat-switcher-btn { width: auto; font-weight: 400; }
+.multi-chat-switcher .chat-switcher-menu { left: auto; right: 8px; width: 360px; max-width: calc(100% - 16px); }
+@media (max-width: 759px) { .multi-chat-tabs { flex: 1 0 100%; order: -1; } }
+
+/* Narrow panes (the dashboard's chat sidebar is about 380px wide): the pane header must still fit on one line with the close button visible, so the
+   provider label that repeats the provider button is dropped and the buttons and gaps tighten. A pane is its own size container. */
+.multi-chat-pane { container-type: inline-size; }
+@container (max-width: 480px) {
+  .chat-header { gap: 4px; padding: 6px 6px; }
+  .chat-header .chat-provider-label { display: none; }
+  .chat-header button, .multi-chat-close { padding: 0 8px; }
+}
+
+/* The tools an assistant turn ran: one collapsed line under the reply, a row per tool when opened. */
+.chat-tools { margin-top: 6px; font-size: 12px; color: var(--muted); }
+.chat-tools summary { cursor: pointer; }
+.chat-tool-row { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; padding: 3px 0; border-top: 1px solid var(--border); }
+.chat-tool-name { color: var(--accent); white-space: nowrap; }
+.chat-tool-args { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.chat-tool-outcome { grid-column: 2; }
+.chat-tool-bad .chat-tool-outcome { color: var(--bad); }
+
+/* Proposed write commands: a card with the exact command, why, and Confirm / Deny while it waits; the stored result under it once it has run. */
+.cmd-block { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.cmd-card { padding: 8px 10px; background: var(--panel); border: 2px solid var(--border); border-radius: 6px; }
+.cmd-pending { border-color: var(--warn); }
+.cmd-denied { opacity: .75; }
+.cmd-head { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-bottom: 4px; }
+.cmd-argv { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; }
+.cmd-meta, .cmd-status { font-size: 12px; color: var(--muted); margin-top: 4px; overflow-wrap: anywhere; }
+.cmd-why { font-size: 13px; margin-top: 4px; }
+.cmd-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.cmd-run { font-size: 12px; border: 2px solid var(--border); border-radius: 6px; padding: 6px 10px; }
+.cmd-run summary { cursor: pointer; overflow-wrap: anywhere; }
+.cmd-run-bad { border-color: var(--bad); }
+.cmd-out, .cmd-err { margin: 6px 0 0; padding: 6px 8px; max-height: 240px; overflow: auto; background: var(--bg); border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.cmd-err { color: var(--bad); }

@@ -133,3 +133,62 @@ environment. The session switcher then
 gets a read-only "Terminal sessions" group (status, timer, current step, context size) fed by
 `GET api/chat/terminal-sessions` and the SSE passthrough `GET api/chat/terminal-sessions/events`
 (the token stays server-side). Unset URL = feature off; agent down = "Session agent unreachable".
+
+### Several session agents (multi-host)
+
+One chat panel can show terminal sessions from several machines, each running its own `session_agent.py`.
+
+| Variable | Meaning |
+|---|---|
+| `AGENT_MANAGER_SESSION_AGENT_URLS` | JSON list of `{host, url, tokenFile}` objects. `host` (the name shown in the badge and used in `?host=`) and `url` are required; `tokenFile` is optional. An entry missing `host` or `url` is skipped with a log warning, a duplicate `host` keeps the first, a trailing `/` on `url` is dropped. When this variable is set and non-empty it wins over the singular variables below. If its value is not a JSON list, the feature is off (it does not fall back to the singular variables). |
+| `AGENT_MANAGER_SESSION_AGENT_URL`, `AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE`, `AGENT_MANAGER_SESSION_AGENT_TOKEN` | The single-host form, unchanged: when the plural variable is unset they still work and give exactly one host named `default`. A token file wins over the static token. |
+
+- **Tokens** are read on every call (a rotated token file needs no restart), stay on the server, and each host's token is sent only to that host; a host with no token gets no `Authorization` header. No token, token path or `tokenFile` value appears in any response body or in the event stream.
+- **A host that is down is skipped, not fatal.** `GET api/chat/terminal-sessions` answers `{enabled, reachable, sessions, hosts, skipped}`: `hosts` are the configured names in config order, every row in `sessions` carries a `host`, `skipped` has one `{host, reason}` per host that failed (the reason is the exception class name, or `unexpected shape`), and `reachable` is true while at least one host answered. Hosts that answered are listed as usual.
+- **Events.** `GET api/chat/terminal-sessions/events?host=<name>` streams one host's events, tagged with that host. The `host` parameter is optional with a single configured host; with several it is required (400 when missing, 404 for an unknown name, 502 when that host cannot be reached).
+
+Worked example, wok (this machine) plus grimm. Token files live outside the repository, mode 0600. The grimm address below is the one in use when this was written: check `tailscale status` for the current one.
+
+```
+AGENT_MANAGER_SESSION_AGENT_URLS='[
+  {"host": "wok",   "url": "http://127.0.0.1:7450",      "tokenFile": "/home/wok/.local/state/agent-manager/session-agent.token"},
+  {"host": "grimm", "url": "http://100.96.112.78:7450",  "tokenFile": "/home/wok/.config/agent-manager-chat-plugin/grimm-session-agent.token"}
+]'
+```
+
+The first token file is the default `--token-file` of the local agent (`--token auto`). The second holds a copy of the token the grimm agent printed or wrote; copy it by hand, keep it 0600, and never commit it. On grimm the agent must listen beyond loopback and name the address it is reached by: `session_agent.py --bind 0.0.0.0 --token auto --allow-host 100.96.112.78` (a non-loopback bind refuses to start without a token).
+
+**Extra chat roots.** `AGENT_MANAGER_CHAT_EXTRA_ROOTS` (colon-separated paths, for example `/media/model-cache/github/crosslister:/media/model-cache/github/books`) adds repos that are neither plugins nor projects to the roots the chat can read. They are appended after the roots core reports, so the primary root does not change; a path that is not an existing directory, or is already listed, is skipped (deduplicated). Unset changes nothing. Roots stay read-only for the local provider.
+
+## Model swap (multi-chat)
+
+A live chat can change the model behind it without losing the conversation. Nothing here is checked against a real swap yet; see the `Model swap (manual)` section of `VERIFY.md`.
+
+**Session fields and `schemaVersion` 2.** Each chat records its `provider`, `model` and `account`, plus `swaps` (one `{at, from, to}` entry per swap) and `summary`. `SCHEMA_VERSION` is 2. An older chat without those fields is upgraded automatically the next time it is written (`_migrate_session`): the four new fields get defaults and nothing else changes. The migration is lossless and the transcript is never touched.
+
+**`POST /api/chat/<id>/swap`.** The body is `{provider: 'local' | 'claude', model?, account?}`. For `claude`, `account` must be a label from the accounts registry; leave it out to follow the live account. For `local` any `account` is ignored. An unknown or inactive chat answers 404, a bad provider or an unknown account answers 400. A swap keeps every transcript row, appends one marker row and one `swaps` entry, and always resets `claudeSessionId` to `None`: a Claude CLI session is not assumed resumable after a swap, so the new side gets its history from the transcript. If the chat holds the local reservation and the target is not local, the reservation is released first, the same way `/reserve` releases it. The response is the updated session and never a token or `tokenFile`.
+
+**Hand-off.** On the first Claude turn after a swap, `handoff.build_handoff` prepends a hand-off: a header, the stored local summary if there is one, the last `CHAT_RECENT_TURNS_KEPT` plain rows verbatim (oldest first), and a line saying how many earlier rows are not included. The original rows are never removed or edited. When the transcript would overflow the target provider's window (`handoff.needs_summary`), the swap also asks the local model for a summary of the older rows (`summarize_older`); a summarizer error is logged and the swap carries on with the verbatim hand-off.
+
+**New environment variables.** `AGENT_MANAGER_CHAT_CLAUDE_WINDOW_TOKENS` (default 200000) and `AGENT_MANAGER_CHAT_LOCAL_WINDOW_TOKENS` (default 16384) set the context window `handoff.window_tokens` uses per provider. A value that is not a positive integer falls back to the default. Token counts are a coarse estimate (characters / 4), only good enough to decide whether a summary is needed.
+
+**A swap to local never takes the GPU.** Only the existing `/reserve` flow acquires the local reservation; `POST /api/chat/<id>/swap` with `provider: 'local'` never does.
+
+**Account tokens.** The `token_file` argument of `claude_client` names a 0600 file holding an account's OAuth token. It is read at call time and passed only in the environment of the child process as `CLAUDE_CODE_OAUTH_TOKEN`; `os.environ`, the request JSON and log lines never see it. An unreadable or empty file raises `ClaudeClientError` with a fixed message that names neither the path nor any content.
+
+**Limit-error classifier (phrases are ASSUMED).** `limit_errors.classify` recognizes a usage limit by the phrases `usage limit` or `limit reached`, and a rate limit by `429`, `rate limit` or `rate_limit`. No real limit-error text has been recorded, so these phrases are assumptions. A failed Claude turn that matches gets a `swapOffer` on its error event, and `record_sample` appends the error text to `limit-error-samples.jsonl` in the storage directory (mode 0600). **Owner step:** after the first real limit, open `limit-error-samples.jsonl` and send the shapes, so the phrases can be replaced with real ones.
+
+## Multi-chat polish (phase 4)
+
+Small features that make several chats easy to watch. All of them are browser-side and none changes what a chat does. The decisions live in pure modules (`static/attention-view.js`, `static/sessions-view.js`, `static/multi-chat.js` top section) with `node --test` tests; `static/chat.js` and the `multi-chat.js` browser adapter only apply them to the page. Nothing here has been checked in real use yet: see `VERIFY.md` and `docs/phase-4-exit-checklist.md`.
+
+- **Needs-you flash and count.** A terminal session that newly becomes `waiting` flashes amber in the switcher for about 10 seconds (CSS class `waiting-flash`), then stays amber while it waits. The browser tab title gets a `(N) ` prefix with the number of waiting sessions, and every change of that number is posted to the parent page as `window.parent.postMessage({ type: 'chat-attention', count: N }, origin)`. The badge on the dashboard's own tab that would use that message is a separate change in the dashboard repo, not part of this one.
+- **Optional chime.** The switcher menu ends with a "Chime when another chat needs me" checkbox, off by default and remembered in `localStorage` under `chat-chime` (`1` or `0`). When it is on and a session newly turns `waiting` and is not on screen, one short beep (880 Hz, about 0.2 s, no audio file) plays. Terminal sessions are never on screen as panes, so every newly waiting terminal session chimes while the box is ticked.
+- **Phone width.** Below 760 px the multi-pane page shows one pane (the active chat, or the first open one) and hides the preset buttons. The saved layout in `chat-workspace-layout` is not touched, so widening the window restores it. Resizing is debounced by 150 ms and re-renders only when 760 px is crossed.
+- **Layout templates.** The toolbar's Templates menu offers `driver + 2 workers` and `monitor grid` plus any you save with "Save current as...". A template is a preset and a pane count; choosing one keeps the chats already open, fills from the open ones, and pads with empty "New chat" slots. Your own templates live in `localStorage` under `chat-workspace-templates`, per browser.
+- **Filter and jump.** The switcher menu starts with a "Filter chats" box that narrows the terminal sessions by name, folder or host as you type. With the menu open, Ctrl+1 to Ctrl+9 highlights the nth terminal session as listed; terminal sessions are read-only, so this is a highlight only. A browser may reserve Ctrl+number for its own tabs.
+- **Popout panes are not available yet.** `static/vendor/dockview.js` is vendored, but nothing defines `window.DockviewGrid`, the adapter `multi-chat.js` looks for, so the plain flexbox panes are always used. Popout windows need that adapter first.
+
+## Merging VERIFY.md
+
+`VERIFY.md` is append-only: every stacked piece appends its own `## ... (piece n/m)` section to the end of the file, and the pieces are merged against each other. So two branches that each appended a section would otherwise always conflict at the end of the file even though both sides should simply be kept. To handle that, the root `.gitattributes` declares `VERIFY.md merge=union`, which uses git's built-in union merge driver: during a merge, both sides' lines are kept instead of reporting a conflict. Because each side's section is inserted at the point where that branch's file ended, the section order may interleave after a merge — check the headings after merging to make sure the logical order is what you intend. Do not use `merge=union` for source files: a union merge of code would hide real conflicts.

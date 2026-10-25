@@ -7,6 +7,7 @@ model-stats.db: 2 of 3 real Chat calls in one session showed that exact false me
 
 Run: .venv/bin/python -m unittest test_chat_sessions -v
 """
+import inspect
 import sys
 import tempfile
 import unittest
@@ -267,6 +268,38 @@ class NoGitHandoffPromptTest(unittest.TestCase):
         self.assertNotIn("worker-reasoning", prompt)
 
 
+class FreshnessRulesPromptTest(unittest.TestCase):
+    """2026-10-25: the chat reported months-old sales as 'the most recent' and said 'nothing to do' after silently swapping its data source."""
+
+    def test_rules_name_newest_date_today_could_not_run_and_stale(self):
+        rules = chat_sessions._FRESHNESS_RULES
+        for phrase in ("newest date", "today's date", "could not run", "possibly stale", "never by row id", "nothing to do"):
+            self.assertIn(phrase, rules)
+
+    def test_local_system_prompt_includes_the_rules(self):
+        self.assertIn(chat_sessions._FRESHNESS_RULES, chat_sessions._LOCAL_SYSTEM_PROMPT)
+        self.assertIn(chat_sessions._FRESHNESS_RULES, chat_sessions._local_system_prompt({"repoRoot": "/x", "roots": ["/x"]}))
+
+    def test_claude_first_turn_preamble_includes_the_rules(self):
+        src = inspect.getsource(chat_sessions._send_claude)
+        self.assertIn("preamble_parts.append(_FRESHNESS_RULES)", src, "the Claude first-turn preamble carries the same rules")
+
+
+class ProjectRulesPromptTest(unittest.TestCase):
+    """2026-10-25: tasks about the chat plugin repo were filed into agent-manager's queue; the local prompt now tells the chat to use list_projects and `project`."""
+
+    def test_rules_name_the_tools_and_the_project_argument(self):
+        rules = chat_sessions._PROJECT_RULES
+        for phrase in ("list_projects", "queue_reviewed_task(project=<label>)", "search_tasks accepts project \"all\"", "ask the user", "Never file a task about repo X"):
+            self.assertIn(phrase, rules)
+
+    def test_local_system_prompt_includes_the_rules_after_the_freshness_rules(self):
+        prompt = chat_sessions._LOCAL_SYSTEM_PROMPT
+        self.assertIn(chat_sessions._PROJECT_RULES, prompt)
+        self.assertLess(prompt.index(chat_sessions._FRESHNESS_RULES), prompt.index(chat_sessions._PROJECT_RULES))
+        self.assertIn(chat_sessions._PROJECT_RULES, chat_sessions._local_system_prompt({"repoRoot": "/x", "roots": ["/x"]}))
+
+
 class RecordTurnErrorTest(unittest.TestCase):
     """record_turn_error() -- a failed turn's error lands IN the stored transcript (it used
     to exist only as a 3-second toast)."""
@@ -335,6 +368,120 @@ class BuildLocalMessagesSkipsErrorsTest(unittest.TestCase):
         messages = chat_sessions._build_local_messages(session, "new message")
         contents = [m["content"] for m in messages[1:]]
         self.assertEqual(contents, ["first question", "second question", "a real answer", "new message"])
+
+
+class ChosenProjectTest(unittest.TestCase):
+    """2026-10-25 (walkthrough): a new chat opened with no indication of its target
+    project (the dashboard's active project could silently become the wrong task
+    queue). The session now carries chosen_project (None = the active one), it
+    round-trips through storage, and the per-turn local prompt makes it the default
+    `project` for the task tools."""
+
+    def setUp(self):
+        self.storage = Path(tempfile.mkdtemp())
+
+    def _store(self, **extra):
+        session = _session()
+        session["status"] = "active"
+        session.update(extra)
+        chat_sessions._write_sessions(self.storage, {session["id"]: session})
+        return session["id"]
+
+    def test_new_session_defaults_chosen_project_to_none(self):
+        s = chat_sessions._new_session(["/x"], None, "local", "sonnet", "high")
+        self.assertIsNone(s["chosen_project"])
+
+    def test_migrate_session_adds_the_key(self):
+        migrated = chat_sessions._migrate_session({"id": "chat-old"})
+        self.assertIn("chosen_project", migrated)
+        self.assertIsNone(migrated["chosen_project"])
+
+    def test_set_chosen_project_round_trips_and_appends_the_note(self):
+        sid = self._store()
+        updated = chat_sessions.set_chosen_project(self.storage, sid, "agent-manager")
+        self.assertEqual(updated["chosen_project"], "agent-manager")
+        stored = chat_sessions.get_session(self.storage, sid)
+        self.assertEqual(stored["chosen_project"], "agent-manager")
+        note = stored["transcript"][-1]
+        self.assertEqual(note["role"], "system")
+        self.assertIn("Project changed to: agent-manager (chosen)", note["text"])
+
+    def test_set_chosen_project_refuses_unknown_and_ended_sessions(self):
+        self.assertIsNone(chat_sessions.set_chosen_project(self.storage, "chat-nope", "x"))
+        sid = self._store(status="ended")
+        self.assertIsNone(chat_sessions.set_chosen_project(self.storage, sid, "x"))
+        self.assertIsNone(chat_sessions.get_session(self.storage, sid).get("chosen_project"))
+
+    def test_local_prompt_names_the_chosen_project_and_that_an_explicit_arg_wins(self):
+        session = _session()
+        session["chosen_project"] = "agent-manager"
+        prompt = chat_sessions._local_system_prompt(session)
+        self.assertIn("acting on project: agent-manager (chosen)", prompt)
+        self.assertIn("default `project` argument", prompt)
+        self.assertIn("explicit `project` argument in a tool call still overrides", prompt)
+
+    def test_local_prompt_omits_it_when_unset(self):
+        prompt = chat_sessions._local_system_prompt(_session())
+        self.assertNotIn("acting on project", prompt)
+        self.assertNotIn("(chosen)", prompt)
+
+
+class ChosenProjectRouteTest(unittest.TestCase):
+    """PATCH /api/chat/<id>/project (2026-10-25 walkthrough): validates the label
+    against the same registry list_projects reads, persists chosen_project, and
+    GET /api/chat/projects feeds the panel's selector."""
+
+    def setUp(self):
+        self.storage = Path(tempfile.mkdtemp())
+        patcher = mock.patch.object(app, "CHAT_STORAGE_DIR", self.storage)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        session = _session()
+        session["status"] = "active"
+        chat_sessions._write_sessions(self.storage, {session["id"]: session})
+        self.sid = session["id"]
+        self.options = [
+            {"label": "agent-manager", "root": "/r/am", "active": True},
+            {"label": "agent-manager-chat-plugin-am", "root": "/r/plugin", "active": False},
+        ]
+        patcher2 = mock.patch("routes.chat._project_options", return_value=self.options)
+        patcher2.start()
+        self.addCleanup(patcher2.stop)
+        self.client = app.app.test_client()
+
+    def test_patch_sets_the_project(self):
+        resp = self.client.patch(
+            f"/api/chat/{self.sid}/project", json={"project": "agent-manager"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["chosen_project"], "agent-manager")
+        self.assertEqual(body["session"]["chosen_project"], "agent-manager")
+        stored = chat_sessions.get_session(self.storage, self.sid)
+        self.assertEqual(stored["chosen_project"], "agent-manager")
+
+    def test_patch_missing_label_is_400(self):
+        resp = self.client.patch(f"/api/chat/{self.sid}/project", json={})
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()["ok"])
+
+    def test_patch_unknown_label_is_400_listing_the_valid_ones(self):
+        resp = self.client.patch(f"/api/chat/{self.sid}/project", json={"project": "nope"})
+        self.assertEqual(resp.status_code, 400)
+        body = resp.get_json()
+        self.assertIn("agent-manager", body["error"])
+
+    def test_patch_unknown_session_is_404(self):
+        resp = self.client.patch(
+            "/api/chat/chat-nope/project", json={"project": "agent-manager"})
+        self.assertEqual(resp.status_code, 404)
+        self.assertFalse(resp.get_json()["ok"])
+
+    def test_projects_endpoint_lists_the_registry_and_the_active_one(self):
+        body = self.client.get("/api/chat/projects").get_json()
+        self.assertEqual([p["label"] for p in body["projects"]],
+                         ["agent-manager", "agent-manager-chat-plugin-am"])
+        self.assertEqual(body["active"], "agent-manager")
 
 
 if __name__ == "__main__":

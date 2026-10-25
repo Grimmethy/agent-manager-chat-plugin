@@ -215,11 +215,26 @@ class LifecycleTest(StorageTestBase):
         self.assertEqual(set(rows[0]), {"id", "title", "provider", "model", "status", "startedAt",
                                         "lastActivityAt", "turnCount", "busy", "reserved"})
 
-    def test_list_sessions_truncates_long_titles(self):
-        chat_sessions._write_session(self.storage, _session("chat-1-aaaaaaaa", transcript=[{"role": "user", "text": "x" * 100}]))
-        title = chat_sessions.list_sessions(self.storage)[0]["title"]
-        self.assertEqual(len(title), 60)
+    def _title_for(self, text):
+        chat_sessions._write_session(self.storage, _session("chat-1-aaaaaaaa", transcript=[{"role": "user", "text": text}]))
+        return chat_sessions.list_sessions(self.storage)[0]["title"]
+
+    def test_list_sessions_truncates_very_long_titles(self):
+        title = self._title_for("x" * 300)
+        self.assertEqual(len(title), 200)
         self.assertTrue(title.endswith("…"))
+
+    def test_list_sessions_keeps_titles_up_to_200_characters_whole(self):
+        long_title = "Task: author a new selectable PromptForge scene template for a high school classroom " * 2
+        self.assertGreater(len(long_title.strip()), 150)
+        self.assertEqual(self._title_for(long_title), long_title.strip())
+        exactly = "y" * 200
+        self.assertEqual(self._title_for(exactly), exactly)
+
+    def test_list_sessions_cuts_a_201_character_title_to_200_ending_in_an_ellipsis(self):
+        title = self._title_for("z" * 201)
+        self.assertEqual(title, "z" * 199 + "…")
+        self.assertEqual(len(title), 200)
 
 
 if __name__ == "__main__":

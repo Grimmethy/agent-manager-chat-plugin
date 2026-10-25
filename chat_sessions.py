@@ -38,11 +38,15 @@ import time
 import uuid
 from pathlib import Path
 
+import accounts
 import claude_client
+import command_runs
+import handoff
 import local_tool_client
 import model_stats_client
 import ollama_client
 import template_store
+import tool_log
 
 PROVIDER_LOCAL = "local"
 PROVIDER_CLAUDE = "claude"
@@ -79,6 +83,10 @@ CHAT_LOCAL_MAX_TURNS = 100
 # callers that want all sessions, but _write_sessions can only touch the sessions it is
 # handed.
 SESSIONS_DIRNAME = ".agent-manager-chat-sessions"
+# 2026-10-19 (multi-chat workspace): the on-disk session schema version. v1 (master)
+# sessions have no schemaVersion/account/swaps/summary keys; _migrate_session() below
+# adds exactly those four with their defaults when a session reads in without them.
+SCHEMA_VERSION = 2
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _migrate_lock = threading.Lock()
 
@@ -114,7 +122,8 @@ def _migrate_legacy_store(storage_dir: Path):
         except (OSError, json.JSONDecodeError) as e:
             print(f"[chat-sessions] legacy store {legacy} unreadable, not migrated: {e}", file=sys.stderr, flush=True)
             return
-        sessions_dir(storage_dir).mkdir(parents=True, exist_ok=True)
+        sessions_dir(storage_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(sessions_dir(storage_dir), 0o700)
         for sid, session in (sessions or {}).items():
             try:
                 if not _session_path(storage_dir, sid).exists():
@@ -124,6 +133,48 @@ def _migrate_legacy_store(storage_dir: Path):
         legacy.rename(legacy.with_name(legacy.name + ".migrated"))
 
 
+def _migrate_session(session: dict) -> dict:
+    """Lossless v1 -> v2 schema upgrade (2026-10-19, multi-chat workspace). A session
+    without a schemaVersion (or below SCHEMA_VERSION) gains exactly the four v2 fields
+    with their defaults -- nothing else is changed or dropped: the transcript is never
+    touched and any unknown extra keys are preserved. Pure: it returns the session and
+    does NOT rewrite the file on read (the next normal _write_session persists the new
+    shape). Idempotent -- a v2 (or newer) session is returned exactly as-is."""
+    if not isinstance(session, dict):
+        return session
+    if session.get("schemaVersion", 0) >= SCHEMA_VERSION:
+        return session
+    session.setdefault("schemaVersion", SCHEMA_VERSION)
+    # Label of a Claude account in accounts.json; None = the live account at turn time.
+    session.setdefault("account", None)
+    session.setdefault("swaps", [])
+    # Later shape: {'upToIndex': int, 'text': str, 'at': iso}
+    session.setdefault("summary", None)
+    # 2026-10-25 (walkthrough): label of the project this chat acts on by default;
+    # None = fall back to the dashboard's active project.
+    session.setdefault("chosen_project", None)
+    return session
+
+
+def set_chosen_project(storage_dir: Path, session_id: str, project: str):
+    """2026-10-25 (walkthrough): set which project this chat acts on by default.
+    Persists the session, appends a one-line system note to the transcript (so the
+    model and the UI both see the change), and returns the updated session -- or
+    None if the session does not exist or is no longer active."""
+    session = _read_session(storage_dir, session_id)
+    if session is None or session.get("status") != "active":
+        return None
+    session["chosen_project"] = project
+    # Transcript rows use `text` (see _build_local_messages's replay loop) and `role`;
+    # a system row replays as a user-side note the model can still see each turn.
+    session.setdefault("transcript", []).append(
+        {"role": "system", "text": f"Project changed to: {project} (chosen)"}
+    )
+    _touch(session)
+    _write_session(storage_dir, session)
+    return session
+
+
 def _read_session(storage_dir: Path, session_id: str):
     _migrate_legacy_store(storage_dir)
     try:
@@ -131,16 +182,21 @@ def _read_session(storage_dir: Path, session_id: str):
     except ValueError:
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        session = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    return _migrate_session(session)
 
 
 def _write_session(storage_dir: Path, session: dict):
     """Writes ONE session atomically: a unique temp file in the same directory, then
     os.replace, so a reader never sees half a file and two writers never share a temp."""
     p = _session_path(storage_dir, session["id"])
-    p.parent.mkdir(parents=True, exist_ok=True)
+    # mode=0o700 so the sessions dir is owner-only even under a permissive umask
+    # (mkdir's mode is ignored when exist_ok=True and the dir already exists, so
+    # chmod the existing dir too -- same pattern as accounts.py's _save).
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(p.parent, 0o700)
     fd, tmp = tempfile.mkstemp(prefix=f".{session['id']}.", suffix=".tmp", dir=p.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -221,6 +277,17 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
         # registry (app.py), NOT here -- an open file object isn't JSON-serializable and
         # wouldn't survive a process restart meaningfully anyway.
         "reserved": False,
+        # --- schema v2 fields (see _migrate_session, which adds the same four to v1 files) ---
+        "schemaVersion": SCHEMA_VERSION,
+        # Label of a Claude account in accounts.json; None = the live account at turn time.
+        "account": None,
+        "swaps": [],
+        # Later shape: {'upToIndex': int, 'text': str, 'at': iso}
+        "summary": None,
+        # 2026-10-25 (walkthrough): the project label this chat acts on by default --
+        # passed as the default `project` for the task tools; None = the dashboard's
+        # active project. An explicit `project` tool argument still wins.
+        "chosen_project": None,
     }
 
 
@@ -269,11 +336,74 @@ def end_session(storage_dir: Path, session_id: str):
     return session
 
 
+def _swap_label(side: dict) -> str:
+    # "provider / model" with the account only when one is pinned -- the human-readable
+    # half of the transcript marker row's text.
+    label = f"{side['provider']} / {side['model']}"
+    if side.get("account"):
+        label += f" (account: {side['account']})"
+    return label
+
+
+def swap_session(storage_dir: Path, session_id: str, provider: str, model: str,
+                 account: str = None, effort: str = None):
+    """HUB0008 4/11 (multi-chat workspace): change a chat's provider/model/account
+    IN PLACE, mid-conversation. Every existing transcript row is kept verbatim --
+    this only appends ONE marker row recording the switch -- and appends one
+    {'at','from','to'} entry to session["swaps"] (schema v2, piece 1) so the swap
+    history survives. Persists exactly once.
+
+    Returns the updated session, or None if the session is missing or not active.
+    Raises ValueError for a provider other than PROVIDER_LOCAL / PROVIDER_CLAUDE.
+
+    claudeSessionId is ALWAYS reset to None on a swap: a Claude CLI session cannot be
+    assumed resumable on another account or after a local-provider interlude -- the
+    new backend gets its history from the transcript (piece 6), never from --resume.
+    """
+    session = _read_session(storage_dir, session_id)
+    if not session or session.get("status") != "active":
+        return None
+    if provider not in (PROVIDER_LOCAL, PROVIDER_CLAUDE):
+        raise ValueError(f"invalid swap provider: {provider!r} "
+                         f"(expected {PROVIDER_LOCAL!r} or {PROVIDER_CLAUDE!r})")
+    from_side = {
+        "provider": session.get("provider"),
+        "model": session.get("model"),
+        "account": session.get("account"),
+    }
+    session["provider"] = provider
+    session["model"] = model
+    # account only means something for the Claude provider -- local has no account.
+    session["account"] = account if provider == PROVIDER_CLAUDE else None
+    if effort is not None:
+        session["effort"] = effort
+    session["claudeSessionId"] = None
+    iso = _now_iso()
+    to_side = {
+        "provider": provider,
+        "model": model,
+        "account": session["account"],
+    }
+    session.setdefault("swaps", []).append({"at": iso, "from": from_side, "to": to_side})
+    # The marker row is the transcript's durable audit record of this swap. It is
+    # skipped in the local model replay (see _build_local_messages) but kept in the
+    # human-visible transcript forever -- never deleted or edited.
+    session["transcript"].append({
+        "role": "assistant",
+        "text": f"Switched from {_swap_label(from_side)} to {_swap_label(to_side)}.",
+        "marker": True,
+        "timestamp": iso,
+    })
+    _touch(session)
+    _write_session(storage_dir, session)
+    return session
+
+
 def _session_title(session: dict) -> str:
     for turn in session.get("transcript") or []:
         if turn.get("role") == "user" and (turn.get("text") or "").strip():
             text = " ".join(turn["text"].split())
-            return text if len(text) <= 60 else text[:59] + "…"
+            return text if len(text) <= 200 else text[:199] + "…"
     return "New chat"
 
 
@@ -339,7 +469,7 @@ def _agents_md_blurb(agents_md: str) -> str:
     )
 
 
-def _send_claude(session: dict, message: str) -> str:
+def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
     started = time.time()
     roots = session.get("roots") or [session["repoRoot"]]
     # First turn only: the CLI's --add-dir makes the extra repos reachable but doesn't
@@ -353,16 +483,63 @@ def _send_claude(session: dict, message: str) -> str:
                 "You are rooted at the agent-manager repo and also have full read/write "
                 "access to these additional repos:\n" + _roots_blurb(session)
             )
+        preamble_parts.append(_FRESHNESS_RULES)
         agents_md = _read_agents_md(session)
         if agents_md:
             preamble_parts.append(_agents_md_blurb(agents_md))
         if preamble_parts:
             message = "\n\n---\n\n".join(preamble_parts) + "\n\n---\n\n" + message
+        # HUB0008 6/11: after a swap, claudeSessionId is None, so the new CLI session
+        # knows nothing of this conversation. When the transcript has earlier rows
+        # (i.e. this is NOT a fresh session's first turn), prepend a hand-off built by
+        # handoff.build_handoff() over the transcript minus the current turn, plus the
+        # stored local summary if there is one (piece 6/11, summarize_older below).
+        transcript = session.get("transcript") or []
+        # The current turn's own rows are the tail _stream_message_turn appends right
+        # before this call: this user message plus the empty assistant placeholder.
+        # Neither belongs in the hand-off -- strip them from the tail.
+        earlier = list(transcript)
+        if (earlier and earlier[-1].get("role") == "assistant"
+                and not (earlier[-1].get("text") or "").strip()
+                and not earlier[-1].get("error") and earlier[-1].get("marker") is not True):
+            earlier.pop()
+        if (earlier and earlier[-1].get("role") == "user"
+                and earlier[-1].get("text") == message):
+            earlier.pop()
+        plain_earlier = [row for row in earlier
+                         if isinstance(row, dict) and not row.get("error")
+                         and row.get("marker") is not True]
+        if plain_earlier:
+            summary = session.get("summary") or {}
+            handoff_text = handoff.build_handoff(
+                earlier,
+                summary.get("text") if summary else None,
+                keep_turns=CHAT_RECENT_TURNS_KEPT,
+                max_tokens=int(0.4 * handoff.window_tokens("claude")),
+            )
+            # Separator line: the same "\n\n---\n\n" convention the preamble above
+            # already uses -- this exact format is this task's own choice (the task
+            # names "a separator line" without spelling out one).
+            message = handoff_text + "\n\n---\n\n" + message
+    # HUB0008 3/11: the chat's own account wins; otherwise follow the live account --
+    # re-resolved on EVERY turn (no caching), so a live-account swap takes effect on
+    # the next turn for a session without an explicit account.
+    label = session.get("account") or accounts.live_label(storage_dir)
+    entry = None
+    if label is not None:
+        entry = next((e for e in accounts.load(storage_dir) if e.get("label") == label), None)
+        if entry is None:
+            # Label was set but not found: ONE warning naming the label -- never the
+            # tokenFile path (secrets live outside the repo and must not leak into logs).
+            print(f"[chat-sessions] account label {label!r} not found in registry",
+                  file=sys.stderr, flush=True)
+    token_file = entry.get("tokenFile") if entry else None
     result = claude_client.generate(
         message, model=session.get("model"), effort=session.get("effort"),
         cwd=session["repoRoot"], allowed_tools=CHAT_CLAUDE_ALLOWED_TOOLS,
         max_turns=CHAT_CLAUDE_MAX_TURNS, resume=session.get("claudeSessionId"),
         add_dirs=roots[1:], allow_amplification=True,
+        token_file=token_file,
     )
     if result.get("sessionId"):
         session["claudeSessionId"] = result["sessionId"]
@@ -370,6 +547,28 @@ def _send_claude(session: dict, message: str) -> str:
                                     stage="chat", result=result, source="chat")
     return result["response"].strip()
 
+
+# 2026-10-25 (sale-lookup test): the chat could not run the named ingest command, read the database file instead, called months-old rows
+# "the most recent" (it ordered by row id) and ended "nothing to do" without saying the newest record was older than the asked window.
+# One constant so the local prompt and the Claude first-turn preamble cannot drift apart.
+_FRESHNESS_RULES = (
+    "Freshness and honesty rules for questions about recent data:\n"
+    "- When asked for recent, latest, new or last-N-days records, order by the record's own date (never by row id), quote the "
+    "newest date you found next to today's date, and if the newest record is older than the window asked about, say so "
+    "('the data has nothing newer than <date>; it may need refreshing with <command>') -- never report old records as recent.\n"
+    "- If a command the user named could not run (read-only mount, missing path or repo, missing credentials), say exactly which "
+    "command could not run and why BEFORE using any substitute source, and label what the substitute shows as possibly stale.\n"
+    "- Never answer 'nothing to do' without listing what you checked and the date of the newest thing you saw."
+)
+
+# 2026-10-25: two tasks about the chat plugin repo were filed into agent-manager's own queue because queue_reviewed_task had no project argument. The tools now
+# take one (core src/local-tool-client.js: list_projects, `project` on queue_reviewed_task, read_task, search_tasks and the four unstick tools).
+_PROJECT_RULES = (
+    "Projects and task queues: every project has its own task queue. Call list_projects first to see each project's label, repo root, whether it is pooled and which one is active. "
+    "File a task about another repo with queue_reviewed_task(project=<label>) and read, search or unstick tasks of that project with the same `project` argument "
+    "(search_tasks accepts project \"all\"). If you are unsure which project a change belongs to, ask the user. "
+    "Never file a task about repo X into another project's queue: the tool refuses a task whose file paths clearly belong to another project, and tells you which one."
+)
 
 _LOCAL_SYSTEM_PROMPT = (
     "You are a coding assistant embedded in the agent-manager system's own dashboard, "
@@ -478,12 +677,25 @@ _LOCAL_SYSTEM_PROMPT = (
     "END-TEMPLATE\n"
     "The chat shows it as a card with a Save button -- you cannot and must not write the "
     "file yourself. Never claim a template is saved; the user saves it. Do not wrap the "
-    "block in a code fence."
+    "block in a code fence.\n\n"
+    + _FRESHNESS_RULES
+    + "\n\n" + _PROJECT_RULES
 )
 
 
 def _local_system_prompt(session: dict) -> str:
-    prompt = _LOCAL_SYSTEM_PROMPT + "\n\nAccessible repos:\n" + _roots_blurb(session)
+    prompt = _LOCAL_SYSTEM_PROMPT
+    # 2026-10-25 (walkthrough): a new chat opened with no indication of its target
+    # project; the dashboard's active project was the wrong queue's project. When the
+    # user picked one for this session, make it the default project for the task tools.
+    if session.get("chosen_project"):
+        prompt += (
+            f"\nThis chat is acting on project: {session['chosen_project']} (chosen). "
+            "Use that label as the default `project` argument for the task tools "
+            "(queue_reviewed_task, read_task, search_tasks, and the unstick tools). "
+            "An explicit `project` argument in a tool call still overrides this default."
+        )
+    prompt += "\n\nAccessible repos:\n" + _roots_blurb(session)
     agents_md = _read_agents_md(session)
     if agents_md:
         prompt += "\n\n---\n\n" + _agents_md_blurb(agents_md)
@@ -567,10 +779,83 @@ def _build_local_messages(session: dict, message: str) -> list:
     for turn in recent:
         if turn.get("error"):
             continue  # recorded failure notices are for the human, never replayed to the model
+        if turn.get("marker") is True:
+            # swap_session()'s audit rows are for the human (and the swaps log), never
+            # re-sent to the model -- keyed strictly on the boolean flag, exactly like
+            # the error-row skip above; a real row whose text merely contains the word
+            # "marker" has no marker key and is replayed normally.
+            continue
         role = "assistant" if turn["role"] == "assistant" else "user"
-        messages.append({"role": role, "content": turn["text"]})
+        messages.append({"role": role, "content": turn["text"] + command_runs.context_note(turn)})
     messages.append({"role": "user", "content": message})
     return messages
+
+
+# HUB0008 6/11: optional local summary of the older turns -- the default summarizer
+# is one bounded local Ollama call (the same ollama_client.generate shape the local
+# provider already uses), asking for a hand-off summary that keeps decisions, file
+# names and open questions. Tests inject their own fake summarizer instead.
+SUMMARY_PROMPT = (
+    "Write a compact hand-off summary of this conversation so far, in plain text, "
+    "for an assistant who will continue it fresh. Keep: the decisions that were "
+    "made, the file names and paths mentioned, and any open questions or unfinished "
+    "work. Drop small talk and repeated status updates."
+)
+
+
+def _default_summarizer(text: str) -> str:
+    result = ollama_client.generate(SUMMARY_PROMPT + "\n\n" + text, num_predict=600)
+    return result["response"]
+
+
+def summarize_older(storage_dir: Path, session_id: str, summarizer=None):
+    """HUB0008 6/11: build (or refresh) the session's local summary of its older
+    turns -- every non-error, non-marker row older than the last
+    CHAT_RECENT_TURNS_KEPT rows -- and store it as session["summary"] =
+    {"upToIndex": <index>, "text": ..., "at": <iso>} before persisting and
+    returning the session (None if the session is unknown or not active).
+
+    `summarizer(text) -> str` is injected so callers and tests stay fake-only;
+    with no summarizer the default above calls ollama_client.generate
+    (SUMMARY_PROMPT, num_predict=600).
+
+    It NEVER removes or edits transcript rows. It does nothing (returns the
+    session unchanged) when handoff.needs_summary(...) is False for the
+    session's CURRENT provider (session["provider"], as swap_session keeps it
+    up to date) or when there are no older rows. A summarizer exception leaves
+    the session unchanged and is re-raised -- nothing is mutated before the
+    summarizer call, so there is simply nothing to roll back.
+    """
+    session = _read_session(storage_dir, session_id)
+    if not session or session.get("status") != "active":
+        return session
+    transcript = session.get("transcript") or []
+    up_to = len(transcript) - CHAT_RECENT_TURNS_KEPT
+    if up_to <= 0:
+        return session  # no older rows: nothing to summarise
+    if not handoff.needs_summary(transcript, session.get("provider") or PROVIDER_LOCAL):
+        return session  # transcript fits the current provider's window: skip
+    older = transcript[:up_to]
+    plain = [row for row in older
+             if isinstance(row, dict) and not row.get("error")
+             and row.get("marker") is not True]
+    if not plain:
+        return session  # older rows exist but hold nothing summarisable
+    text = "\n".join(
+        "%s: %s" % ("Assistant" if row.get("role") == "assistant" else "User",
+                    row.get("text") or "")
+        for row in plain
+    )
+    if summarizer is None:
+        summarizer = _default_summarizer
+    summary_text = summarizer(text)  # an exception propagates: nothing mutated yet
+    session["summary"] = {
+        "upToIndex": up_to,
+        "text": summary_text,
+        "at": _now_iso(),
+    }
+    _write_session(storage_dir, session)
+    return session
 
 
 def _stream_local(session: dict, message: str, result_box: dict = None):
@@ -653,6 +938,8 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
         yield footer
     if result_box is not None:
         result_box["final_text"] = final_text
+        result_box["tools"] = tool_log.summarize_tool_calls((result or {}).get("toolCallLog"))
+        result_box["proposals"] = (result or {}).get("commandProposals") or []
 
 
 def stream_message(storage_dir: Path, session_id: str, message: str):
@@ -702,7 +989,7 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     reply_parts = []
     result_box = {}
     if session["provider"] == PROVIDER_CLAUDE:
-        reply = _send_claude(session, message)
+        reply = _send_claude(session, message, storage_dir)
         reply_parts.append(reply)
         session["transcript"][-1]["text"] = reply
         _write_session(storage_dir, session)
@@ -725,6 +1012,10 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     # SAVE-TEMPLATE blocks become Save-button proposals (template_store.py); never auto-saved.
     reply, proposals = template_store.extract_proposals(reply)
     session["transcript"][-1]["text"] = reply.strip()
+    if result_box.get("tools"):
+        session["transcript"][-1]["tools"] = result_box["tools"]
+    if result_box.get("proposals"):
+        command_runs.record_proposals(session["transcript"][-1], result_box["proposals"])
     if proposals:
         session["transcript"][-1]["templates"] = proposals
     _write_session(storage_dir, session)
