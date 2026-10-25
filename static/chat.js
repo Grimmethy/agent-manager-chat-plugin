@@ -288,6 +288,13 @@ class ChatPane {
     this.onSessionChange(session);
   }
 
+  // The chat's real title, from the sessions list (the multi-chat bar passes it in); shown in the pane header while this pane still shows the same chat.
+  setTitle(text) {
+    this.titleText = typeof text === 'string' ? text : '';
+    this.titleFor = this.sessionId;
+    this.titleEl.textContent = this.titleText || (this.session ? fullTitle(this.session.title) : '');
+  }
+
   syncProviderToggle() {
     const claude = this.providerChoice === 'claude';
     this.providerBtn.dataset.provider = this.providerChoice;
@@ -628,7 +635,8 @@ class ChatPane {
   render() {
     const session = this.session;
     this.syncSwapHeader();
-    this.titleEl.textContent = session ? fullTitle(session.title) : '';
+    // A loaded session has no `title` (only the sessions list does), so the host page hands the real title in through setTitle(); it counts only while this pane still shows that chat.
+    this.titleEl.textContent = this.titleText && this.titleFor === this.sessionId ? this.titleText : (session ? fullTitle(session.title) : '');
     if (session && session.provider && this.providerChoice !== session.provider) {
       this.providerChoice = session.provider;
       this.syncProviderToggle();

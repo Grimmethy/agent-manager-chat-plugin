@@ -378,6 +378,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function renderTabs() {
       const titles = {};
       if (switcher && Array.isArray(switcher.rows)) for (const r of switcher.rows) if (r && typeof r.id === 'string') titles[r.id] = r.title;
+      for (const p of livePanes) if (p.sessionId && typeof titles[p.sessionId] === 'string') p.setTitle(titles[p.sessionId]); // pane headers carry the same real title as the buttons
       tabsBox.innerHTML = '';
       for (const tab of chatTabs(state, titles, activeId)) {
         const btn = document.createElement('button');
