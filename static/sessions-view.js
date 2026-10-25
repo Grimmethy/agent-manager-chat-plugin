@@ -3,11 +3,21 @@
 // `node --test` (test/sessions-view.test.mjs): the current time is always injected.
 
 const TITLE_MAX = 40;
+const ROW_TITLE_MAX = 200;
 
 export function truncateTitle(title, max = TITLE_MAX) {
   const text = String(title == null ? '' : title).replace(/\s+/g, ' ').trim();
   if (!text) return 'New chat';
   return text.length <= max ? text : text.slice(0, max - 1) + '…';
+}
+
+// Row/button title: the whitespace-normalised FULL title, cut only beyond
+// ROW_TITLE_MAX (the row and the button clip themselves visually, so a short
+// JS cut just hid text the reader could see). 'New chat' when there is none.
+export function fullTitle(raw) {
+  const text = String(raw == null ? '' : raw).replace(/\s+/g, ' ').trim();
+  if (!text) return 'New chat';
+  return text.length <= ROW_TITLE_MAX ? text : text.slice(0, ROW_TITLE_MAX) + '…';
 }
 
 export function statusWord(row) {
@@ -67,7 +77,7 @@ export function nextSelectionAfterClose(rows, closedId) {
 export function formatRow(row, now) {
   return {
     id: row.id,
-    title: truncateTitle(row.title),
+    title: fullTitle(row.title),
     fullTitle: row.title || '',
     provider: providerLabel(row),
     status: statusWord(row),
