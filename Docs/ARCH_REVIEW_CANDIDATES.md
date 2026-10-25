@@ -1137,3 +1137,28 @@ Assign each failure origin a stable machine-readable code (e.g. `"internal_api"`
 
 Benefits:
 The frontend can branch on a stable identifier rather than parsing English prose, making error handling resilient to wording changes. Operators debugging a 502 can immediately tell which upstream dependency failed without reading logs. The redundant `OSError` catch is removed, simplifying the exception hierarchy the reader must track.
+
+### AC-85 · ~~Asymmetric error handling between streaming and non-streaming paths~~
+Strength: Strong
+
+**Status: Withdrawn**
+
+The original draft asserted that `stream_local_turn`'s use of a `{"type": "error", ...}` yield was a silent-failure bug and that callers would "silently miss a network failure." This is incorrect. The module's own docstring for `stream_local_turn` explicitly enumerates `"error"` as a valid yield type (`"chunk"|"final"|"error"`), and `local_tool_client.py` documents the generator contract that `chat_sessions.py` consumes: yield chunks, then a final, or an error dict. The caller is designed to inspect the yielded dictionary and react accordingly. Changing the function to raise `InternalApiError` mid-iteration would violate the documented generator contract, break the existing consumer logic in `chat_sessions.py`, and conflate a recoverable per-turn error with an unrecoverable transport failure. The current design is intentional and correct.
+
+### AC-86 · ~~Redundant pass-through wrapper module adds indirection without value~~
+Strength: Strong
+
+**Status: Withdrawn**
+
+The original draft characterized `local_tool_client.py` as a valueless shim that should be deleted. In fact, the module's header states explicitly that it preserves the public name and signature (`local_tool_client.stream_plan_with_tools(...)`) that `chat_sessions.py` and other external callers already invoke, so that "nothing else [needs] to change." It is a deliberate compatibility layer maintaining API stability during the Phase 3 migration. Deleting it would force every external caller to update its import path and function name, which is the opposite of the stability the module provides. The indirection is a feature, not a defect.
+
+### AC-87 · ~~Error handling in the app layer depends on an alias that will vanish with the shim~~
+Strength: Strong
+
+**Status: Withdrawn**
+
+This finding was predicated on AC-002's recommendation to delete `local_tool_client.py`. Since that recommendation is withdrawn (see above), the premise that `LocalToolClientError` "will vanish" no longer holds. The alias is a clear, semantic name for the error type in the context of local-tool calls, and `app.py`'s `except (ClaudeClientError, LocalToolClientError)` clause is a valid, explicit dependency on a stable public name. Renaming it to `InternalApiError` would couple the app layer to an internal implementation name and provide no correctness benefit.
+
+---
+
+**Summary:** All three original findings were based on misreadings of the code's design intent. The streaming error-dict contract, the `local_tool_client.py` compatibility layer, and the `LocalToolClientError` alias are each intentional, documented, and load-bearing. No code change is warranted.
