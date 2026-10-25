@@ -459,7 +459,18 @@ def api_chat_reserve(session_id):
     except InternalApiError as e:
         abort(502, description=f"reservation call to the core dashboard failed: {e}")
 
-    session = set_reserved(CHAT_STORAGE_DIR, session_id, want_on)
+    # KNOWN LIMITATION (AC-4 divergence): if set_reserved fails after the call above succeeded, the server-side reservation is LIVE while the
+    # local session file still has the old flag, and there is no compensating release in this path. The failure is logged with the stable tag
+    # AC4_DIVERGENCE so an operator can grep for it and reconcile by hand. Longer-term fix: call internal_reserve(session_id, on=False) from the
+    # except block below (as api_chat_close does), or set the local flag first and retry the remote call.
+    try:
+        session = set_reserved(CHAT_STORAGE_DIR, session_id, want_on)
+    except Exception as e:
+        import ollama_client
+        logger.error("AC4_DIVERGENCE session=%s model=%s want_on=%s error=%s: %s -- Server-side reservation is LIVE but local chat_sessions "
+                     "state was NOT updated. Manual reconciliation required.",
+                     session_id, ollama_client.MODEL, want_on, type(e).__name__, e)
+        raise
     return jsonify(session)
 
 
