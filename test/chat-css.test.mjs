@@ -110,6 +110,14 @@ test('.multi-chat-flex is a horizontal snap strip, not a wrapping vertical grid'
   assert.match(block, /scroll-snap-type\s*:\s*x\s+mandatory/i, 'scroll-snap-type must be "x mandatory"');
 });
 
+test('.multi-chat-flex hides its scrollbar but still scrolls and snaps, so the buttons are the way to move', () => {
+  const block = blocksFor('.multi-chat-flex').join(' ');
+  assert.match(block, /scrollbar-width\s*:\s*none/i, 'Firefox-style scrollbar must be hidden');
+  assert.match(blocksFor('.multi-chat-flex::-webkit-scrollbar').join(' '), /display\s*:\s*none/i, 'WebKit/Blink scrollbar must be hidden');
+  assert.match(block, /overflow-x\s*:\s*auto/i, 'the strip must still scroll horizontally');
+  assert.match(block, /scroll-snap-type\s*:\s*x\s+mandatory/i, 'the strip must still snap');
+});
+
 test('.multi-chat-flex sets --strip-visible from the width with the stripVisibleCount breakpoints', () => {
   const block = blocksFor('.multi-chat-flex').join(' ');
   assert.match(block, /(^|[;\s])--strip-visible\s*:\s*2/i, 'default of two visible panes');
