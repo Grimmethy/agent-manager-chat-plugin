@@ -30,6 +30,8 @@ import { fullTitle, orderSessions, nextSelectionAfterClose, formatRow,
 // split. providerLabel drives the header label, swapOptions builds the Swap menu,
 // swapBody builds each POST body, offerText renders the failed-turn one-click offer.
 import { providerLabel, swapOptions, offerText, swapBody } from "./swap-view.js";
+// The tools an assistant turn ran (stored by tool_log.py), shown as a collapsed list under its reply.
+import { renderToolsHtml } from "./tools-view.js";
 // Piece 2/10: the pure "needs you" attention logic (which rows newly became waiting,
 // how many are waiting) lives in attention-view.js (piece 1). This file only calls it
 // and applies the result to the DOM; keep the decision logic there.
@@ -134,7 +136,7 @@ function chatRenderTranscript(transcript, session) {
         <textarea class="tpl-text" rows="6" ${done ? 'disabled' : ''}>${escapeHtml(tp.text)}</textarea>
         <button type="button" class="tpl-save" ${done ? 'disabled' : ''}>${done ? 'Saved' : 'Save template'}</button>${note}</div>`;
     }).join('');
-    return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div>${cards}</div>`;
+    return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div>${renderToolsHtml(t.tools)}${cards}</div>`;
   }).join('');
   return `<div class="field-label">Conversation</div><div class="chat-transcript">${rows}</div>`;
 }

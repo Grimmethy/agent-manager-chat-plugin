@@ -45,6 +45,7 @@ import local_tool_client
 import model_stats_client
 import ollama_client
 import template_store
+import tool_log
 
 PROVIDER_LOCAL = "local"
 PROVIDER_CLAUDE = "claude"
@@ -889,6 +890,7 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
         yield footer
     if result_box is not None:
         result_box["final_text"] = final_text
+        result_box["tools"] = tool_log.summarize_tool_calls((result or {}).get("toolCallLog"))
 
 
 def stream_message(storage_dir: Path, session_id: str, message: str):
@@ -961,6 +963,8 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     # SAVE-TEMPLATE blocks become Save-button proposals (template_store.py); never auto-saved.
     reply, proposals = template_store.extract_proposals(reply)
     session["transcript"][-1]["text"] = reply.strip()
+    if result_box.get("tools"):
+        session["transcript"][-1]["tools"] = result_box["tools"]
     if proposals:
         session["transcript"][-1]["templates"] = proposals
     _write_session(storage_dir, session)
