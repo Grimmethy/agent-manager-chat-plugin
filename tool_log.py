@@ -49,3 +49,12 @@ def summarize_tool_calls(tool_call_log) -> list:
         if len(out) >= MAX_TOOLS:
             break
     return out
+
+
+OUTPUT_MAX = 4000
+
+
+def scrub_output(text, limit: int = OUTPUT_MAX) -> str:
+    """A command's stdout or stderr as stored on the transcript: secrets hidden with the same rules as the tool arguments, then cut to `limit` characters."""
+    text = _scrub("" if text is None else str(text))
+    return text if len(text) <= limit else text[:limit - 1] + "…"

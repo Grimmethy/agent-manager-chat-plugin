@@ -33,10 +33,10 @@ test('every field is escaped', () => {
   assert.match(html, /a&amp;b&#39;c/);
 });
 
-test('chat.js imports the renderer and puts it between the message text and the template cards', () => {
+test('chat.js imports the renderer and puts it between the message text and the command block and template cards', () => {
   const src = readFileSync(fileURLToPath(new URL('../static/chat.js', import.meta.url)), 'utf8');
   assert.match(src, /import \{ renderToolsHtml \} from "\.\/tools-view\.js";/);
-  assert.match(src, /<div class="chat-msg-text">\$\{body\}<\/div>\$\{renderToolsHtml\(t\.tools\)\}\$\{cards\}/);
+  assert.match(src, /<div class="chat-msg-text">\$\{body\}<\/div>\$\{renderToolsHtml\(t\.tools\)\}\$\{renderCommandsHtml\(t\)\}\$\{cards\}/);
 });
 
 test('the tools block is styled with the existing palette tokens', () => {
