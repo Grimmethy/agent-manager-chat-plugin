@@ -1516,3 +1516,31 @@ Make the identity contract explicit and uniform. Decide whether terminal-session
 
 Benefits:
 The row-identity rule becomes a single, auditable decision rather than an emergent behavior of payload shape. Duplicate-row and wrong-row-update failure modes are either structurally impossible or explicitly logged, reducing debugging time for operators who see inconsistent terminal-session lists after a host rename or a relay misconfiguration.
+
+### AC-113 · Provider-specific token budgeting in a generic handoff module
+Strength: Worth exploring
+Files: handoff.py
+
+Problem:
+The `window_tokens` function in `handoff.py` hardcodes a mapping of provider names ("claude", "local") to specific environment variables (e.g., `AGENT_MANAGER_CHAT_CLAUDE_WINDOW_TOKENS`, `AGENT_MANAGER_CHAT_LOCAL_WINDOW_TOKENS`) and their default token counts. The code documents this as an intentional, scoped design: the module is a pure helper with no I/O, and the mapping is treated as configuration data rather than logic. That is a reasonable choice for the current two-provider scope. However, the practical consequence remains that adding a third provider requires editing `handoff.py` to insert a new key, environment-variable name, and default into the map. For a team that anticipates growing the provider set, this creates a small but recurring touch-point in a module that is otherwise provider-agnostic in its logic (it accepts a `provider` string and applies a uniform resolution path).
+
+Solution:
+If the provider set is expected to grow, the mapping can be externalised to a registry or a per-provider configuration layer so that `handoff.py` resolves the token budget by looking up the active provider in a shared structure rather than naming each one. This is an optional extensibility improvement, not a correction of a defect; the current inline map is perfectly adequate for two providers.
+
+Benefits:
+When a new provider is added, its window-token configuration lives alongside the rest of that provider's settings, and `handoff.py` needs no modification. The change is low-risk and can be deferred until a third provider is actually planned.
+
+### AC-114 · Token estimation heuristic is not centralised
+Strength: Worth exploring
+Files: handoff.py
+
+Problem:
+`handoff.py` defines `estimate_tokens` as a simple `math.ceil(len(text or "") / 4)` heuristic. The function is defined locally in the handoff module rather than in a shared utility. From the provided inputs, `handoff.py` is the only module that contains this heuristic; no other file in the set was shown to duplicate it. The concern is therefore not a confirmed duplication but a *fragility*: if any future module (a context-window guard, a summary trigger, a budget enforcer) needs the same estimate, it will either re-implement the divisor-of-4 heuristic independently or import a private helper from `handoff.py`, both of which make the estimation strategy harder to change in one place.
+
+Solution:
+Extract the token-estimation logic into a small shared utility module (e.g., `token_utils.py`) that all callers import. The utility can accept an optional model-family parameter so that a caller can supply a more accurate divisor or delegate to a real tokenizer, while `handoff.py` and any future consumer simply call the same function.
+
+Benefits:
+A single, importable source of truth for token estimation means that adjusting the strategy (e.g., switching to a model-specific tokenizer) is a one-line change in one file rather than a search across the codebase for every place the heuristic was re-implemented.
+
+NOTE: Flag 1's core factual point (the design is documented and intentional, not an accidental OCP violation) was applied; the "violation" language was removed and the item reframed as an optional extensibility improvement. Flag 2's point that no duplication is evidenced in the provided inputs was applied; the speculative "likely duplicated in chat_sessions.py / ollama_client.py" claim was removed and the problem restated as a centralisation/fragility concern rather than an asserted duplication.
