@@ -112,8 +112,10 @@ function renderMarkdown(text) {
 function chatRenderTranscript(transcript, session) {
   const assistantLabel = session && session.provider === 'claude' ? 'Claude' : 'Local';
   const rows = transcript.map((t, idx) => {
-    const roleLabel = t.role === 'assistant' ? assistantLabel : 'You';
-    const cls = (t.role === 'assistant' ? 'chat-msg-assistant' : 'chat-msg-user') + (t.error ? ' chat-msg-error' : '');
+    // 2026-10-25 (walkthrough): system rows are the "Project changed to: … (chosen)"
+    // notes the project selector appends to the transcript.
+    const roleLabel = t.role === 'assistant' ? assistantLabel : (t.role === 'system' ? 'System' : 'You');
+    const cls = (t.role === 'assistant' ? 'chat-msg-assistant' : (t.role === 'system' ? 'chat-msg-system' : 'chat-msg-user')) + (t.error ? ' chat-msg-error' : '');
     const isAssistant = t.role === 'assistant' && !t.error; // error notices stay literal text, not markdown (underscores in env var names get eaten)
     let body;
     if (t.timestamp) {
@@ -208,6 +210,10 @@ class ChatPane {
     </div>
     <div class="chat-context-log-content"></div>
   </div>
+  <div class="chat-project-row" hidden>
+    <span class="chat-project-label"></span>
+    <select class="chat-project-select" aria-label="Project this chat acts on"></select>
+  </div>
   <div class="chat-body">
     <div class="chat-transcript-host"></div>
     <textarea class="chat-input" rows="3" placeholder="Talk to the chat... (Enter to send, Shift+Enter for a new line)"></textarea>
@@ -231,6 +237,14 @@ class ChatPane {
     this.logPanel = q('.chat-context-log-panel');
     this.logContent = q('.chat-context-log-content');
     this.logClose = q('.chat-context-log-close');
+    // 2026-10-25 (walkthrough): the "Acting on: <project>" selector (see renderProjectRow).
+    this.projectRow = q('.chat-project-row');
+    this.projectLabelEl = q('.chat-project-label');
+    this.projectSelect = q('.chat-project-select');
+    this.projectOptions = [];
+    this.projectActiveLabel = null;
+    this.projectSelect.addEventListener('change', () => this.changeProject(this.projectSelect.value));
+    this.loadProjects();
     this.transcriptEl = q('.chat-transcript-host');
     this.input = q('.chat-input');
     this.sendBtn = q('.chat-send-btn');
@@ -674,11 +688,67 @@ class ChatPane {
     this.render();
   }
 
+  // 2026-10-25 (walkthrough): "Acting on: <label> (active|chosen)" under the chat title.
+  // A new chat used to open with no indication of its target project, so the dashboard's
+  // active project could silently become the wrong task queue. Options come from
+  // GET api/chat/projects (the same registry the core list_projects tool reads);
+  // changing one PATCHes api/chat/<id>/project and appends a one-line system note
+  // to the transcript (rendered as a "System" row by chatRenderTranscript).
+  async loadProjects() {
+    try {
+      const data = await fetchJson('api/chat/projects');
+      this.projectOptions = Array.isArray(data && data.projects) ? data.projects : [];
+      this.projectActiveLabel = data && data.active;
+    } catch (e) {
+      this.projectOptions = [];
+      this.projectActiveLabel = null;
+    }
+    this.renderProjectRow();
+  }
+
+  renderProjectRow() {
+    const opts = this.projectOptions || [];
+    if (!opts.length) { this.projectRow.hidden = true; return; }
+    this.projectRow.hidden = false;
+    const chosen = this.session && this.session.chosen_project;
+    const current = chosen || this.projectActiveLabel || opts[0].label;
+    this.projectSelect.innerHTML = opts.map(o =>
+      `<option value="${escapeHtml(o.label)}"${o.label === current ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+    ).join('');
+    this.projectLabelEl.textContent = `Acting on: ${current}${chosen ? ' (chosen)' : ' (active)'}`;
+  }
+
+  async changeProject(label) {
+    if (!label || !this.session || !this.session.id) return;
+    if (label === this.session.chosen_project) { this.renderProjectRow(); return; }
+    if (this.isSending) {
+      showToast('Wait for the current reply to finish before changing project.', 'info');
+      this.renderProjectRow();
+      return;
+    }
+    try {
+      const resp = await fetch(`api/chat/${encodeURIComponent(this.session.id)}/project`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project: label }),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error((body && body.error) || `HTTP ${resp.status}`);
+      if (this.session) this.session.chosen_project = body.chosen_project || label;
+      this.renderProjectRow();
+      showToast(`Now acting on: ${label}`, 'info');
+    } catch (e) {
+      this.renderProjectRow();
+      showToast('Could not change project: ' + e.message);
+    }
+  }
+
   render() {
     const session = this.session;
     this.syncSwapHeader();
     // A loaded session has no `title` (only the sessions list does), so the host page hands the real title in through setTitle(); it counts only while this pane still shows that chat.
     this.titleEl.textContent = this.titleText && this.titleFor === this.sessionId ? this.titleText : (session ? fullTitle(session.title) : '');
+    this.renderProjectRow();
     if (session && session.provider && this.providerChoice !== session.provider) {
       this.providerChoice = session.provider;
       this.syncProviderToggle();

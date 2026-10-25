@@ -1,7 +1,9 @@
 from flask import Blueprint, Response, abort, jsonify, request, session, stream_with_context
 
 import json
+import os
 import sys
+from pathlib import Path
 
 import requests
 import logging
@@ -25,6 +27,102 @@ import agent_hosts
 # instances//queue/ or holds any GPU lock of its own.
 
 chat_bp = Blueprint("chat-bp", __name__)
+
+
+def _project_options():
+    """2026-10-25 (walkthrough): the project list for the chat panel's "Acting on:"
+    selector -- the SAME registry the core dashboard's list_projects tool reads
+    (CORE_REPO_ROOT/projects.json: one {label, root} entry per project). The active
+    one is the registry's own `active` field, falling back to the AGENT_MANAGER_REPO_ROOT
+    setting (same precedence as app.py's _active_project_setting). Fail-open: if the
+    registry cannot be read at all (core checkout moved, malformed file), fall back to
+    the basename of each chat root so the selector always has real options and a
+    Chat turn is never blocked on a cosmetic setting. Never raises.
+    Returns [{'label': str, 'root': str|None, 'active': bool}]."""
+    from app import CORE_REPO_ROOT, _active_project_setting, _chat_roots
+    active_root = None
+    try:
+        ar = _active_project_setting("AGENT_MANAGER_REPO_ROOT")
+        if ar:
+            active_root = os.path.realpath(str(ar))
+    except Exception:
+        active_root = None
+
+    registry = None
+    try:
+        registry = json.loads((Path(CORE_REPO_ROOT) / "projects.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        registry = None
+
+    entries, active_label = None, None
+    if isinstance(registry, list):
+        entries = registry
+    elif isinstance(registry, dict):
+        entries = registry.get("projects") if isinstance(registry.get("projects"), list) else None
+        active_label = registry.get("active") or registry.get("activeProject")
+
+    options = []
+    if isinstance(entries, list):
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            root = e.get("root") or e.get("repo") or e.get("path")
+            label = e.get("label") or (str(root).rstrip("/").rsplit("/", 1)[-1] if root else None)
+            if not label:
+                continue
+            active = label == active_label or (
+                active_root is not None and root is not None
+                and os.path.realpath(str(root)) == active_root)
+            options.append({"label": label, "root": root, "active": bool(active)})
+    if options:
+        return options
+    # Fail-open fallback: one option per chat root (basename as its label).
+    try:
+        roots = _chat_roots() or []
+    except Exception:
+        roots = []
+    for r in roots:
+        options.append({
+            "label": str(r).rstrip("/").rsplit("/", 1)[-1] or str(r),
+            "root": r,
+            "active": active_root is not None and os.path.realpath(str(r)) == active_root,
+        })
+    return options or [{"label": "agent-manager", "root": None, "active": True}]
+
+
+@chat_bp.route("/api/chat/projects", methods=["GET"])
+def api_chat_projects():
+    """The "Acting on:" selector's options (2026-10-25 walkthrough): the same
+    project registry the core dashboard's list_projects tool reads, tagged with
+    which one the dashboard currently has active. See _project_options()."""
+    options = _project_options()
+    active = next((o["label"] for o in options if o["active"]), None)
+    return jsonify({"projects": options, "active": active})
+
+
+@chat_bp.route("/api/chat/<session_id>/project", methods=["PATCH"])
+def api_chat_set_project(session_id):
+    """2026-10-25 (walkthrough): change which project this chat acts on BEFORE the
+    first message (or between turns). Body: {"project": "<label>"}. The label must be
+    one of _project_options() (same registry list_projects reads). Persists
+    chosen_project on the session, appends a one-line system note to the transcript,
+    and returns the updated session. 400 on a missing/unknown label, 404 on an
+    unknown or ended session. The chosen project becomes the default `project` for
+    the task tools on every subsequent turn (chat_sessions._local_system_prompt);
+    an explicit `project` tool argument still wins."""
+    from app import CHAT_STORAGE_DIR
+    from chat_sessions import set_chosen_project
+    data = request.get_json(silent=True) or {}
+    label = data.get("project")
+    if not label or not isinstance(label, str):
+        return jsonify({"ok": False, "error": "Missing or invalid 'project' (expected a non-empty string label)"}), 400
+    valid = [o["label"] for o in _project_options()]
+    if label not in valid:
+        return jsonify({"ok": False, "error": f"Unknown project '{label}'. Valid: {valid}"}), 400
+    updated = set_chosen_project(CHAT_STORAGE_DIR, session_id, label)
+    if updated is None:
+        return jsonify({"ok": False, "error": "Session not found or no longer active"}), 404
+    return jsonify({"ok": True, "chosen_project": label, "session": updated})
 
 @chat_bp.route("/api/chat/active", methods=["GET"])
 def api_chat_active():
