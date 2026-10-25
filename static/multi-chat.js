@@ -622,6 +622,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           const slot = i === -1 ? state.panes.length : i;
           state.panes[slot] = pane.session.id;
           saveLayout(state);
+          activeId = pane.session.id; // the new chat's button is the highlighted one
+          renderTabs();
           refreshSwitcher();
         }
       }).catch((e) => {
@@ -808,6 +810,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       const idx = state.panes.indexOf(null);
       if (idx === -1) state.panes.push(null);
       pendingNewAt = idx === -1 ? state.panes.length - 1 : idx;
+      stripIndex = pendingNewAt; // the strip scrolls to the new chat (clamped to the last position that fits)
       render();
     }
 
