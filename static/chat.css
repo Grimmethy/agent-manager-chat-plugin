@@ -190,6 +190,7 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
   .chat-header button,
   .chat-send-row button,
   .chat-switcher-new,
+  .multi-chat-strip-btn,
   .chat-chime-setting { min-height: 44px; min-width: 44px; }
   .chat-chime-setting input { width: 20px; height: 20px; }
 }
@@ -223,3 +224,8 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 }
 .multi-chat-pane.wide, .multi-chat-placeholder.wide { flex-basis: 100%; }
 
+/* Pane strip navigation (toolbar): previous / next buttons around an 'n / m' label; hidden by the script when there is nothing to move to. */
+.multi-chat-strip-nav { display: inline-flex; align-items: center; gap: 6px; }
+.multi-chat-strip-nav[hidden] { display: none; }
+.multi-chat-strip-label { min-width: 4.5em; text-align: center; font-size: 12px; color: var(--muted); }
+.multi-chat-strip-btn:disabled { opacity: .4; cursor: default; }

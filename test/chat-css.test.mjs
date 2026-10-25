@@ -122,3 +122,12 @@ test('.multi-chat-pane snaps to the start of the strip', () => {
   const block = blocksFor('.multi-chat-pane').join(' ');
   assert.match(block, /scroll-snap-align\s*:\s*start/i, 'scroll-snap-align must be start');
 });
+
+test('the strip navigation: a hidden-aware inline row and 44px touch buttons', () => {
+  const nav = blocksFor('.multi-chat-strip-nav').join(' ');
+  assert.match(nav, /display\s*:\s*inline-flex/i);
+  assert.ok(blocksFor('.multi-chat-strip-nav[hidden]').join(' ').match(/display\s*:\s*none/i), 'the hidden attribute must hide it');
+  const coarse = mediaBlocksFor('(pointer: coarse)', '.multi-chat-strip-btn').join(' ');
+  assert.match(coarse, /min-width\s*:\s*44px/);
+  assert.match(coarse, /min-height\s*:\s*44px/);
+});
