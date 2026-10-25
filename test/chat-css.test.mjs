@@ -211,13 +211,24 @@ test('the top bar: open chats are a scrollable row of buttons with a highlighted
   }
 });
 
-test('the All chats list anchors under its own button (position: relative), right-aligned, instead of opening below the window', () => {
-  assert.match(blocksFor('.multi-chat-switcher').join(' '), /position:\s*relative/);
+test('the All chats list is anchored to the whole bar (not its mid-bar button) and kept inside it, so it never leaves a narrow frame', () => {
+  assert.match(blocksFor('.multi-chat-toolbar').join(' '), /position:\s*relative/);
+  assert.match(blocksFor('.multi-chat-switcher').join(' '), /position:\s*static/);
   const menu = blocksFor('.multi-chat-switcher .chat-switcher-menu').join(' ');
-  assert.match(menu, /right:\s*0/);
+  assert.match(menu, /right:\s*8px/);
   assert.match(menu, /left:\s*auto/);
+  assert.match(menu, /max-width:\s*calc\(100% - 16px\)/);
 });
 
 test('on a phone the open-chat buttons take a row of their own above the other controls', () => {
   assert.match(css, /@media \(max-width: 759px\)\s*\{\s*\.multi-chat-tabs\s*\{[^}]*flex:\s*1 0 100%[^}]*order:\s*-1/);
+});
+
+test('a pane under 480px wide (the dashboard sidebar) drops the repeated provider label and tightens its header so the close button still fits', () => {
+  assert.match(blocksFor('.multi-chat-pane').join(' '), /container-type:\s*inline-size/);
+  const m = css.match(/@container\s*\(\s*max-width\s*:\s*480px\s*\)\s*\{([\s\S]*?)\n\}/);
+  assert.ok(m, 'no @container (max-width: 480px) rule');
+  assert.match(m[1], /\.chat-header \.chat-provider-label\s*\{\s*display:\s*none/);
+  assert.match(m[1], /\.chat-header\s*\{[^}]*gap:\s*4px/);
+  assert.match(m[1], /\.chat-header button, \.multi-chat-close\s*\{[^}]*padding:\s*0 8px/);
 });

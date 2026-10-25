@@ -36,3 +36,10 @@ test('+ new chat renders the whole strip (so every open chat stays mounted) with
   assert.doesNotMatch(fn, /Open chat/, 'openNewChat no longer builds "Open chat…" placeholders for the other panes');
   assert.match(multiJs, /id === null && i === pendingNewAt/);
 });
+
+test('+ new chat moves the strip to the new chat and highlights its button', () => {
+  const fn = multiJs.slice(multiJs.indexOf('function openNewChat()'), multiJs.indexOf('// Re-render only when crossing'));
+  assert.ok(fn.indexOf('stripIndex = pendingNewAt') !== -1, 'openNewChat sets stripIndex from pendingNewAt');
+  assert.ok(fn.indexOf('stripIndex = pendingNewAt') < fn.indexOf('render();'), 'stripIndex is set before render()');
+  assert.match(multiJs, /activeId = pane\.session\.id;[^\n]*\n\s*renderTabs\(\);/);
+});

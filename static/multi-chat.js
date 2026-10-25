@@ -378,6 +378,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function renderTabs() {
       const titles = {};
       if (switcher && Array.isArray(switcher.rows)) for (const r of switcher.rows) if (r && typeof r.id === 'string') titles[r.id] = r.title;
+      for (const p of livePanes) if (p.sessionId && typeof titles[p.sessionId] === 'string') p.setTitle(titles[p.sessionId]); // pane headers carry the same real title as the buttons
       tabsBox.innerHTML = '';
       for (const tab of chatTabs(state, titles, activeId)) {
         const btn = document.createElement('button');
@@ -621,6 +622,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           const slot = i === -1 ? state.panes.length : i;
           state.panes[slot] = pane.session.id;
           saveLayout(state);
+          activeId = pane.session.id; // the new chat's button is the highlighted one
+          renderTabs();
           refreshSwitcher();
         }
       }).catch((e) => {
@@ -807,6 +810,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       const idx = state.panes.indexOf(null);
       if (idx === -1) state.panes.push(null);
       pendingNewAt = idx === -1 ? state.panes.length - 1 : idx;
+      stripIndex = pendingNewAt; // the strip scrolls to the new chat (clamped to the last position that fits)
       render();
     }
 
