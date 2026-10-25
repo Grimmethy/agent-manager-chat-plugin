@@ -1784,3 +1784,21 @@ Introduce a small private helper, e.g. `_get_auth_headers(host)`, that encapsula
 
 Benefits:
 A single code path owns the auth-header contract, so adding a new header, swapping the token source, or changing the failure mode is a one-line change in the helper rather than a multi-site edit. It also makes the intent of each public method clearer, since the auth boilerplate is extracted, and reduces the chance that one call site drifts out of sync with another during refactoring.
+
+### AC-133 · ~~Inconsistent error-handling contract for the local-provider path~~ — **Retracted**
+Strength: N/A (misdiagnosis)
+Files: app.py, local_tool_client.py, internal_api_client.py
+
+**Correction:** The original draft claimed that because `stream_local_turn` is a generator, an exception raised inside it during iteration would be "yielded" as a dictionary and therefore never caught by `_call_chat`'s `except LocalToolClientError` block. This is incorrect. In Python, when a generator function raises an exception during iteration (i.e., the caller is inside a `for` loop or `yield from` over the generator), that exception propagates up the call stack to the enclosing `try`/`except`. Since `LocalToolClientError` is an alias for `InternalApiError`, and `stream_local_turn` raises `InternalApiError` on `requests.RequestException`, the exception is correctly caught by `_call_chat` and the unified 502 Bad Gateway response is returned as designed. No code change is warranted; the existing error-handling contract is already consistent across both provider paths.
+
+---
+
+### AC-134 · ~~Duplicated and inconsistent root-resolution logic~~ — **Retracted**
+Strength: N/A (mischaracterization)
+Files: app.py, internal_api_client.py
+
+**Correction:** The original draft treated `_chat_roots` / `_with_extra_roots` in `app.py` and the `primary_root` / `extra_roots` parameters of `stream_local_turn` as redundant duplicates of the same concern. They are not. The client-side helpers in `app.py` perform **local validation and filtering** (e.g., skipping entries that are not existing directories, as documented in `_with_extra_roots`'s docstring) to determine which roots the plugin itself can operate on. The `primary_root` / `extra_roots` parameters passed to `stream_local_turn` provide **server-side context** to the core dashboard for its own processing. These are two distinct responsibilities—local capability checking versus server-side context—and removing the client-side logic would break the plugin's local root validation. No code change is warranted.
+
+---
+
+**Summary:** Both items in the original draft were retracted. AC-001 was based on a misunderstanding of Python generator exception propagation (exceptions raised during iteration propagate to the caller's `except` clause, they are not silently converted to yielded values). AC-002 conflated two legitimately distinct mechanisms (local validation vs. server-side context) and proposed a removal that would break existing functionality. No defects were identified in the reviewed code.
