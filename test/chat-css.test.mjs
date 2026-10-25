@@ -156,3 +156,28 @@ test('under 760px only the layout presets and the templates menu are hidden; the
   assert.deepEqual(hide[1].split(',').map((x) => x.trim()).sort(), ['.multi-chat-preset-btn', '.multi-chat-templates']);
   assert.equal(blocksFor('.multi-chat-toolbar').some((b) => /display:\s*none/.test(b)), false);
 });
+
+test('a pane header is one non-wrapping line with the title on the left and compact buttons, and the empty switcher slot takes no room', () => {
+  const header = blocksFor('.chat-header').join(' ');
+  assert.match(header, /flex-wrap:\s*nowrap/);
+  assert.match(header, /overflow-x:\s*auto/, 'a very narrow pane scrolls its header instead of wrapping to a second row');
+  const title = blocksFor('.chat-pane-title').join(' ');
+  assert.match(title, /flex:\s*1 1 0/);
+  assert.match(title, /text-overflow:\s*ellipsis/);
+  assert.match(title, /white-space:\s*nowrap/);
+  assert.match(blocksFor('.chat-switcher-slot:empty').join(' '), /display:\s*none/);
+  assert.match(blocksFor('.chat-switcher-slot:not(:empty) ~ .chat-pane-title').join(' '), /display:\s*none/);
+  const buttons = blocksFor('.chat-header button').join(' ');
+  assert.match(buttons, /height:\s*30px/);
+  assert.ok(blocksFor('.multi-chat-close').length > 0, 'the close button shares the header button size');
+  assert.ok(mediaBlocksFor('(pointer: coarse)', '.multi-chat-close').join(' ').match(/min-height:\s*44px/), 'close keeps a 44px touch target');
+});
+
+test('the strip fills the host and a pane body is a column, so the transcript gets the height the old two header rows wasted', () => {
+  const strip = blocksFor('.multi-chat-flex').join(' ');
+  assert.match(strip, /flex:\s*1 1 0/);
+  assert.match(strip, /min-height:\s*0/);
+  const body = blocksFor('.multi-chat-pane-body').join(' ');
+  assert.match(body, /display:\s*flex/);
+  assert.match(body, /flex-direction:\s*column/);
+});

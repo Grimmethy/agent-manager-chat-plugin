@@ -323,7 +323,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // The strip layout (`.multi-chat-flex` / `.multi-chat-pane` / `.wide` sizing, scroll-snap)
       // lives in static/chat.css: one horizontal row, --strip-visible panes per screen.
       '.multi-chat-host { flex:1; min-height:0; overflow:hidden; position:relative; display:flex; flex-direction:column; }' +
-      '.multi-chat-pane-head { display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:4px 8px 0; }' +
       '.multi-chat-pane-body { flex:1; min-height:0; overflow-y:auto; }' +
       '.multi-chat-placeholder { border:2px dashed var(--border,#ccc); border-radius:8px; align-items:center; justify-content:center; background:transparent; }';
     document.head.appendChild(style);
@@ -561,19 +560,19 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function paneSlot(wide, open) {
       const slot = document.createElement('div');
       slot.className = (wide ? 'multi-chat-pane wide' : 'multi-chat-pane') + ' multi-chat-pane-slot';
-      const head = document.createElement('div');
-      head.className = 'multi-chat-pane-head';
       const close = document.createElement('button');
       close.type = 'button';
       close.className = 'secondary multi-chat-close';
       close.textContent = '×';
       close.title = 'Close this pane (the chat stays open on the server)';
       close.onclick = () => closeSlot(open.id);
-      head.appendChild(close);
       const body = document.createElement('div');
       body.className = 'multi-chat-pane-body';
       body.append(open.nodes);
-      slot.appendChild(head);
+      // One header line per pane: the close button is the last button of the pane's own .chat-header (title left, buttons right).
+      const header = body.querySelector('.chat-header');
+      if (header) header.appendChild(close);
+      else body.prepend(close);
       slot.appendChild(body);
       body.addEventListener('focusin', () => { activeId = open.id; });
       return slot;
