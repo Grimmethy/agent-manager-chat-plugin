@@ -1451,3 +1451,29 @@ Refactor `chat_sessions.py` to import and call `handoff._is_plain_row` (or a thi
 
 Benefits:
 The "plain row" rule now exists in exactly one place, eliminating the risk of silent logic drift between handoff calculation and local message building. Future changes to transcript row types (e.g., introducing "tool" or "system" rows) require a single edit in `handoff.py` and propagate automatically to `chat_sessions.py`. The pure-logic module retains full ownership of the domain rule, while the I/O-heavy session module simply consumes it, improving locality of behavior and reducing the cognitive load on developers touching either file.
+
+### AC-108 · Inconsistent error-handling contract between streaming and non-streaming paths in internal_api_client
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+The module exposes both non-streaming helpers (`get_roots`, `preempt`, `reserve`) and a streaming helper (`stream_local_turn`). The non-streaming functions follow a uniform contract: they catch `requests.RequestException` and re-raise a domain-specific `InternalApiError`, so callers need only one `except` clause to detect failure. `stream_local_turn`, however, catches the same exception class and instead yields a dictionary `{"type": "error", ...}` into the iterator. A caller that has already written `try/except InternalApiError` around the non-streaming calls must now also inspect every yielded item for an error payload when consuming the stream, effectively forcing two different failure-detection strategies inside the same module. This splits the module's public error contract in two and makes it easy for a new caller to handle one path correctly and miss the other.
+
+Solution:
+Unify the contract by having `stream_local_turn` raise `InternalApiError` (or a dedicated `InternalApiStreamError` subclass) on transport-level failures before the generator begins yielding, rather than encoding the failure as a data item. If the failure can only be detected mid-stream (e.g., the connection drops after the first chunk), the generator should raise the exception at that point rather than yielding an error dict. Callers that need to distinguish "stream ended normally" from "stream failed" can then rely on a single exception type, and the `{"type": "error"}` payload convention can be reserved for application-level errors that are part of the protocol rather than transport failures.
+
+Benefits:
+Callers need only one `except` clause regardless of whether they invoke a non-streaming or streaming helper, reducing the chance of a silently swallowed transport error. New contributors can rely on a single, documented error contract for the entire module. It also makes it straightforward to add cross-cutting concerns—retry logic, structured logging, metrics—around a single exception type instead of branching on payload shape.
+
+### AC-109 · Scattered environment-variable resolution for core-repo configuration
+Strength: Worth exploring
+Files: app.py, internal_api_client.py
+
+Problem:
+`app.py` resolves `CORE_REPO_ROOT` by reading `AGENT_MANAGER_CORE_REPO_ROOT` from `os.environ`, while `internal_api_client.py` independently resolves `CORE_DASHBOARD_URL` by reading `AGENT_MANAGER_CORE_DASHBOARD_URL` from `os.environ`. Each file performs its own lookup, defaulting, and (potentially) validation at import time. There is no single place where the set of `AGENT_MANAGER_CORE_*` variables is documented, validated, or given consistent defaulting behaviour. Adding a new cross-cutting concern—such as a startup warning when a variable is unset, a shared default-derivation rule (e.g., dashboard URL derived from repo root), or a test-override mechanism—requires touching every file that reads the environment, and it is easy to miss one.
+
+Solution:
+Introduce a small configuration module (e.g., `config.py` or a `settings` dataclass) that reads all `AGENT_MANAGER_CORE_*` variables once at import time, applies defaults and validation in one place, and exposes the resolved values as module-level constants or a frozen dataclass. Both `app.py` and `internal_api_client.py` would then import the resolved values from that single module rather than calling `os.environ` themselves.
+
+Benefits:
+Configuration resolution, validation, and defaulting live in one auditable location, making it trivial to add logging, a `--dry-run` check, or a test fixture that monkey-patches a single object. New environment variables can be added in one file without hunting for every `os.environ` call site. It also makes the set of required/optional variables self-documenting, reducing onboarding friction and the risk of a typo in a variable name going unnoticed until runtime.
