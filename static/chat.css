@@ -212,8 +212,11 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
   scroll-snap-type: x mandatory;
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
   box-sizing: border-box;
 }
+/* The prev/next buttons, the arrow keys and touch swipe move the strip; no drag bar. */
+.multi-chat-flex::-webkit-scrollbar { display: none; }
 @media (max-width: 759px) { .multi-chat-flex { --strip-visible: 1; } }
 @media (max-width: 759px) { .multi-chat-preset-btn, .multi-chat-templates { display: none; } }
 @media (min-width: 1400px) { .multi-chat-flex { --strip-visible: 3; } }
