@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyPreset, closePane, serialize, deserialize, firstOpenPane, layoutForWidth,
+  stripVisibleCount, clampStripIndex, stepStrip, stripLabel, stripButtons,
   DEFAULT_TEMPLATES, saveTemplate, applyTemplate, serializeTemplates, deserializeTemplates,
 } from '../static/multi-chat.js';
 
@@ -220,4 +221,54 @@ test('deserializeTemplates drops entries with a bad preset or a bad count', () =
     badCount: { preset: '1', count: 'x' }, negative: { preset: '1', count: -1 }, nul: null,
   });
   assert.deepEqual(deserializeTemplates(json), { ok: { preset: '2col', count: 2 } });
+});
+
+test('stripVisibleCount: 1 on a phone, 2 on a tablet or small laptop, 3 on a wide screen, boundaries at 760 and 1400', () => {
+  assert.equal(stripVisibleCount(375), 1);
+  assert.equal(stripVisibleCount(759), 1);
+  assert.equal(stripVisibleCount(760), 2);
+  assert.equal(stripVisibleCount(1399), 2);
+  assert.equal(stripVisibleCount(1400), 3);
+  assert.equal(stripVisibleCount(3000), 3);
+  for (const bad of [undefined, null, NaN, 'wide', {}]) assert.equal(stripVisibleCount(bad), 1);
+});
+
+test('clampStripIndex: stays inside 0..(paneCount - visibleCount); non-numbers and a short strip give 0', () => {
+  assert.equal(clampStripIndex(2, 5, 2), 2);
+  assert.equal(clampStripIndex(9, 5, 2), 3);
+  assert.equal(clampStripIndex(-4, 5, 2), 0);
+  assert.equal(clampStripIndex(1.9, 5, 2), 1);
+  for (const bad of [undefined, null, NaN, '2', {}]) assert.equal(clampStripIndex(bad, 5, 2), 0);
+  assert.equal(clampStripIndex(3, 1, 2), 0, 'fewer panes than fit');
+  assert.equal(clampStripIndex(3, 0, 1), 0, 'no panes');
+  assert.equal(clampStripIndex(1, 'x', 2), 0, 'bad pane count');
+});
+
+test('stepStrip: moves by delta and stops at both ends', () => {
+  assert.equal(stepStrip(0, 1, 4, 1), 1);
+  assert.equal(stepStrip(3, 1, 4, 1), 3, 'last stays last');
+  assert.equal(stepStrip(0, -1, 4, 1), 0, 'first stays first');
+  assert.equal(stepStrip(1, 1, 4, 2), 2);
+  assert.equal(stepStrip(2, 1, 4, 2), 2, 'two visible: the last index is paneCount - 2');
+  assert.equal(stepStrip(1, 'x', 4, 1), 1, 'a bad delta does not move');
+  assert.equal(stepStrip(99, -1, 4, 1), 2, 'an out-of-range index is clamped before stepping');
+});
+
+test('stripLabel: n / m for one visible pane, a range for several, empty with no panes', () => {
+  assert.equal(stripLabel(0, 0, 1), '');
+  assert.equal(stripLabel(0, 1, 1), '1 / 1');
+  assert.equal(stripLabel(2, 4, 1), '3 / 4');
+  assert.equal(stripLabel(0, 4, 2), '1-2 / 4');
+  assert.equal(stripLabel(2, 4, 2), '3-4 / 4');
+  assert.equal(stripLabel(0, 3, 3), '1-3 / 3');
+  assert.equal(stripLabel(0, 1, 3), '1 / 1', 'one pane on a three-wide screen is not a range');
+  assert.equal(stripLabel(9, 4, 2), '3-4 / 4', 'index is clamped');
+});
+
+test('stripButtons: canPrev and canNext at the first, middle and last position', () => {
+  assert.deepEqual(stripButtons(0, 4, 1), { canPrev: false, canNext: true });
+  assert.deepEqual(stripButtons(1, 4, 1), { canPrev: true, canNext: true });
+  assert.deepEqual(stripButtons(3, 4, 1), { canPrev: true, canNext: false });
+  assert.deepEqual(stripButtons(0, 2, 2), { canPrev: false, canNext: false }, 'everything fits');
+  assert.deepEqual(stripButtons(0, 0, 1), { canPrev: false, canNext: false });
 });

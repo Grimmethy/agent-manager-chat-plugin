@@ -114,6 +114,46 @@ export function layoutForWidth(state, activeId, width, breakpoint = 760) {
   return { preset: '1', panes: keep === undefined ? [] : [keep] };
 }
 
+// Horizontal pane strip (owner request 2026-10-24: panes side by side in one row with previous/next buttons, swipe on touch). Pure helpers, no DOM.
+// How many panes fit side by side: one below 760px (a phone), two up to 1399px, three from 1400px. A width that is not a number counts as a phone.
+export function stripVisibleCount(width) {
+  const w = Number(width);
+  if (!(w >= 760)) return 1;
+  return w < 1400 ? 2 : 3;
+}
+
+// The first visible pane's index, kept inside [0, max(0, paneCount - visibleCount)]; anything that is not a finite number gives 0.
+function lastStripIndex(paneCount, visibleCount) {
+  const count = Number.isFinite(Number(paneCount)) ? Math.max(0, Math.trunc(Number(paneCount))) : 0;
+  const visible = Number.isFinite(Number(visibleCount)) ? Math.max(1, Math.trunc(Number(visibleCount))) : 1;
+  return Math.max(0, count - visible);
+}
+
+export function clampStripIndex(index, paneCount, visibleCount) {
+  const i = typeof index === 'number' && Number.isFinite(index) ? Math.trunc(index) : 0;
+  return Math.min(lastStripIndex(paneCount, visibleCount), Math.max(0, i));
+}
+
+export function stepStrip(index, delta, paneCount, visibleCount) {
+  const from = clampStripIndex(index, paneCount, visibleCount);
+  const d = typeof delta === 'number' && Number.isFinite(delta) ? Math.trunc(delta) : 0;
+  return clampStripIndex(from + d, paneCount, visibleCount);
+}
+
+// '2 / 4' for the first visible pane, or '1-2 / 4' when two or more panes are on screen; '' when there is no pane.
+export function stripLabel(index, paneCount, visibleCount) {
+  const count = Number.isFinite(Number(paneCount)) ? Math.max(0, Math.trunc(Number(paneCount))) : 0;
+  if (count === 0) return '';
+  const first = clampStripIndex(index, count, visibleCount) + 1;
+  const last = Math.min(count, first - 1 + Math.max(1, Math.trunc(Number(visibleCount)) || 1));
+  return last > first ? `${first}-${last} / ${count}` : `${first} / ${count}`;
+}
+
+export function stripButtons(index, paneCount, visibleCount) {
+  const i = clampStripIndex(index, paneCount, visibleCount);
+  return { canPrev: i > 0, canNext: i < lastStripIndex(paneCount, visibleCount) };
+}
+
 // Layout templates (HUB0010 6/10): named {preset, count} recipes. Plain data in, plain data
 // out; nothing here touches storage or the DOM, and no input is ever mutated.
 function slotsFor(preset) {
