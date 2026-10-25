@@ -1318,3 +1318,16 @@ Introduce a single `filterByFields(rows, query, fields)` helper inside `sessions
 
 Benefits:
 The matching algorithm lives in exactly one place, so any correctness fix or enhancement (Unicode normalization, fuzzy matching, etc.) is applied uniformly to both panels. Adding a new filterable field to either panel is a one-element change to the field list rather than a copy-paste of the entire loop. The two public functions become thin, readable one-liners that make the intent obvious.
+
+### AC-100 · Duplicated and Divergent Provider Labeling Logic
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both files export a function named `providerLabel`, but they implement different logic and return different string formats for the same underlying data concepts (provider, model, account). `sessions-view.js` returns `"Claude · <model>"` or `"Local · <model>"` and does not handle accounts, while `swap-view.js` returns `"Claude · <model> · <account>"` or `"Local · <model>"` and explicitly handles the `account` field, distinguishing between `null` (live account) and specific labels. This creates a tight coupling to specific string formats in the UI layer: if the display format needs to change (adding a status indicator, changing the separator, standardizing how "Local" vs "Claude" is presented), a developer must find and update both functions. The core provider-detection logic (`provider === 'claude'`, `provider === 'local'`) is duplicated, violating DRY and creating a risk of divergence where one file adds a new provider type or adjusts its format and the other does not, leading to inconsistent UI labels for the same session depending on which view is active.
+
+Solution:
+Extract the provider/model/account labeling logic into a shared utility module (e.g., `static/labels.js` or `static/format.js`) that exports a single `formatProviderLabel(session)` function handling all provider types, model presence, and account details. Both `sessions-view.js` and `swap-view.js` should import and use this shared function. If `sessions-view.js` specifically needs a shorter label without the account segment, it can pass a configuration flag (e.g., `{ includeAccount: false }`) or call a separate `formatShortProviderLabel` exported from the same shared module, ensuring the core provider detection and base string construction remain centralized in one place.
+
+Benefits:
+Provider labeling logic lives in a single source of truth, making it easier to maintain and audit. The same session is labeled consistently across different views (session switcher vs. swap menu), eliminating the risk of one view showing a stale or divergent format. UI components depend on a shared formatting utility rather than duplicating business logic about how to interpret provider/model/account data, and adding new providers or changing label formats requires updating only one module.
