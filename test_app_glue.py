@@ -233,5 +233,35 @@ class TestDiscussProviderArgs(unittest.TestCase):
             self.assertEqual((provider, model, effort), ("claude", "sonnet", "low"))
 
 
+class TestStateDirChmodIsBestEffort(unittest.TestCase):
+    """app.py chmods the session dir at import time; when that raises (a dir owned by another
+    user) the plugin must still import, and must say so on stderr."""
+
+    def _import_app_with_failing_chmod(self):
+        import subprocess
+        state = tempfile.mkdtemp()
+        code = ("import os\n"
+                "def boom(*a, **k):\n"
+                "    raise PermissionError(1, 'Operation not permitted')\n"
+                "os.chmod = boom\n"
+                "import app\n"
+                "print('imported', app.CHAT_STORAGE_DIR)\n")
+        env = dict(os.environ, AGENT_MANAGER_CHAT_STORAGE_DIR=state)
+        r = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).parent),
+                           env=env, capture_output=True, text=True, timeout=60)
+        return state, r
+
+    def test_a_failing_chmod_does_not_stop_the_import(self):
+        state, r = self._import_app_with_failing_chmod()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("imported", r.stdout)
+
+    def test_a_failing_chmod_is_logged_with_the_path_and_the_error(self):
+        state, r = self._import_app_with_failing_chmod()
+        self.assertIn("could not chmod", r.stderr)
+        self.assertIn(os.path.realpath(state), r.stderr)
+        self.assertIn("Operation not permitted", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
