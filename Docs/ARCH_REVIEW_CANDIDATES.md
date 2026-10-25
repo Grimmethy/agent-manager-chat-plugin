@@ -1719,3 +1719,42 @@ Factor the fake-registry construction into a single shared test helper (e.g. a `
 
 Benefits:
 A registry-schema change requires editing one helper instead of two test files. New tests that need a fake registry can reuse the same helper, reducing the chance of a subtly wrong shape being introduced. The test suite becomes easier to maintain as the account model evolves.
+
+### AC-128 · Centralize stream-abort signaling in the SSE client
+Strength: Strong
+Files: internal_api_client.py, local_tool_client.py, routes/chat.py
+
+Problem:
+`stream_local_turn` in `internal_api_client.py` reports every failure—whether a definitive server rejection (401/403) or a mid-stream connection drop—by yielding a plain dictionary `{"type": "error", "error": ...}` into the same iterator that carries valid data chunks. The `local_tool_client.py` shim passes this mixed stream through with `yield from`, so the ultimate consumer in `routes/chat.py` must inspect every yielded item for a `type` field to distinguish data from error. This makes the failure mode implicit in the data stream rather than explicit in the control flow: a caller that forgets to check for the error dict will silently treat it as a content chunk, and there is no single `except` clause where the abort can be handled uniformly. The contract is fragile because it depends on every downstream consumer remembering to filter, and it conflates non-retryable rejections with transient network failures under one undifferentiated signal.
+
+Solution:
+Introduce a dedicated `StreamAbortedError` exception in `internal_api_client.py` that carries the same error payload (status code, message, retryability flag). When `r.raise_for_status()` fires or a `ConnectionError` is caught inside the `iter_lines()` loop, raise `StreamAbortedError` instead of yielding an error dict. Update `local_tool_client.py` to let the exception propagate (or re-raise it under its own name if a shim-level alias is desired), and update `routes/chat.py` to wrap the `for` loop in a `try/except StreamAbortedError` block. This converts the implicit data-stream contract into an explicit control-flow signal that the Python type system and exception-handling idioms already support.
+
+Benefits:
+Callers get a single, catchable point of failure instead of having to inspect every yielded item; the distinction between a definitive rejection and a transient drop becomes a field on the exception rather than something the caller must infer from the error message string; and the `yield from` pass-through in `local_tool_client.py` no longer needs to be "error-aware," reducing the surface area of the implicit contract.
+
+### AC-129 · Make the error-type dependency in app.py explicit
+Strength: Worth exploring
+Files: local_tool_client.py, internal_api_client.py, app.py, claude_client.py
+
+Problem:
+`local_tool_client.py` re-exports `InternalApiError` under the alias `LocalToolClientError`. `app.py`'s `_call_chat` catches `LocalToolClientError` (imported from `local_tool_client`) alongside `ClaudeClientError` (imported from `claude_client`). Because the alias is just a name binding, the true origin of the exception type is `internal_api_client.py`, but the import graph visible in `app.py` points to `local_tool_client`. If `local_tool_client` is ever refactored to drop the re-export, or if `internal_api_client` introduces a base `CoreApiError` with `InternalApiError` as a subclass, `app.py` will either break or silently catch a narrower set of exceptions than intended—without any signal in its own import list that the dependency actually lives one module deeper.
+
+Solution:
+Replace the alias in `local_tool_client.py` with a direct re-export that documents the origin (`from internal_api_client import InternalApiError`), and in `app.py` import `InternalApiError` directly from `internal_api_client` for the catch clause. If a domain-specific name is still desired in `app.py`, define a thin `LocalToolClientError(InternalApiError)` subclass in `local_tool_client.py` so the hierarchy is real rather than a name swap, and catch the base `InternalApiError` in `app.py` to future-proof against hierarchy changes.
+
+Benefits:
+The dependency graph in `app.py` matches the actual module that defines the exception, making the coupling visible in the import list. A future refactor of `internal_api_client`'s error hierarchy will surface as a type-checker or import error at the point of use rather than silently changing the semantics of a name that appears to belong to a different module.
+
+### AC-130 · Resolve the local model name inside the client that uses it
+Strength: Worth exploring
+Files: internal_api_client.py, ollama_client.py, routes/chat.py
+
+Problem:
+The `reserve` function in `internal_api_client.py` accepts a `model` parameter that callers populate by reading `os.environ.get("LOCAL_MODEL")` (exposed as `ollama_client.MODEL`). The module already reads `AGENT_MANAGER_CORE_DASHBOARD_URL` from the environment for its own base URL, so it is self-contained for one configuration value but delegates the other to every caller. The knowledge of which environment variable holds the model name is therefore scattered across `ollama_client.py` and each call site in `routes/chat.py`, rather than being co-located with the client that actually sends it to the dashboard. Adding a new caller requires remembering to read the same env var and pass it positionally or by keyword, and a typo in the variable name will only surface at runtime.
+
+Solution:
+Give `reserve` a default of `model=None` and, when `None`, resolve it internally via `os.environ.get("LOCAL_MODEL")` (or a module-level constant read once at import time, mirroring how the dashboard URL is handled). Callers that need to override for testing or multi-model scenarios can still pass an explicit value. Remove the now-unnecessary `MODEL` read from `routes/chat.py` call sites.
+
+Benefits:
+The client is self-contained with respect to the local model's identity, matching its existing pattern for the dashboard URL. New callers no longer need to know the env-var name, and a single change to the variable name (or a move to a config file) is localized to `internal_api_client.py` rather than every call site.
