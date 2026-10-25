@@ -287,12 +287,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     style.textContent =
       '.multi-chat-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:8px 12px; border-bottom:1px solid var(--border,#ddd); }' +
       '.multi-chat-toolbar .multi-chat-switcher { flex:1; min-width:0; }' +
-      '.multi-chat-host { flex:1; min-height:0; overflow:auto; position:relative; }' +
-      '.multi-chat-flex { display:flex; flex-wrap:wrap; gap:8px; padding:8px; align-content:flex-start; }' +
-      '.multi-chat-pane, .multi-chat-placeholder { flex:0 0 calc(50% - 8px); min-height:280px; display:flex; flex-direction:column; }' +
-      '.multi-chat-pane.wide, .multi-chat-placeholder.wide { flex-basis:100%; }' +
+      // The strip layout (`.multi-chat-flex` / `.multi-chat-pane` / `.wide` sizing, scroll-snap)
+      // lives in static/chat.css: one horizontal row, --strip-visible panes per screen.
+      '.multi-chat-host { flex:1; min-height:0; overflow:hidden; position:relative; display:flex; flex-direction:column; }' +
       '.multi-chat-pane-head { display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:4px 8px 0; }' +
-      '.multi-chat-pane-body { flex:1; min-height:0; }' +
+      '.multi-chat-pane-body { flex:1; min-height:0; overflow-y:auto; }' +
       '.multi-chat-placeholder { border:2px dashed var(--border,#ccc); border-radius:8px; align-items:center; justify-content:center; background:transparent; }';
     document.head.appendChild(style);
   }
@@ -529,12 +528,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function render() {
       host.innerHTML = ''; // unmounts every previous pane's DOM -- no network
       markPreset();
-      // HUB0010 5/10: below the breakpoint what is rendered is layoutForWidth's
-      // single-pane view of the layout. `state` (and the saved layout) keeps the wide
-      // layout, so widening the window brings it back; render never saves.
-      const mobile = isMobile();
-      const view = mobile ? layoutForWidth(state, activeId, window.innerWidth || 1024, MOBILE_MAX_WIDTH) : state;
-      toolbar.hidden = mobile; // phone width: the chat's own switcher is the navigation
+      // Owner 2026-10-24: the strip always shows the saved layout at every width.
+      // Below 760px the CSS sets --strip-visible to 1 (static/chat.css), so a phone
+      // shows one whole pane per screen and a touch swipe moves to the next.
+      // render never collapses `state` (and never saves).
+      const view = state;
+      toolbar.hidden = isMobile(); // phone width: the chat's own switcher is the navigation
       const wide = view.preset === '1';
       const mounted = mountedSet(view, activeId);
 
@@ -548,21 +547,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         return { id, placeholder: false, nodes: null };
       }).filter(Boolean);
 
-      if (mobile) {
-        // Narrow viewport: one pane; the switcher inside it is the only navigation.
-        const target = open.find((o) => o.id === activeId) || open[0];
-        if (!target) {
-          host.appendChild(placeholder('+ New chat', openNewChat, true));
-          return;
-        }
-        const body = document.createElement('div');
-        body.className = 'multi-chat-pane-body';
-        mountPane(target.id, body, false);
-        host.appendChild(paneSlot(true, { id: target.id, nodes: body }));
-        return;
-      }
-
-      // Desktop: Dockview when available, otherwise a flexbox split.
+      // One row of panes: Dockview when available, otherwise the flexbox strip.
       const mountedOpen = open.filter((o) => !o.placeholder);
       if (tryRenderDockview(mountedOpen) && mountedOpen.length === open.length) return;
       if (host.firstChild) host.removeChild(host.firstChild); // remove the abandoned dockview container

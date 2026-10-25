@@ -194,3 +194,32 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
   .chat-chime-setting input { width: 20px; height: 20px; }
 }
 
+/* Multi-chat horizontal snap strip (owner 2026-10-24): one row, horizontal scroll,
+   scroll-snap. --strip-visible = panes per screen: 1 under 760px, 2 from 760px, 3 from 1400px
+   (the same numbers as stripVisibleCount in multi-chat.js). A pane fills the strip's height
+   and scrolls its own transcript; touch swipe works natively through scroll-snap. */
+.multi-chat-flex {
+  --strip-visible: 2;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  padding: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+  box-sizing: border-box;
+}
+@media (max-width: 759px) { .multi-chat-flex { --strip-visible: 1; } }
+@media (min-width: 1400px) { .multi-chat-flex { --strip-visible: 3; } }
+.multi-chat-pane, .multi-chat-placeholder {
+  flex: 0 0 calc((100% - (var(--strip-visible, 2) - 1) * 8px) / var(--strip-visible, 2));
+  scroll-snap-align: start;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+.multi-chat-pane.wide, .multi-chat-placeholder.wide { flex-basis: 100%; }
+
