@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  truncateTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
+  truncateTitle, fullTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
   orderSessions, nextSelectionAfterClose, formatRow,
   formatTokens, contextLabel, terminalTimer, STALE_BUSY_SECS, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
   filterRows, filterChats, emptyLabel, jumpTarget,
@@ -20,6 +20,44 @@ test('truncateTitle', () => {
   const out = truncateTitle(long, 10);
   assert.equal(out.length, 10);
   assert.ok(out.endsWith('…'));
+});
+
+test('fullTitle: 90-character title survives intact', () => {
+  const t90 = 'x'.repeat(90);
+  assert.equal(t90.length, 90);
+  assert.equal(fullTitle(t90), t90);
+});
+
+test('fullTitle: 300-character title is cut to 200 characters ending in …', () => {
+  const t300 = 'z'.repeat(300);
+  const out = fullTitle(t300);
+  assert.equal(out.length, 201); // 200 kept chars + the ellipsis
+  assert.ok(out.endsWith('…'));
+  assert.equal(out, t300.slice(0, 200) + '…');
+});
+
+test('fullTitle: runs of whitespace and newlines collapse to single spaces', () => {
+  assert.equal(fullTitle('  hello\n\n  world\t\ttab '), 'hello world tab');
+  assert.equal(fullTitle('\n'), 'New chat');
+});
+
+test('fullTitle: empty and null titles give New chat', () => {
+  assert.equal(fullTitle(''), 'New chat');
+  assert.equal(fullTitle(null), 'New chat');
+});
+
+test('formatRow title: full titles survive, only beyond 200 is cut, empty is New chat', () => {
+  const base = { id: 'x', provider: 'local', busy: false, turnCount: 0 };
+  const t90 = 'x'.repeat(90);
+  assert.equal(formatRow({ ...base, title: t90 }, NOW).title, t90);
+  const t300 = 'y'.repeat(300);
+  const cut = formatRow({ ...base, title: t300 }, NOW).title;
+  assert.equal(cut.length, 201);
+  assert.ok(cut.endsWith('…'));
+  assert.equal(cut, t300.slice(0, 200) + '…');
+  assert.equal(formatRow({ ...base, title: '  a\n  b\n' }, NOW).title, 'a b');
+  assert.equal(formatRow({ ...base, title: '' }, NOW).title, 'New chat');
+  assert.equal(formatRow({ ...base, title: null }, NOW).title, 'New chat');
 });
 
 test('statusWord', () => {
