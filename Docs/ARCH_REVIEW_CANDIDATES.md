@@ -1373,3 +1373,31 @@ Introduce a small normalizer at the top of the `swapOptions` and `swapBody` code
 
 Benefits:
 The UI and API contract align regardless of which "no account" representation arrives from the session object, eliminating a class of subtle bugs where an empty-string account leaks into filter logic or POST bodies. The normalization is a one-line change with no behavioral impact on the already-correct `null`/`undefined` paths, so the risk of introducing a regression is minimal. Future code that reads `session.account` can rely on the documented invariant rather than re-deriving the sentinel semantics locally.
+
+### AC-103 · Centralize Internal API error-handling in a single helper
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+The three non-streaming public functions in `internal_api_client.py` (`get_roots`, `preempt`, `reserve`) each independently wrap their `requests` call in a `try/except requests.RequestException` block that raises `InternalApiError`. This duplicates the connection-level error-handling contract—exception type, message format, and any status-code checking—across three call sites within the same module. Any future change to the error contract (adding retries, circuit-breaking, or altering the message format) requires editing three separate blocks and risks them drifting out of sync.
+
+Solution:
+Introduce a private helper (e.g. `_request(method, url, **kwargs)`) that performs the HTTP call, inspects the response status, and wraps any `requests.RequestException` into `InternalApiError` with a consistent message. Each of the three non-streaming public functions then calls `_request` and focuses exclusively on building its specific payload and parsing the response body. The public signatures remain unchanged, so no caller code is affected.
+
+`stream_local_turn` is deliberately excluded from this helper. It uses `requests.post(..., stream=True)` and iterates over `r.iter_lines()` inside a generator, yielding chunks to the caller. Forcing that flow through a uniform `_request` wrapper would either break the generator contract or require a complex abstraction that obscures the yield semantics. Its initial-connection `try/except` remains in place, co-located with the streaming iteration where it belongs.
+
+Benefits:
+The error-handling contract for the three non-streaming endpoints lives in exactly one place, making it trivial to audit and to evolve (retries, timeouts, circuit-breakers) without touching the public functions. The module's public API is unchanged, so downstream callers in `routes/chat.py` and elsewhere require no modification. The streaming function retains an explicit, generator-appropriate error path that does not fight the yield contract.
+
+### AC-104 · Resolve the model name inside `reserve()` to decouple routes from the provider module
+Strength: Strong
+Files: internal_api_client.py, routes/chat.py
+
+Problem:
+Three handlers in `routes/chat.py` (`api_chat_close`, `api_chat_message`, `api_chat_reserve`) each perform a local `import ollama_client` solely to read `ollama_client.MODEL` (which is just `os.environ.get("LOCAL_MODEL")`) and pass it as a positional argument to `internal_api_client.reserve()`. This forces the routing layer to import a specific provider module just to supply an environment variable, coupling route handlers to one particular model-client implementation.
+
+Solution:
+Change the `reserve()` signature to `def reserve(reservation_id: str, model: str = None, on: bool = True) -> dict` and, at the top of the body, add `if model is None: model = os.environ.get("LOCAL_MODEL")`. The existing `if model:` guard before serializing into the JSON body already handles the falsy case. Then, in each of the three handlers in `routes/chat.py`, delete the `import ollama_client` line and call `reserve(session_id, on=…)` without the model argument.
+
+Benefits:
+The routing layer becomes provider-agnostic: it depends only on `internal_api_client` and shared app helpers, not on a specific model-client module. Swapping or adding a local model provider later requires no changes to route files. The env-var read is co-located with the HTTP call that actually consumes the value, making the dependency explicit in one place rather than scattered across three handlers.
