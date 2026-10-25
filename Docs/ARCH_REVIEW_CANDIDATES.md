@@ -1331,3 +1331,45 @@ Extract the provider/model/account labeling logic into a shared utility module (
 
 Benefits:
 Provider labeling logic lives in a single source of truth, making it easier to maintain and audit. The same session is labeled consistently across different views (session switcher vs. swap menu), eliminating the risk of one view showing a stale or divergent format. UI components depend on a shared formatting utility rather than duplicating business logic about how to interpret provider/model/account data, and adding new providers or changing label formats requires updating only one module.
+
+### AC-101 · Duplicated `providerLabel` with divergent semantics across view modules
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` export a function named `providerLabel` that formats a provider/model pair, but they implement different rules and return different shapes. `sessions-view.js` returns a simple display string (e.g., `"Claude · gpt-4"` or `"Local"`) with no account information, while `swap-view.js` returns a richer string (e.g., `"Claude · gpt-4 · live account"`) and handles account-pinning logic. Both accept a single object argument (`row` / `session`) and extract `provider`, `model`, and (in the swap case) `account` internally.
+
+The practical cost is twofold. First, the core "how do we describe a provider/model pair" logic is duplicated: if the naming convention changes (a new provider type, a different separator, a locale requirement), both files must be updated independently, and a missed update in one produces inconsistent labels across the UI. Second, any consumer that needs both variants (such as a shared `chat.js` orchestrator) must import them under distinct local names (`import { providerLabel as sessionLabel } from './sessions-view.js'`), which is a small but recurring source of confusion and typos, and it obscures the fact that the two functions are supposed to be the same concept.
+
+Solution:
+Extract a single shared utility module (e.g., `static/provider-label.js`) that exposes one function with the same single-object signature the existing code already uses:
+
+```js
+// static/provider-label.js
+export function providerLabel(row) {
+  // row: { provider, model, account? }
+  const base = formatBase(row.provider, row.model); // e.g. "Claude · gpt-4"
+  if (row.account != null && row.account !== "") {
+    return `${base} · ${row.account}`;
+  }
+  return base;
+}
+```
+
+Because the signature is identical to what both existing exports already accept (a single object with `provider`, `model`, and optionally `account`), the change is a drop-in replacement: each call site that currently writes `providerLabel(row)` or `providerLabel(session)` simply changes its import source from the local module to `./provider-label.js`. No caller needs to destructure or re-shape its argument. The old per-module `providerLabel` exports are removed.
+
+Benefits:
+A single source of truth for provider/model display strings means a convention change is made in exactly one place, guaranteeing consistent labels across every view. The need to alias two same-named imports disappears, so any module can `import { providerLabel } from './provider-label.js'` unambiguously. The shared function is trivially unit-testable in isolation, and the view modules become thinner, focusing solely on DOM/rendering concerns rather than string-formatting policy.
+
+### AC-102 · Inconsistent "no account" representation (null vs. empty string) in swap-view
+Strength: Worth exploring
+Files: static/swap-view.js
+
+Problem:
+In `static/swap-view.js`, the concept of "no pinned account" (i.e., use the live/default account) is represented as `null` or `undefined` on `session.account`. The `swapOptions` filter (`o.account !== current`) and the `swapBody` construction (omitting `account` when it is `null`/`undefined`) both treat `null`/`undefined` as the sentinel. However, if `session.account` ever arrives as an empty string `""`—for example from a form field that was cleared but not set to `null`, or from a deserialized API response that uses `""` as a default—the filter becomes `o.account !== ""` (which silently drops any account whose label is empty, an unintended side-effect) and `swapBody` will include `account: ""` in the POST payload, potentially tripping backend validation or creating a phantom "empty-string account" record. The module has no single normalization point that maps all "no account" representations to one canonical value before the filter and body-construction logic runs.
+
+Solution:
+Introduce a small normalizer at the top of the `swapOptions` and `swapBody` code paths (or as a shared helper in the same module): `const current = (session.account == null || session.account === "") ? null : session.account;`. Use this normalized `current` value for both the filter comparison and the body-omission check. Additionally, add a brief comment (or a tiny `normalizeAccount` helper) documenting that `null`, `undefined`, and `""` are all treated as "no pinned account," so future contributors understand the contract. If the backend API contract specifies that `account` must be absent (not `""`) when no account is pinned, the normalizer guarantees the client never sends the empty-string variant.
+
+Benefits:
+The UI and API contract align regardless of which "no account" representation arrives from the session object, eliminating a class of subtle bugs where an empty-string account leaks into filter logic or POST bodies. The normalization is a one-line change with no behavioral impact on the already-correct `null`/`undefined` paths, so the risk of introducing a regression is minimal. Future code that reads `session.account` can rely on the documented invariant rather than re-deriving the sentinel semantics locally.
