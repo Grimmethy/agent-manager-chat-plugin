@@ -1596,3 +1596,16 @@ Introduce a single internal helper, e.g. `_ensure_single_live(storage_path, targ
 
 Benefits:
 The invariant is auditable in a single function, reducing the risk of a future edit breaking the "exactly one" guarantee in one path while leaving others correct. New contributors see one canonical implementation instead of three subtly different ones. The helper is trivially unit-testable in isolation (feed it a temp directory, assert the post-condition), whereas testing the invariant today requires exercising each of the three entry points separately.
+
+### AC-119 · Duplicate provider-labeling logic with divergent semantics
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js, static/chat.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` export a function named `providerLabel` that formats provider and model information for display, but their implementations and expected data shapes differ significantly. `sessions-view.js` expects a row object with `provider` and `model` fields and returns a string like `'Claude · <model>'` or `'Local'`. `swap-view.js` expects a session object with `provider`, `model`, and `account` fields and returns a string like `'Claude · <model> · <account>'` or `'Local · <model>'`. This tight coupling means the two modules must be kept in sync manually whenever the provider or model display format changes, and it forces the caller (`chat.js`) to know which version to use in which context, violating the principle of locality and increasing the risk of inconsistent UI rendering.
+
+Solution:
+Extract the common provider/model formatting logic into a shared utility module (e.g., `static/provider-label.js`) that accepts a provider, model, and optional account as arguments and returns the formatted string. Both `sessions-view.js` and `swap-view.js` should import and use this shared function, passing the relevant fields from their respective row or session objects. The shared module becomes the single source of truth for how provider and model information is displayed, eliminating the need for callers to track which variant applies where.
+
+Benefits:
+A single formatting function guarantees consistent provider/model display across all views, removes the manual synchronization burden between two modules, and frees `chat.js` from having to select between two subtly different implementations. Future changes to the display format (e.g., adding a new provider or changing the separator) require editing exactly one file rather than hunting for every copy of the logic.
