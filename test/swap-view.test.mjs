@@ -31,6 +31,17 @@ test('providerLabel: local and unknown providers', () => {
   assert.equal(providerLabel(null), 'Unknown');
 });
 
+test("providerLabel: a session with no model never prints 'null' or 'undefined'", () => {
+  assert.equal(providerLabel({ provider: 'local', model: null }), 'Local');
+  assert.equal(providerLabel({ provider: 'local' }), 'Local');
+  assert.equal(providerLabel({ provider: 'local', model: '' }), 'Local');
+  assert.equal(providerLabel({ provider: 'claude', model: null, account: 'work' }), 'Claude · work');
+  assert.equal(providerLabel({ provider: 'claude' }), 'Claude · live account');
+  for (const s of [{ provider: 'local', model: null }, { provider: 'claude', model: undefined, account: null }]) {
+    assert.doesNotMatch(providerLabel(s), /null|undefined/);
+  }
+});
+
 test('swapOptions: excludes the current account, keeps local', () => {
   const session = { provider: 'claude', model: 'opus', account: 'work' };
   assert.deepEqual(swapOptions(ACCOUNTS, session), [

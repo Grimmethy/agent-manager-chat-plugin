@@ -3,11 +3,21 @@
 // `node --test` (test/sessions-view.test.mjs): the current time is always injected.
 
 const TITLE_MAX = 40;
+const ROW_TITLE_MAX = 200;
 
 export function truncateTitle(title, max = TITLE_MAX) {
   const text = String(title == null ? '' : title).replace(/\s+/g, ' ').trim();
   if (!text) return 'New chat';
   return text.length <= max ? text : text.slice(0, max - 1) + '…';
+}
+
+// Row/button title: the whitespace-normalised FULL title, cut only beyond
+// ROW_TITLE_MAX (the row and the button clip themselves visually, so a short
+// JS cut just hid text the reader could see). 'New chat' when there is none.
+export function fullTitle(raw) {
+  const text = String(raw == null ? '' : raw).replace(/\s+/g, ' ').trim();
+  if (!text) return 'New chat';
+  return text.length <= ROW_TITLE_MAX ? text : text.slice(0, ROW_TITLE_MAX) + '…';
 }
 
 export function statusWord(row) {
@@ -67,7 +77,7 @@ export function nextSelectionAfterClose(rows, closedId) {
 export function formatRow(row, now) {
   return {
     id: row.id,
-    title: truncateTitle(row.title),
+    title: fullTitle(row.title),
     fullTitle: row.title || '',
     provider: providerLabel(row),
     status: statusWord(row),
@@ -171,6 +181,16 @@ export function filterRows(rows, query) {
   return rows.filter((r) => !!r && (has(r.name) || has(r.cwd) || has(r.host)));
 }
 
+// Same filter for the CHAT rows (the switcher box is labelled 'Filter chats'): case-insensitive substring of
+// the trimmed query against the full title and the provider/model label ('Local · qwen3'). An empty or
+// whitespace-only query returns `rows` itself; a null row or a missing field never throws.
+export function filterChats(rows, query) {
+  const needle = String(query == null ? '' : query).trim().toLowerCase();
+  if (needle === '') return rows;
+  const has = (value) => String(value == null ? '' : value).toLowerCase().includes(needle);
+  return rows.filter((r) => !!r && (has(r.title) || has(providerLabel(r)) || has(r.model)));
+}
+
 // Ctrl+1..9 jump: the key of the nth row of the order GIVEN (the caller passes the order on
 // screen), or null for n outside 1-9 or past the end. The key is host/id when the row has a
 // host and just the id otherwise: the same form the attention code uses for newly waiting
@@ -215,6 +235,14 @@ export function applyTerminalEvent(rows, event, data) {
   const next = [...rows];
   next[i] = data;
   return next;
+}
+
+// The empty-state line for the terminal group: names the host(s) that were asked (the `hosts` array GET api/chat/terminal-sessions
+// already returns) so an operator can tell the feature is pointed at the wrong machine. Plain text, the caller escapes it. Non-string and
+// blank entries are ignored; no usable host gives the plain 'No terminal sessions'. No URL or token ever reaches this.
+export function emptyLabel(hosts) {
+  const names = Array.isArray(hosts) ? hosts.filter((h) => typeof h === 'string' && h.trim() !== '') : [];
+  return names.length ? 'No terminal sessions on ' + names.join(', ') : 'No terminal sessions';
 }
 
 // The line naming the hosts whose session agent could not be reached. GET api/chat/terminal-sessions reports each as {host, reason} (agent_client.list_all);

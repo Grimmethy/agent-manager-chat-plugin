@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyPreset, closePane, serialize, deserialize, firstOpenPane, layoutForWidth,
+  stripVisibleCount, clampStripIndex, stepStrip, stripLabel, stripButtons, indexFromScroll, shouldHandleArrowKey, placeChatInStrip, chatTabs,
   DEFAULT_TEMPLATES, saveTemplate, applyTemplate, serializeTemplates, deserializeTemplates,
 } from '../static/multi-chat.js';
 
@@ -220,4 +221,110 @@ test('deserializeTemplates drops entries with a bad preset or a bad count', () =
     badCount: { preset: '1', count: 'x' }, negative: { preset: '1', count: -1 }, nul: null,
   });
   assert.deepEqual(deserializeTemplates(json), { ok: { preset: '2col', count: 2 } });
+});
+
+test('stripVisibleCount: 1 on a phone, 2 on a tablet or small laptop, 3 on a wide screen, boundaries at 760 and 1400', () => {
+  assert.equal(stripVisibleCount(375), 1);
+  assert.equal(stripVisibleCount(759), 1);
+  assert.equal(stripVisibleCount(760), 2);
+  assert.equal(stripVisibleCount(1399), 2);
+  assert.equal(stripVisibleCount(1400), 3);
+  assert.equal(stripVisibleCount(3000), 3);
+  for (const bad of [undefined, null, NaN, 'wide', {}]) assert.equal(stripVisibleCount(bad), 1);
+});
+
+test('clampStripIndex: stays inside 0..(paneCount - visibleCount); non-numbers and a short strip give 0', () => {
+  assert.equal(clampStripIndex(2, 5, 2), 2);
+  assert.equal(clampStripIndex(9, 5, 2), 3);
+  assert.equal(clampStripIndex(-4, 5, 2), 0);
+  assert.equal(clampStripIndex(1.9, 5, 2), 1);
+  for (const bad of [undefined, null, NaN, '2', {}]) assert.equal(clampStripIndex(bad, 5, 2), 0);
+  assert.equal(clampStripIndex(3, 1, 2), 0, 'fewer panes than fit');
+  assert.equal(clampStripIndex(3, 0, 1), 0, 'no panes');
+  assert.equal(clampStripIndex(1, 'x', 2), 0, 'bad pane count');
+});
+
+test('stepStrip: moves by delta and stops at both ends', () => {
+  assert.equal(stepStrip(0, 1, 4, 1), 1);
+  assert.equal(stepStrip(3, 1, 4, 1), 3, 'last stays last');
+  assert.equal(stepStrip(0, -1, 4, 1), 0, 'first stays first');
+  assert.equal(stepStrip(1, 1, 4, 2), 2);
+  assert.equal(stepStrip(2, 1, 4, 2), 2, 'two visible: the last index is paneCount - 2');
+  assert.equal(stepStrip(1, 'x', 4, 1), 1, 'a bad delta does not move');
+  assert.equal(stepStrip(99, -1, 4, 1), 2, 'an out-of-range index is clamped before stepping');
+});
+
+test('stripLabel: n / m for one visible pane, a range for several, empty with no panes', () => {
+  assert.equal(stripLabel(0, 0, 1), '');
+  assert.equal(stripLabel(0, 1, 1), '1 / 1');
+  assert.equal(stripLabel(2, 4, 1), '3 / 4');
+  assert.equal(stripLabel(0, 4, 2), '1-2 / 4');
+  assert.equal(stripLabel(2, 4, 2), '3-4 / 4');
+  assert.equal(stripLabel(0, 3, 3), '1-3 / 3');
+  assert.equal(stripLabel(0, 1, 3), '1 / 1', 'one pane on a three-wide screen is not a range');
+  assert.equal(stripLabel(9, 4, 2), '3-4 / 4', 'index is clamped');
+});
+
+test('stripButtons: canPrev and canNext at the first, middle and last position', () => {
+  assert.deepEqual(stripButtons(0, 4, 1), { canPrev: false, canNext: true });
+  assert.deepEqual(stripButtons(1, 4, 1), { canPrev: true, canNext: true });
+  assert.deepEqual(stripButtons(3, 4, 1), { canPrev: true, canNext: false });
+  assert.deepEqual(stripButtons(0, 2, 2), { canPrev: false, canNext: false }, 'everything fits');
+  assert.deepEqual(stripButtons(0, 0, 1), { canPrev: false, canNext: false });
+});
+
+test('indexFromScroll: the first pane whose left edge is at or past the scroll position (4px slack), clamped to the last pane', () => {
+  const lefts = [8, 687, 1366, 2045];
+  assert.equal(indexFromScroll(0, lefts), 0);
+  assert.equal(indexFromScroll(8, lefts), 0);
+  assert.equal(indexFromScroll(687, lefts), 1);
+  assert.equal(indexFromScroll(684, lefts), 1, '3px short of a snap point still counts as that pane');
+  assert.equal(indexFromScroll(700, lefts), 2, 'between two panes the next one is first');
+  assert.equal(indexFromScroll(1358, lefts), 2, 'the strip cannot scroll further than 1358 on a 2724px strip');
+  assert.equal(indexFromScroll(99999, lefts), 3, 'past the end gives the last pane');
+  assert.equal(indexFromScroll(-50, lefts), 0);
+  assert.equal(indexFromScroll(NaN, lefts), 0);
+  assert.equal(indexFromScroll(100, []), 0);
+  assert.equal(indexFromScroll(100, null), 0);
+});
+
+test('shouldHandleArrowKey: false while typing in an input, textarea, select or contenteditable element', () => {
+  for (const tag of ['INPUT', 'TEXTAREA', 'SELECT', 'input', 'textarea', 'select']) assert.equal(shouldHandleArrowKey(tag), false, tag);
+  assert.equal(shouldHandleArrowKey('DIV', true), false, 'contenteditable');
+  for (const tag of ['BODY', 'BUTTON', 'DIV', 'A', undefined, null, '']) assert.equal(shouldHandleArrowKey(tag), true, String(tag));
+});
+
+test('placeChatInStrip: an open chat only becomes active; a new one takes the first empty slot, else replaces the active pane', () => {
+  const full = { preset: '2col', panes: ['a', 'b'] };
+  const frozen = JSON.stringify(full);
+  assert.deepEqual(placeChatInStrip(full, 'b', 'a'), { state: { preset: '2col', panes: ['a', 'b'] }, activeId: 'b' }, 'already open: only activeId changes');
+  assert.deepEqual(placeChatInStrip({ preset: '2col', panes: ['a', null] }, 'c', 'a'), { state: { preset: '2col', panes: ['a', 'c'] }, activeId: 'c' }, 'first empty slot');
+  assert.deepEqual(placeChatInStrip(full, 'c', 'a'), { state: { preset: '2col', panes: ['c', 'b'] }, activeId: 'c' }, 'full strip: replaces the active pane');
+  assert.deepEqual(placeChatInStrip(full, 'c', null), { state: { preset: '2col', panes: ['a', 'c'] }, activeId: 'c' }, 'null activeId: replaces the last pane');
+  assert.deepEqual(placeChatInStrip(full, 'c', 'zzz'), { state: { preset: '2col', panes: ['a', 'c'] }, activeId: 'c' }, 'unknown activeId behaves like null');
+  assert.deepEqual(placeChatInStrip({ preset: '1', panes: [] }, 'c', null), { state: { preset: '1', panes: ['c'] }, activeId: 'c' }, 'no panes at all');
+  assert.equal(JSON.stringify(full), frozen, 'the input is never mutated');
+  assert.deepEqual(placeChatInStrip(full, '', 'a'), { state: { preset: '2col', panes: ['a', 'b'] }, activeId: 'a' }, 'an empty id changes nothing');
+});
+
+test('chatTabs: one entry per open pane in pane order, null slots skipped, only the active pane marked', () => {
+  const state = { preset: '2x2', panes: ['a', null, 'b', 'c'] };
+  const tabs = chatTabs(state, { a: 'Alpha', b: ' Beta ', c: 'Gamma' }, 'b');
+  assert.deepEqual(tabs, [
+    { id: 'a', title: 'Alpha', active: false },
+    { id: 'b', title: 'Beta', active: true },
+    { id: 'c', title: 'Gamma', active: false },
+  ]);
+});
+
+test('chatTabs: an unknown, empty or non-string title reads "Chat"; a missing titles map or state is safe; the input is not mutated', () => {
+  const state = { preset: '2col', panes: ['a', 'b', 'c'] };
+  const copy = JSON.parse(JSON.stringify(state));
+  const tabs = chatTabs(state, { a: '', b: 7 }, null);
+  assert.deepEqual(tabs.map((t) => t.title), ['Chat', 'Chat', 'Chat']);
+  assert.ok(tabs.every((t) => t.active === false));
+  assert.deepEqual(state, copy);
+  assert.deepEqual(chatTabs(state, null, 'a').map((t) => t.title), ['Chat', 'Chat', 'Chat']);
+  assert.deepEqual(chatTabs(null, {}, 'a'), []);
+  assert.equal(chatTabs(state, { toString: 'x' }, 'a')[0].title, 'Chat', 'inherited keys are not titles');
 });

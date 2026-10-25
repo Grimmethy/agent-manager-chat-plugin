@@ -158,6 +158,8 @@ AGENT_MANAGER_SESSION_AGENT_URLS='[
 
 The first token file is the default `--token-file` of the local agent (`--token auto`). The second holds a copy of the token the grimm agent printed or wrote; copy it by hand, keep it 0600, and never commit it. On grimm the agent must listen beyond loopback and name the address it is reached by: `session_agent.py --bind 0.0.0.0 --token auto --allow-host 100.96.112.78` (a non-loopback bind refuses to start without a token).
 
+**Extra chat roots.** `AGENT_MANAGER_CHAT_EXTRA_ROOTS` (colon-separated paths, for example `/media/model-cache/github/crosslister:/media/model-cache/github/books`) adds repos that are neither plugins nor projects to the roots the chat can read. They are appended after the roots core reports, so the primary root does not change; a path that is not an existing directory, or is already listed, is skipped (deduplicated). Unset changes nothing. Roots stay read-only for the local provider.
+
 ## Model swap (multi-chat)
 
 A live chat can change the model behind it without losing the conversation. Nothing here is checked against a real swap yet; see the `Model swap (manual)` section of `VERIFY.md`.

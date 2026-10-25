@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  truncateTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
+  truncateTitle, fullTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
   orderSessions, nextSelectionAfterClose, formatRow,
   formatTokens, contextLabel, terminalTimer, STALE_BUSY_SECS, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
-  filterRows, jumpTarget,
+  filterRows, filterChats, emptyLabel, jumpTarget,
 } from '../static/sessions-view.js';
 import { rowKey, hostsOf, filterByHost } from '../static/sessions-view.js';
 import { skippedLabel } from '../static/sessions-view.js';
@@ -20,6 +20,44 @@ test('truncateTitle', () => {
   const out = truncateTitle(long, 10);
   assert.equal(out.length, 10);
   assert.ok(out.endsWith('…'));
+});
+
+test('fullTitle: 90-character title survives intact', () => {
+  const t90 = 'x'.repeat(90);
+  assert.equal(t90.length, 90);
+  assert.equal(fullTitle(t90), t90);
+});
+
+test('fullTitle: 300-character title is cut to 200 characters ending in …', () => {
+  const t300 = 'z'.repeat(300);
+  const out = fullTitle(t300);
+  assert.equal(out.length, 201); // 200 kept chars + the ellipsis
+  assert.ok(out.endsWith('…'));
+  assert.equal(out, t300.slice(0, 200) + '…');
+});
+
+test('fullTitle: runs of whitespace and newlines collapse to single spaces', () => {
+  assert.equal(fullTitle('  hello\n\n  world\t\ttab '), 'hello world tab');
+  assert.equal(fullTitle('\n'), 'New chat');
+});
+
+test('fullTitle: empty and null titles give New chat', () => {
+  assert.equal(fullTitle(''), 'New chat');
+  assert.equal(fullTitle(null), 'New chat');
+});
+
+test('formatRow title: full titles survive, only beyond 200 is cut, empty is New chat', () => {
+  const base = { id: 'x', provider: 'local', busy: false, turnCount: 0 };
+  const t90 = 'x'.repeat(90);
+  assert.equal(formatRow({ ...base, title: t90 }, NOW).title, t90);
+  const t300 = 'y'.repeat(300);
+  const cut = formatRow({ ...base, title: t300 }, NOW).title;
+  assert.equal(cut.length, 201);
+  assert.ok(cut.endsWith('…'));
+  assert.equal(cut, t300.slice(0, 200) + '…');
+  assert.equal(formatRow({ ...base, title: '  a\n  b\n' }, NOW).title, 'a b');
+  assert.equal(formatRow({ ...base, title: '' }, NOW).title, 'New chat');
+  assert.equal(formatRow({ ...base, title: null }, NOW).title, 'New chat');
 });
 
 test('statusWord', () => {
@@ -300,4 +338,41 @@ test('jumpTarget prefixes the host when the row has one and not otherwise', () =
   assert.equal(jumpTarget(rows, 2), 'b');
   assert.equal(jumpTarget(rows, 3), 'c');
   assert.equal(jumpTarget(rows, 4), 'd');
+});
+
+test('emptyLabel names the hosts that were asked', () => {
+  assert.equal(emptyLabel(['default']), 'No terminal sessions on default');
+  assert.equal(emptyLabel(['wok', 'grimm']), 'No terminal sessions on wok, grimm');
+});
+
+test('emptyLabel falls back to the plain text for no, bad or blank host lists', () => {
+  assert.equal(emptyLabel([]), 'No terminal sessions');
+  assert.equal(emptyLabel(undefined), 'No terminal sessions');
+  assert.equal(emptyLabel(null), 'No terminal sessions');
+  assert.equal(emptyLabel('wok'), 'No terminal sessions');
+  assert.equal(emptyLabel(['', null, 7, 'wok']), 'No terminal sessions on wok');
+});
+
+const CHAT_ROWS = [
+  { id: 'c1', title: 'Task: author a new selectable PromptForge scene', provider: 'local', model: 'qwen3' },
+  { id: 'c2', title: 'New chat', provider: 'claude', model: 'claude-sonnet-5-5' },
+  { id: 'c3', title: null, provider: 'local', model: null },
+];
+
+test('filterChats matches the full title and the provider/model label, case-insensitively', () => {
+  assert.deepEqual(filterChats(CHAT_ROWS, 'PROMPTFORGE').map((r) => r.id), ['c1']);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'sonnet').map((r) => r.id), ['c2']);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'claude').map((r) => r.id), ['c2']);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'new chat').map((r) => r.id), ['c2']);
+});
+
+test('filterChats: an empty or whitespace query returns the rows as given; no match returns []', () => {
+  assert.equal(filterChats(CHAT_ROWS, ''), CHAT_ROWS);
+  assert.equal(filterChats(CHAT_ROWS, '   '), CHAT_ROWS);
+  assert.equal(filterChats(CHAT_ROWS, null), CHAT_ROWS);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'zzzz'), []);
+});
+
+test('filterChats tolerates null fields and null rows', () => {
+  assert.deepEqual(filterChats([null, ...CHAT_ROWS], 'local').map((r) => r.id), ['c1', 'c3']);
 });

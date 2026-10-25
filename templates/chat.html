@@ -2,6 +2,8 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>System Chat</title>
 <!-- RELATIVE hrefs/src throughout this file, deliberately -- this page is reached via
      the host dashboard's generic proxy (/api/plugins/<name>/proxy/<subpath>), so the
@@ -29,6 +31,9 @@
      ChatPane.build() replaces its innerHTML with class-based DOM on load, so any consumer (host core-ui.js persistent-sidebar
      mount, a future multi-pane orchestrator) must query class selectors inside the pane root -- never id-based names. -->
 <div id="chat-panel"></div>
+<!-- Classic (non-module) script, so it runs before any module below: chat.js's mountChat() then returns early and the old single
+     ChatPane above the strip is never mounted; static/multi-chat.js owns the whole page (switcher, strip, panes). -->
+<script>window.__CHAT_MULTI_PANES__ = true;</script>
 <!-- type="module" so chat.js can `import` static/vendor/smd.js -- module import
      specifiers resolve against the importing MODULE's own URL, not the document's, so
      this stays proxy-safe the same way the plain relative src= above is. -->

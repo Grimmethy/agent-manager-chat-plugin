@@ -23,13 +23,17 @@
 // markdown they're asking to be formatted, and rendering it would just be a bigger HTML
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
-import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
-  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel, filterRows, jumpTarget } from "./sessions-view.js";
+import { fullTitle, orderSessions, nextSelectionAfterClose, formatRow,
+  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel, filterRows, filterChats, emptyLabel, jumpTarget } from "./sessions-view.js";
 // HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
 // (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
 // split. providerLabel drives the header label, swapOptions builds the Swap menu,
 // swapBody builds each POST body, offerText renders the failed-turn one-click offer.
 import { providerLabel, swapOptions, offerText, swapBody } from "./swap-view.js";
+// The tools an assistant turn ran (stored by tool_log.py), shown as a collapsed list under its reply.
+import { renderToolsHtml } from "./tools-view.js";
+// Proposed write commands (Confirm / Deny) and the results of the ones that ran (command_runs.py stores them on the assistant entry).
+import { renderCommandsHtml } from "./commands-view.js";
 // Piece 2/10: the pure "needs you" attention logic (which rows newly became waiting,
 // how many are waiting) lives in attention-view.js (piece 1). This file only calls it
 // and applies the result to the DOM; keep the decision logic there.
@@ -134,7 +138,7 @@ function chatRenderTranscript(transcript, session) {
         <textarea class="tpl-text" rows="6" ${done ? 'disabled' : ''}>${escapeHtml(tp.text)}</textarea>
         <button type="button" class="tpl-save" ${done ? 'disabled' : ''}>${done ? 'Saved' : 'Save template'}</button>${note}</div>`;
     }).join('');
-    return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div>${cards}</div>`;
+    return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div>${renderToolsHtml(t.tools)}${renderCommandsHtml(t)}${cards}</div>`;
   }).join('');
   return `<div class="field-label">Conversation</div><div class="chat-transcript">${rows}</div>`;
 }
@@ -187,6 +191,7 @@ class ChatPane {
     this.root.innerHTML = `
   <div class="chat-header">
     <div class="chat-switcher-slot"></div>
+    <span class="chat-pane-title"></span>
     <span class="chat-provider-container"></span>
     <span class="chat-provider-label" hidden></span>
     <span class="chat-swap-slot">
@@ -212,6 +217,7 @@ class ChatPane {
   </div>`;
     const q = (sel) => this.root.querySelector(sel);
     this.switcherSlot = q('.chat-switcher-slot');
+    this.titleEl = q('.chat-pane-title');
     this.providerContainer = q('.chat-provider-container');
     // HUB0008 10/11: header provider label + Swap menu (see syncSwapHeader below).
     this.providerLabelEl = q('.chat-provider-label');
@@ -284,6 +290,13 @@ class ChatPane {
       this.setSwapOpen(false);
     }
     this.onSessionChange(session);
+  }
+
+  // The chat's real title, from the sessions list (the multi-chat bar passes it in); shown in the pane header while this pane still shows the same chat.
+  setTitle(text) {
+    this.titleText = typeof text === 'string' ? text : '';
+    this.titleFor = this.sessionId;
+    this.titleEl.textContent = this.titleText || (this.session ? fullTitle(this.session.title) : '');
   }
 
   syncProviderToggle() {
@@ -432,6 +445,11 @@ class ChatPane {
       if (option) { this.setSwapOpen(false); this.performSwap(option); }
       return;
     }
+    const cmdBtn = e.target.closest && e.target.closest('.cmd-confirm, .cmd-deny');
+    if (cmdBtn && this.session && this.root.contains(cmdBtn)) {
+      await this.decideCommand(cmdBtn);
+      return;
+    }
     const btn = e.target.closest && e.target.closest('.tpl-save');
     if (!btn || !this.session || !this.root.contains(btn)) return;
     const card = btn.closest('.tpl-card');
@@ -451,6 +469,27 @@ class ChatPane {
       showToast(body.proposal.message, body.proposal.status === 'saved' ? 'info' : 'error');
     } catch (err) {
       showToast('Could not save template: ' + err.message);
+    }
+    this.render();
+  }
+
+  // Confirm / Deny on a proposed command. The route persists the decision first and, for Confirm, waits for core's runner (up to 15 minutes), so the card shows
+  // 'Running...' meanwhile; the stored session that comes back holds the result. An error leaves the proposal as the server has it.
+  async decideCommand(btn) {
+    const card = btn.closest('.cmd-card');
+    if (!card) return;
+    const confirm = btn.classList.contains('cmd-confirm');
+    for (const b of card.querySelectorAll('button')) b.disabled = true;
+    btn.textContent = confirm ? 'Running...' : 'Denying...';
+    try {
+      const resp = await fetch(`api/chat/${encodeURIComponent(this.session.id)}/command/${encodeURIComponent(card.dataset.proposal)}/${confirm ? 'confirm' : 'deny'}`, { method: 'POST' });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
+      this.setSession(body.session);
+    } catch (err) {
+      showToast('Could not record that decision: ' + err.message);
+      await this.load();
+      return;
     }
     this.render();
   }
@@ -526,6 +565,24 @@ class ChatPane {
       // Root-caused live 2026-09-22 (Grimmethy, through the dashboard's proxied iframe --
       // this bug never showed hitting the plugin directly on :7442, only through :7420's
       // proxy): this fetch() had no Accept header at all.
+      // Pure helper (kept dependency-free so test/chat-preempt-text.test.mjs can lift it):
+      // turn the core's preempt rows into the operator-visible chat text. 'killed' -> freed,
+      // 'spared' -> spared (as before); 'busy' -> a holder on this chat's GPU that
+      // survived the preempt, so the operator knows their turn is queued behind it.
+      // Unknown actions are ignored (no crash, no text).
+      function buildPreemptText(lanes) {
+        const killed = lanes.filter((l) => l.action === 'killed').map((l) => l.lane);
+        const spared = lanes.filter((l) => l.action === 'spared')
+          .map((l) => `${l.lane} (${Math.round((l.ageSeconds || 0) / 60)}m in)`);
+        const busy = lanes.filter((l) => l.action === 'busy')
+          .map((l) => `busy: ${l.lane} ${l.taskId} (${l.phase}) - your turn is queued behind it`);
+        const bits = [];
+        if (killed.length) bits.push('freed ' + killed.join(', '));
+        if (spared.length) bits.push('spared ' + spared.join(', '));
+        if (busy.length) bits.push(busy.join(', '));
+        if (!bits.length) return '';
+        return `⚡ ${bits.join(' · ')}\n\n`;
+      }
       const resp = await fetch(`api/chat/${encodeURIComponent(session.id)}/message`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
         body: JSON.stringify({ message }),
@@ -550,14 +607,8 @@ class ChatPane {
           if (!line) continue;
           const evt = JSON.parse(line.slice(6));
           if (evt.type === 'preempt') {
-            const lanes = evt.lanes || [];
-            const killed = lanes.filter((l) => l.action === 'killed').map((l) => l.lane);
-            const spared = lanes.filter((l) => l.action === 'spared')
-              .map((l) => `${l.lane} (${Math.round((l.ageSeconds || 0) / 60)}m in)`);
-            const bits = [];
-            if (killed.length) bits.push('freed ' + killed.join(', '));
-            if (spared.length) bits.push('spared ' + spared.join(', '));
-            if (bits.length) { assistantEntry.text = `⚡ ${bits.join(' · ')}\n\n`; this.render(); }
+            const preemptText = buildPreemptText(evt.lanes || []);
+            if (preemptText) { assistantEntry.text = preemptText; this.render(); }
           } else if (evt.type === 'chunk') {
             assistantEntry.text += evt.text;
             this.render();
@@ -626,6 +677,8 @@ class ChatPane {
   render() {
     const session = this.session;
     this.syncSwapHeader();
+    // A loaded session has no `title` (only the sessions list does), so the host page hands the real title in through setTitle(); it counts only while this pane still shows that chat.
+    this.titleEl.textContent = this.titleText && this.titleFor === this.sessionId ? this.titleText : (session ? fullTitle(session.title) : '');
     if (session && session.provider && this.providerChoice !== session.provider) {
       this.providerChoice = session.provider;
       this.syncProviderToggle();
@@ -677,8 +730,9 @@ class ChatPane {
 // lives in sessions-view.js; this class only does DOM + fetches. The list re-fetches every
 // 5s while the dropdown is open and after any action.
 class SessionSwitcher {
-  constructor(slot, { getSelectedId, onSelect, onNew, onClose, getRoots }) {
+  constructor(slot, { getSelectedId, onSelect, onNew, onClose, getRoots, buttonLabel }) {
     this.slot = slot;
+    this.buttonLabel = buttonLabel || null; // a fixed button text (the multi-chat bar's 'All chats'); null shows the selected chat's title
     this.getSelectedId = getSelectedId;
     this.onSelect = onSelect;
     this.onNew = onNew;
@@ -860,7 +914,7 @@ class SessionSwitcher {
 
   renderButton() {
     const row = this.rows.find((r) => r.id === this.getSelectedId());
-    this.btn.textContent = (row ? truncateTitle(row.title) : 'Chats') + ' ▾';
+    this.btn.textContent = (this.buttonLabel || (row ? fullTitle(row.title) : 'Chats')) + ' ▾';
     const roots = this.getRoots();
     this.btn.title = roots.length
       ? 'Switch chat. Accessible repos (roots[0] is primary):\n' + roots.join('\n')
@@ -924,7 +978,7 @@ class SessionSwitcher {
     const displayed = (t.reachable && t.rows.length) ? filterRows(filterByHost(rows, selectedHost), this.filterQuery) : [];
     this.displayedTerminalRows = displayed;
     if (!t.reachable) body = '<div class="chat-switcher-empty">Session agent unreachable</div>';
-    else if (!t.rows.length) body = '<div class="chat-switcher-empty">No terminal sessions</div>';
+    else if (!t.rows.length) body = `<div class="chat-switcher-empty">${escapeHtml(emptyLabel(t.hosts))}</div>`;
     else if (!displayed.length) body = '<div class="chat-switcher-empty">No sessions match</div>';
     else body = displayed.map((r) => {
       // Piece 2/10: match this row against the newly-waiting keys from the last
@@ -1026,8 +1080,11 @@ class SessionSwitcher {
     this.renderButton();
     const now = Date.now();
     const selectedId = this.getSelectedId();
+    const chats = filterChats(this.rows, this.filterQuery);
+    const chatsEmpty = this.rows.length && !chats.length
+      ? '<div class="chat-switcher-empty">No chats match</div>' : '';
     this.list.innerHTML = `<div class="chat-switcher-new" role="option">+ New chat</div>`
-      + this.rows.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('')
+      + chats.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('') + chatsEmpty
       + this.renderTerminalSection(now)
       + this.renderChimeSetting();
   }
