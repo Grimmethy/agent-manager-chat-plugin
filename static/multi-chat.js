@@ -187,6 +187,16 @@ export function shouldHandleArrowKey(tagName, isContentEditable = false) {
   return !(tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT');
 }
 
+// The chat buttons at the top of the bar: one per open pane, in pane order. `titles` maps a session id to its title; a chat whose title is not known (yet) is called 'Chat'.
+// Returns [{ id, title, active }]; `active` is true only for the pane that is `activeId`. Nothing is mutated.
+export function chatTabs(state, titles, activeId) {
+  const known = titles && typeof titles === 'object' ? titles : {};
+  return openIds(state).map((id) => {
+    const t = Object.prototype.hasOwnProperty.call(known, id) && typeof known[id] === 'string' ? known[id].trim() : '';
+    return { id, title: t || 'Chat', active: id === activeId };
+  });
+}
+
 // Layout templates (HUB0010 6/10): named {preset, count} recipes. Plain data in, plain data
 // out; nothing here touches storage or the DOM, and no input is ever mutated.
 function slotsFor(preset) {
@@ -319,7 +329,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     style.id = 'multi-chat-style';
     style.textContent =
       '.multi-chat-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:8px 12px; border-bottom:1px solid var(--border,#ddd); }' +
-      '.multi-chat-toolbar .multi-chat-switcher { flex:1; min-width:0; }' +
       // The strip layout (`.multi-chat-flex` / `.multi-chat-pane` / `.wide` sizing, scroll-snap)
       // lives in static/chat.css: one horizontal row, --strip-visible panes per screen.
       '.multi-chat-host { flex:1; min-height:0; overflow:hidden; position:relative; display:flex; flex-direction:column; }' +
@@ -345,12 +354,44 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     root.appendChild(toolbar);
     root.appendChild(host);
 
-    // --- toolbar: the one chat switcher (built once chat.js has loaded) -----
+    // --- toolbar: the open chats as a row of buttons (one per pane, the active one highlighted) and a "+" new-chat button ----------------
+    const tabsBox = document.createElement('div');
+    tabsBox.className = 'multi-chat-tabs';
+    tabsBox.setAttribute('role', 'tablist');
+    tabsBox.setAttribute('aria-label', 'Open chats');
+    toolbar.appendChild(tabsBox);
+    const newTabBtn = document.createElement('button');
+    newTabBtn.type = 'button';
+    newTabBtn.className = 'secondary multi-chat-new-btn';
+    newTabBtn.textContent = '+';
+    newTabBtn.title = 'New chat';
+    newTabBtn.setAttribute('aria-label', 'New chat');
+    newTabBtn.onclick = () => openNewChat();
+    toolbar.appendChild(newTabBtn);
+
+    // --- toolbar: the session switcher, now the "All chats" list (built once chat.js has loaded) -----
     const switcherSlot = document.createElement('div');
     switcherSlot.className = 'multi-chat-switcher';
     toolbar.appendChild(switcherSlot);
     let switcher = null;
-    const refreshSwitcher = () => { if (switcher) switcher.refresh(); };
+    const refreshSwitcher = () => { if (switcher) switcher.refresh().then(renderTabs, () => {}); renderTabs(); };
+    function renderTabs() {
+      const titles = {};
+      if (switcher && Array.isArray(switcher.rows)) for (const r of switcher.rows) if (r && typeof r.id === 'string') titles[r.id] = r.title;
+      tabsBox.innerHTML = '';
+      for (const tab of chatTabs(state, titles, activeId)) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'secondary multi-chat-tab';
+        btn.textContent = tab.title;
+        btn.title = tab.title;
+        btn.setAttribute('role', 'tab');
+        btn.setAttribute('aria-selected', String(tab.active));
+        if (tab.active) btn.setAttribute('aria-current', 'true');
+        btn.onclick = () => selectChat(tab.id);
+        tabsBox.appendChild(btn);
+      }
+    }
 
     // --- toolbar: one "Layout" control at the end of the bar; the presets and the templates live in its popover ----------------
     const layoutBox = document.createElement('div');
@@ -483,6 +524,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!strip || next === stripIndex) return false;
       stripIndex = next;
       scrollStripTo(next, true);
+      const landed = state.panes[next];
+      if (typeof landed === 'string') activeId = landed; // the highlighted chat follows the strip
+      renderTabs();
       updateStripNav();
       return true;
     }
@@ -565,7 +609,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     let livePanes = []; // the ChatPane instances drawn by the current render, for the dashboard's refresh message
     let showToast = (msg) => console.error(msg);
     function mountPane(id, bodyEl, isNew) {
-      const pane = new ChatPane(bodyEl, {});
+      const pane = new ChatPane(bodyEl, { onSessionChange: () => refreshSwitcher() }); // a new title or a busy flag shows up on the chat's button
       livePanes.push(pane);
       const opener = isNew ? pane.startNew() : pane.loadSession(id);
       // After startNew the pane knows its fresh session id -- record it so the
@@ -601,7 +645,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (header) header.appendChild(close);
       else body.prepend(close);
       slot.appendChild(body);
-      body.addEventListener('focusin', () => { activeId = open.id; });
+      body.addEventListener('focusin', () => { activeId = open.id; renderTabs(); });
       return slot;
     }
 
@@ -678,6 +722,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function render() {
       host.innerHTML = ''; // unmounts every previous pane's DOM -- no network
       livePanes = [];
+      renderTabs();
       Promise.resolve().then(refreshSwitcher); // after this render has finished, whichever way it returns
       strip = null;
       updateStripNav();
@@ -751,6 +796,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // layout state once startNew() has resolved (see mountPane).
       host.innerHTML = '';
       livePanes = [];
+      renderTabs();
       Promise.resolve().then(refreshSwitcher);
       markPreset();
       const idx = state.panes.indexOf(null);
@@ -802,6 +848,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (wasOpen && strip) {
         scrollStripTo(clampStripIndex(stripIndex, stripPanes().length, stripVisibleCount(window.innerWidth || 1024)), true);
         updateStripNav();
+        renderTabs();
         refreshSwitcher();
         return;
       }
@@ -858,6 +905,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           onSelect: selectChat,
           onNew: openNewChat,
           onClose: closeChat,
+          buttonLabel: 'All chats',
         });
         render();
         ensureOnePane();
