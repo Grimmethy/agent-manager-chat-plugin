@@ -1240,3 +1240,29 @@ Introduce a single `filterByFields(rows, query, fields)` helper where `fields` i
 
 Benefits:
 Matching semantics (case-folding, whitespace trimming, null-safety) are defined in one place, eliminating the risk of the two filters drifting apart if the matching rules evolve. The code is slightly shorter and the intent of each filter is expressed purely by its field list, making the difference between the two filters immediately visible.
+
+### AC-94 · ~~Centralize the "plain row" predicate to eliminate duplicated skip-logic~~ — **RETRACTED**
+Strength: Strong
+
+The original draft claimed `test_chat_routes_swap.py` re-implements the `_is_plain_row` filter via inline list comprehensions. On re-reading the test, it does not. `test_response_has_the_marker_row_and_a_swaps_entry` asserts the *presence* of exactly one marker row (`len(markers) == 1`) and that the pre-swap transcript rows appear verbatim (`body["transcript"][:2] == …`). It never filters rows by the "plain vs. annotated" predicate, so there is no duplicated skip-logic to centralize. The proposed public `is_plain_row` / `get_plain_rows` refactor has no consumer in the test and solves a problem that is not present in the code.
+
+**Action:** No change. The existing private helper in `handoff.py` and the test's presence-assertion are orthogonal concerns; no coupling exists to break.
+
+---
+
+### AC-95 · ~~Decouple model_stats_client from the top-level app module~~ — **RETRACTED**
+Strength: Strong
+
+The original draft flagged `from app import CORE_REPO_ROOT` as an inverted dependency and proposed an environment variable or a `paths.py` shim. The module docstring in `model_stats_client.py` explicitly documents *why* the import exists:
+
+> "not vendored – model-stats.db and model-stats-db.js both live in the core repo, so this stays pointed at `AGENT_MANAGER_CORE_REPO_ROOT/src/model-stats-db.js` (via `app.py`'s `CORE_REPO_ROOT`) rather than a relative `__file__` path, which does not hold from this repo's different directory depth."
+
+The path is resolved relative to the **core** repo root, which is a runtime value established by the app bootstrap. A static env-var default or a new `paths.py` module would either (a) duplicate the same resolution logic without eliminating the dependency, or (b) hard-code a path that is wrong at the Chat-plugin repo's directory depth—exactly the failure mode the comment warns about. The circular-import risk cited in the draft is speculative: `model_stats_client` is a leaf in the import graph shown and no reverse import chain was identified.
+
+**Action:** No change. The current `from app import CORE_REPO_ROOT` is the documented, intentional mechanism for cross-repo path resolution. Introducing an indirection layer would add complexity without removing the underlying dependency and risks breaking the path at the plugin repo's depth.
+
+---
+
+### Summary
+
+Both ACs in the original draft were based on misreadings of the provided source. After correction, **no refactoring action is recommended** for the two files under review. The private `_is_plain_row` helper and the `app.CORE_REPO_ROOT` import are each appropriate to their context, and the tests / consumers interact with them in ways that do not create the coupling or dependency problems the draft described.
