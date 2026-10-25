@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyPreset, closePane, serialize, deserialize, firstOpenPane, layoutForWidth,
-  stripVisibleCount, clampStripIndex, stepStrip, stripLabel, stripButtons,
+  stripVisibleCount, clampStripIndex, stepStrip, stripLabel, stripButtons, indexFromScroll, shouldHandleArrowKey,
   DEFAULT_TEMPLATES, saveTemplate, applyTemplate, serializeTemplates, deserializeTemplates,
 } from '../static/multi-chat.js';
 
@@ -271,4 +271,25 @@ test('stripButtons: canPrev and canNext at the first, middle and last position',
   assert.deepEqual(stripButtons(3, 4, 1), { canPrev: true, canNext: false });
   assert.deepEqual(stripButtons(0, 2, 2), { canPrev: false, canNext: false }, 'everything fits');
   assert.deepEqual(stripButtons(0, 0, 1), { canPrev: false, canNext: false });
+});
+
+test('indexFromScroll: the first pane whose left edge is at or past the scroll position (4px slack), clamped to the last pane', () => {
+  const lefts = [8, 687, 1366, 2045];
+  assert.equal(indexFromScroll(0, lefts), 0);
+  assert.equal(indexFromScroll(8, lefts), 0);
+  assert.equal(indexFromScroll(687, lefts), 1);
+  assert.equal(indexFromScroll(684, lefts), 1, '3px short of a snap point still counts as that pane');
+  assert.equal(indexFromScroll(700, lefts), 2, 'between two panes the next one is first');
+  assert.equal(indexFromScroll(1358, lefts), 2, 'the strip cannot scroll further than 1358 on a 2724px strip');
+  assert.equal(indexFromScroll(99999, lefts), 3, 'past the end gives the last pane');
+  assert.equal(indexFromScroll(-50, lefts), 0);
+  assert.equal(indexFromScroll(NaN, lefts), 0);
+  assert.equal(indexFromScroll(100, []), 0);
+  assert.equal(indexFromScroll(100, null), 0);
+});
+
+test('shouldHandleArrowKey: false while typing in an input, textarea, select or contenteditable element', () => {
+  for (const tag of ['INPUT', 'TEXTAREA', 'SELECT', 'input', 'textarea', 'select']) assert.equal(shouldHandleArrowKey(tag), false, tag);
+  assert.equal(shouldHandleArrowKey('DIV', true), false, 'contenteditable');
+  for (const tag of ['BODY', 'BUTTON', 'DIV', 'A', undefined, null, '']) assert.equal(shouldHandleArrowKey(tag), true, String(tag));
 });
