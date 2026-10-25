@@ -375,7 +375,7 @@ def _session_title(session: dict) -> str:
     for turn in session.get("transcript") or []:
         if turn.get("role") == "user" and (turn.get("text") or "").strip():
             text = " ".join(turn["text"].split())
-            return text if len(text) <= 60 else text[:59] + "…"
+            return text if len(text) <= 200 else text[:199] + "…"
     return "New chat"
 
 
