@@ -1,9 +1,12 @@
 # Design decision: owner-approved write-command execution path for Chat
 
-> **Status: PROPOSAL — a design decision, pending owner approval. This is NOT an
-> approved design.** Nothing in this document is implemented, no code is changed,
-> no routes or endpoints exist or are added by this doc. The owner reviews and
-> decides; the decision questions at the end are what need answering.
+> **Status: APPROVED by the owner, 2026-10-25.** Decisions: **(A)** execution is
+> option 2 of section 4, a restricted host-side runner in core; **(B)** the
+> allowlist is ONE central config in the chat plugin's storage dir; **(C)** scope
+> is the first proposal as written: exact argv, single repo, persisted confirm,
+> allowlist-only, never a write-tool unlock (`queue_reviewed_task` stays the only
+> code-change hand-off). Implementation proceeds in the pieces of section 6.
+> Nothing here is implemented yet until those pieces merge.
 >
 > Date: 2026-10-25
 > Grounding note: every symbol cited below from **this** (chat plugin) repo was
@@ -54,22 +57,28 @@ The asymmetry to keep visible:
 
 ## 1. Allowlist of exact commands per repo
 
-- **Location (default):** a per-repo file named `.chat-allowlist` inside the
-  repo itself (e.g. `inventory-plugin/.chat-allowlist`), so the allowlist lives
-  next to the code and data it may touch. Alternative: a single JSON/YAML config
-  under the chat plugin's storage dir keyed by repo root. Tradeoff: per-repo
-  files keep ownership local and survive a plugin reinstall; the central config
-  is easier to audit in one place. **Decision question below.**
+- **Location (decided, B):** ONE central file in the chat plugin's storage dir,
+  `~/.local/state/agent-manager-chat-plugin/command-allowlist.json` (override with
+  the env var `AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH`), mode 0600, keyed by
+  repo root. One place to audit; per-repo `.chat-allowlist` files were the
+  alternative and are not used.
 - **Format:** JSON array of argv arrays. Example:
 
   ```json
   {
-    "repo": "/media/model-cache/github/inventory-plugin",
     "commands": [
-      ["python3", "-m", "inventory", "sales", "email"]
+      {
+        "repo": "/media/model-cache/github/inventory-plugin",
+        "argv": ["python3", "-m", "inventory", "sales", "email"],
+        "env": {"PYTHONPATH": "src:/media/model-cache/github/crosslister/src"},
+        "timeoutSeconds": 300
+      }
     ]
   }
   ```
+
+  `env` (optional) is the ONLY environment added to the run, and `timeoutSeconds`
+  (optional) overrides the default, within the runner's maximum (section 4).
 
 - **Matching rule:** **exact argv equality** against the entry, run in that
   repo's own working tree. No shell involved: no shell expansion, no wildcards,
@@ -154,21 +163,25 @@ repo). **The plugin cannot bwrap on its own** — `run_bash` from this process
 still lands inside the read-only sandbox, so any writable execution must be
 owned by a core-side path. Two options, both core-side:
 
-1. **New core internal API route** that the chat plugin calls through the
-   existing client pattern in `internal_api_client.py` (which already carries
-   the plugin→core internal calls, e.g. the `internal_reserve` release pattern
-   referenced in `routes/chat.py`). The route verifies: (a) the exact argv is in
-   that repo's allowlist, (b) a persisted `confirm` for the `proposalId` exists,
-   then runs the argv in the repo's own working tree in a **fresh sandbox where
-   that ONE repo is writable** and every other accessible repo stays read-only.
-   - *Tradeoff:* cleanest containment (per-command, per-repo writable scope,
-     core owns the sandbox, plugin holds no privileged capability); requires a
-     core-side code change and a new internal (not public) method.
-2. **Restricted host-side runner** — a long-lived core-side process that
-   pre-loads the allowlists and confirmation store and executes approved argv
-   with `cwd` pinned to the target repo.
-   - *Tradeoff:* one always-writable process to keep trusted (larger standing
-     attack surface, easier to misconfigure); no per-run sandbox isolation.
+1. **New core internal API route with a per-run sandbox** (NOT chosen). Cleanest
+   containment, but needs a per-run sandbox where exactly one repo is writable.
+2. **Restricted host-side runner (CHOSEN, decision A).** Core executes approved
+   argv with `cwd` pinned to the target repo, with no per-run sandbox. The doc's
+   own tradeoff stands (a trusted writer on the host, a larger standing surface
+   than option 1), so the runner is kept deliberately small:
+   - it is a function invoked per request by a core internal route
+     (`POST /api/internal/chat/run-command`), **not** a daemon with its own state;
+   - `execFile`-style execution of the argv list: **no shell**, no expansion;
+   - `cwd` is the realpath of the allowlisted repo; the environment is a minimal
+     base (`PATH`, `HOME`, `LANG`) plus **only** the allowlist entry's `env`;
+   - timeout default 120 s, entry override up to a maximum of 900 s;
+   - stdout and stderr each capped at 20000 characters;
+   - one run at a time (a lock), so two confirmed commands never overlap;
+   - one append-only audit line per attempt (accepted or refused) in
+     `~/.local/state/agent-manager/chat-command-audit.jsonl`;
+   - it refuses everything while the `.chat-write-tools-disabled` kill-switch file
+     is present, and it re-validates the allowlist and the persisted confirmation
+     itself rather than trusting the plugin.
 
 Both options keep `queue_reviewed_task` **as the only chat→core hand-off for
 code changes**: the new channel executes operational commands only, and this
@@ -213,17 +226,49 @@ must live in the core, never be a plugin-side bypass of the mounts.**
    surface is an exact-argv allowlist plus a persisted owner confirmation — it
    is precisely the trade the owner is making by approving this.
 
-## Decision questions for the owner
+## Decisions (2026-10-25)
 
-1. **Section 4: which execution option?** (a) new core internal API route with
-   per-run sandbox where exactly one repo is writable, or (b) a restricted
-   host-side runner?
-2. **Section 1: where do allowlists live?** Per-repo `.chat-allowlist` files
-   (default proposed) or a single config in the chat plugin's storage dir?
-3. **Scope confirmation:** is "exact argv, single repo, persisted confirm,
-   allowlist-only, never a write-tool unlock" the boundary the owner wants — or
-   should this design decision be declined and Chat stay read-only?
+1. **Section 4, execution:** option 2, the restricted host-side runner.
+2. **Section 1, allowlist location:** one central config in the chat plugin's
+   storage dir.
+3. **Scope:** exact argv, single repo, persisted confirm, allowlist-only, never a
+   write-tool unlock: the first proposal as written.
 
-*This document is a design decision awaiting owner approval. Until the owner
-answers the questions above, nothing described in it is approved or
-implemented.*
+## 6. Implementation contract and pieces
+
+**Contract** (every piece uses exactly these names):
+
+- **Allowlist file:** `AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH` or
+  `~/.local/state/agent-manager-chat-plugin/command-allowlist.json`, mode 0600,
+  JSON `{"commands": [{"repo": "/abs/repo", "argv": ["python3", "-m", "inventory",
+  "sales", "email"], "env": {"PYTHONPATH": "src:/media/model-cache/github/crosslister/src"},
+  "timeoutSeconds": 300}]}`. A match needs the repo realpath equal and the argv
+  exactly equal. A missing, unreadable or malformed file is an empty allowlist.
+- **Proposal tool:** chat tool `propose_command({repo, argv, why})`, defined in
+  core `src/local-tool-client.js` `CHAT_TOOLS`. It validates against the allowlist
+  file and returns `{ proposalId, status: 'awaiting-confirmation' }` or a refusal
+  naming why. Accepted proposals ride on the turn's final event as
+  `commandProposals: [{ proposalId, repo, argv, why }]`.
+- **Transcript fields** (on the assistant entry): `commandProposals: [{ proposalId,
+  repo, argv, why, status: 'pending' | 'confirmed' | 'denied' | 'ran', decidedAt }]`
+  and `commandExecutions: [{ proposalId, argv, repo, confirmedAt, exitCode, ok,
+  stdout, stderr, durationMs }]` (stdout and stderr scrubbed and clipped with
+  `tool_log.py`'s rules).
+- **Plugin route:** `POST api/chat/<session id>/command/<proposalId>/<confirm|deny>`
+  persists the decision (`decidedAt`) and, for confirm, calls core
+  `POST /api/internal/chat/run-command` with `{ proposalId, sessionId, repo, argv,
+  confirmedAt }`. Nothing runs before a persisted confirm.
+- **Core runner reply:** `{ ok, exitCode, stdout, stderr, durationMs }` or
+  `{ ok: false, refused: '<reason>' }`. Limits are those of section 4.
+- **Model context:** a one-line summary of each execution is added to the model's
+  context on the next turn.
+
+**Pieces, each its own task, in order:**
+
+1. Core: the runner module and the internal route.
+2. Core: the `propose_command` chat tool.
+3. Plugin: storage of proposals and executions, the confirm/deny route, the call
+   to the core runner.
+4. Plugin UI: the proposal card with Confirm and Deny, and the executions block.
+5. The owner enables the first allowlist entry (`python3 -m inventory sales
+   email`) after the feature is live.
