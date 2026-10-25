@@ -1069,6 +1069,13 @@ def record_turn_error(storage_dir: Path, session_id: str, error_text: str):
     return session
 
 
+def save_template(storage_dir: Path, session: dict, entry: int, index: int, key=None, text=None):
+    'Persists a template proposal for the given session and flushes the session to storage. Raises LookupError if the proposal does not exist.'
+    proposal = template_store.save_proposal(session, entry, index, key, text)
+    _write_session(storage_dir, session)
+    return proposal
+
+
 def set_reserved(storage_dir: Path, session_id: str, reserved: bool):
     """Just the persisted flag -- app.py's reservation registry owns actually
     acquiring/releasing the lock and the idle-timeout watchdog; this only keeps the
