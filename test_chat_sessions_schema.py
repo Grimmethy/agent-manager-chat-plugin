@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import chat_sessions  # noqa: E402
 
 FIXTURE = Path(__file__).parent / "test_fixtures" / "chat_sessions" / "legacy_session.json"
-V2_KEYS = ("schemaVersion", "account", "swaps", "summary")
+V2_KEYS = ("schemaVersion", "account", "swaps", "summary", "chosen_project")
 # The 14 keys _new_session() produced on master (before schema v2) -- the fixture's
 # exact top-level key set.
 MASTER_KEYS = (
@@ -51,7 +51,8 @@ class MigrateSessionTest(unittest.TestCase):
         self.assertIsNone(out["account"])
         self.assertEqual(out["swaps"], [])
         self.assertIsNone(out["summary"])
-        # Every original key and value intact; exactly the four fields added, nothing
+        self.assertIsNone(out["chosen_project"])
+        # Every original key and value intact; exactly the five fields added, nothing
         # else changed or dropped (transcript untouched, unknown keys would be kept too).
         self.assertEqual(set(out), set(original) | set(V2_KEYS))
         for k, v in original.items():
@@ -70,6 +71,7 @@ class MigrateSessionTest(unittest.TestCase):
         self.assertIsNone(s["account"])
         self.assertEqual(s["swaps"], [])
         self.assertIsNone(s["summary"])
+        self.assertIsNone(s["chosen_project"])
         for k in MASTER_KEYS:
             self.assertIn(k, s)
 
