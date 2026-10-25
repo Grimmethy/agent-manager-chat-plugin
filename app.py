@@ -164,13 +164,32 @@ def _chat_roots() -> list:
     in-tree version's own bare-PACKAGE_ROOT fallback had, so a Chat turn still has
     SOMETHING to root itself at rather than erroring outright."""
     from internal_api_client import InternalApiError, get_roots
+    roots = None
     try:
-        roots = get_roots()
-        if roots:
-            return roots
+        roots = get_roots() or None
     except InternalApiError:
         pass
-    return [os.path.realpath(str(CORE_REPO_ROOT))]
+    if roots is None:
+        roots = [os.path.realpath(str(CORE_REPO_ROOT))]
+    return _with_extra_roots(roots)
+
+
+def _with_extra_roots(roots: list) -> list:
+    """`roots` plus the repos named in AGENT_MANAGER_CHAT_EXTRA_ROOTS (paths separated by os.pathsep, e.g. the crosslister
+    repo, which is neither a plugin nor a project and so is not in core's list). Appended after the core roots, so roots[0]
+    stays the primary; an entry that is not an existing directory, or is already present (compared by realpath), is skipped.
+    Unset or empty returns `roots` unchanged."""
+    extra = [e.strip() for e in os.environ.get("AGENT_MANAGER_CHAT_EXTRA_ROOTS", "").split(os.pathsep) if e.strip()]
+    if not extra:
+        return roots
+    out = list(roots)
+    seen = {os.path.realpath(r) for r in out}
+    for e in extra:
+        real = os.path.realpath(e)
+        if os.path.isdir(real) and real not in seen:
+            out.append(real)
+            seen.add(real)
+    return out
 
 
 def _discuss_provider_args(body: dict = None):
