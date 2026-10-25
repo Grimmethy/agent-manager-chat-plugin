@@ -1401,3 +1401,16 @@ Change the `reserve()` signature to `def reserve(reservation_id: str, model: str
 
 Benefits:
 The routing layer becomes provider-agnostic: it depends only on `internal_api_client` and shared app helpers, not on a specific model-client module. Swapping or adding a local model provider later requires no changes to route files. The env-var read is co-located with the HTTP call that actually consumes the value, making the dependency explicit in one place rather than scattered across three handlers.
+
+### AC-105 · Provider-Specific Reservation Logic in Generic Routing
+Strength: Strong
+Files: test_chat_routes_swap.py, internal_api_client.py
+
+Problem:
+The `POST /api/chat/<id>/swap` endpoint embeds provider-specific reservation-release logic directly in the generic routing layer. The test `test_leaving_local_while_reserved_releases_the_reservation` in `test_chat_routes_swap.py` asserts that the swap route calls `internal_api_client.reserve(SID, ollama_client.MODEL, False)` when a session leaves the `local` provider. This means the route must import `ollama_client` solely to obtain the model name and must know the positional shape of the `reserve` API, tightly coupling a provider-agnostic routing endpoint to one specific provider's client module.
+
+Solution:
+Move the model-name resolution inside `internal_api_client.reserve()` itself. The method should accept the session ID and a boolean flag (e.g., `reserve(SID, release=True)`) and resolve the model name internally via `os.environ.get("LOCAL_MODEL")`, which is already the canonical source for the local model identifier. The swap route then calls `internal_api_client.reserve(SID, release=True)` and no longer imports `ollama_client` or references `ollama_client.MODEL` at all. This keeps the fix within a module that is already part of the current architecture (`internal_api_client.py`) and aligns with the resolution strategy already outlined in AC-41/AC-42.
+
+Benefits:
+The routing layer no longer depends on a specific provider's client module or its exported constants. Adding a new provider that manages its own reservations (e.g., a GPU pool or a rate-limited remote service) requires no changes to the swap route—only a new branch inside `internal_api_client.reserve()` or a provider-specific override. The "what model to release" knowledge is co-located with the reservation mechanism that actually uses it, improving locality, testability, and long-term maintainability.
