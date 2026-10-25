@@ -99,3 +99,26 @@ test('touch (pointer: coarse) gets 44px touch targets and a 20px chime checkbox'
   assert.match(checkbox, /width\s*:\s*20px/);
   assert.match(checkbox, /height\s*:\s*20px/);
 });
+
+test('.multi-chat-flex is a horizontal snap strip, not a wrapping vertical grid', () => {
+  assert.ok(declares('.multi-chat-flex', 'flex-wrap'), 'missing flex-wrap');
+  assert.ok(declares('.multi-chat-flex', 'overflow-x'), 'missing overflow-x');
+  assert.ok(declares('.multi-chat-flex', 'scroll-snap-type'), 'missing scroll-snap-type');
+  const block = blocksFor('.multi-chat-flex').join(' ');
+  assert.match(block, /flex-wrap\s*:\s*nowrap/i, 'flex-wrap must be nowrap');
+  assert.match(block, /overflow-x\s*:\s*auto/i, 'overflow-x must be auto');
+  assert.match(block, /scroll-snap-type\s*:\s*x\s+mandatory/i, 'scroll-snap-type must be "x mandatory"');
+});
+
+test('.multi-chat-flex sets --strip-visible from the width with the stripVisibleCount breakpoints', () => {
+  const block = blocksFor('.multi-chat-flex').join(' ');
+  assert.match(block, /(^|[;\s])--strip-visible\s*:\s*2/i, 'default of two visible panes');
+  assert.match(css, /@media\s*\(\s*max-width\s*:\s*759px\s*\)\s*\{\s*\.multi-chat-flex\s*\{\s*--strip-visible\s*:\s*1/i, 'one pane under 760px');
+  assert.match(css, /@media\s*\(\s*min-width\s*:\s*1400px\s*\)\s*\{\s*\.multi-chat-flex\s*\{\s*--strip-visible\s*:\s*3/i, 'three panes from 1400px');
+});
+
+test('.multi-chat-pane snaps to the start of the strip', () => {
+  assert.ok(declares('.multi-chat-pane', 'scroll-snap-align'), 'missing scroll-snap-align');
+  const block = blocksFor('.multi-chat-pane').join(' ');
+  assert.match(block, /scroll-snap-align\s*:\s*start/i, 'scroll-snap-align must be start');
+});
