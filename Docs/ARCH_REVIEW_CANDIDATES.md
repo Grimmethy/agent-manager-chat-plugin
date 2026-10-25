@@ -1266,3 +1266,16 @@ The path is resolved relative to the **core** repo root, which is a runtime valu
 ### Summary
 
 Both ACs in the original draft were based on misreadings of the provided source. After correction, **no refactoring action is recommended** for the two files under review. The private `_is_plain_row` helper and the `app.CORE_REPO_ROOT` import are each appropriate to their context, and the tests / consumers interact with them in ways that do not create the coupling or dependency problems the draft described.
+
+### AC-96 · `providerLabel` name collision between sibling view helpers
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` export a function named `providerLabel`, yet the two implementations differ in both parameter shape (`row` vs. `session`) and output format (sessions-view produces `"Claude · <model>"` while swap-view produces `"Claude · <model> · <account>"`). Because they live in the same directory, share the same "DOM-free helpers consumed by chat.js" contract, and cross-reference each other in comments, a reader of the single consumer (`chat.js`) must maintain a manual import alias to disambiguate the two, and every call-site becomes a small puzzle: which `providerLabel` is in scope here, and does this code path need the short form or the account-aware form? The shared name also creates a maintenance hazard—any future edit applied to one function (e.g., adding a new field to the label) can be accidentally mirrored onto the other simply because they look like the same helper.
+
+Solution:
+Rename one of the two exports to make the distinction self-evident at the import and call-site level. The natural choice is to rename the swap-view export to `swapProviderLabel` (or, if the sessions-view form is considered the "default", rename that one to `rowProviderLabel`). Update the single import in `chat.js` to use the new name directly, removing the alias. Add a one-line comment in each file noting the sibling's export name so the pair remains discoverable without a cross-file search.
+
+Benefits:
+The import in `chat.js` becomes unambiguous and self-documenting—no alias, no mental bookkeeping about which `providerLabel` is which. New contributors reading either file immediately see a name that encodes the context (swap vs. session row), reducing the chance that a label-format change intended for one view is accidentally applied to the other. The cross-referencing comments in the two files become less load-bearing, since the names themselves now carry the disambiguation.
