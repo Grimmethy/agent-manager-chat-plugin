@@ -1072,7 +1072,12 @@ def record_turn_error(storage_dir: Path, session_id: str, error_text: str):
 def set_reserved(storage_dir: Path, session_id: str, reserved: bool):
     """Just the persisted flag -- app.py's reservation registry owns actually
     acquiring/releasing the lock and the idle-timeout watchdog; this only keeps the
-    dashboard's own display of "is this session reserved" in sync with that."""
+    dashboard's own display of "is this session reserved" in sync with that.
+
+    Idempotent: calling this more than once with the same `reserved` value is a safe no-op; the final persisted state is identical however many
+    times it is invoked, so a caller may retry it after a partial failure (e.g. the AC-4 divergence: the server-side reservation is live but the
+    local flag was never written). Atomic: persistence goes through _write_session (tempfile + os.replace), so a concurrent reader never observes
+    a half-written session file. Returns None, writing nothing, for an unknown session."""
     session = _read_session(storage_dir, session_id)
     if not session:
         return None
