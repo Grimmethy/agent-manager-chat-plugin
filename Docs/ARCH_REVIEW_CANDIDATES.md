@@ -1188,3 +1188,29 @@ Extract the shared scaffolding into a small helper, e.g. `filterByFields(rows, q
 
 Benefits:
 Adding a new searchable field to either filter is a one-element change to an array literal rather than a copy of the helper body. The two filter functions can no longer silently diverge in normalisation or short-circuit behaviour, and the shared helper has a single, testable location for edge-case logic (unicode normalisation, case-folding, etc.).
+
+### AC-90 · Inconsistent error-propagation contract between streaming and non-streaming internal-API calls
+Strength: Strong
+Files: internal_api_client.py, app.py
+
+Problem:
+The non-streaming functions in `internal_api_client.py` (`get_roots`, `preempt`, `reserve`) all raise `InternalApiError` on failure, and `app.py` is explicitly designed to catch that exception and return a clean HTTP 502. The streaming function `stream_local_turn`, however, catches `requests.RequestException` and yields a JSON `{"type": "error", ...}` object into the response body instead of raising. This creates a split-brain error contract: a connection failure before the stream begins is reported through the data stream (yielded payload) rather than through the exception path that every other function in the module uses. As a result, `app.py`'s `except InternalApiError` handler never fires for an initial-connection failure in the streaming path, and the client receives a 200 OK response whose body contains an error object rather than the expected 502.
+
+Solution:
+Modify `stream_local_turn` in `internal_api_client.py` so that if the initial `requests.post` call or the subsequent `raise_for_status()` fails (i.e., before the generator begins yielding any data), it raises `InternalApiError` just like the non-streaming functions. Only when a failure occurs *during* iteration of `r.iter_lines()` (mid-stream, after the response headers have already been sent) should the function yield the `{"type": "error", ...}` JSON object, since at that point the HTTP status line can no longer be changed. This preserves the ability to report a dropped stream to the client while aligning the "server unreachable" case with the rest of the module.
+
+Benefits:
+Callers in `app.py` no longer need to inspect yielded data to determine whether the initial connection failed; the existing `except InternalApiError` block correctly catches initial streaming failures and returns a consistent HTTP 502. The error-handling surface is reduced to two well-defined cases—exception for "cannot reach the provider" and in-stream error object for "provider connection dropped mid-response"—making the contract easier to reason about, test, and document.
+
+### AC-91 · Redundant `LocalToolClientError` alias obscures the true error source
+Strength: Worth exploring
+Files: local_tool_client.py, app.py, internal_api_client.py
+
+Problem:
+`local_tool_client.py` imports `InternalApiError` and re-exports it under the name `LocalToolClientError`. `app.py` then imports `LocalToolClientError` from `local_tool_client` and catches it as though it were a distinct exception type. Because the alias is literally the same class object as `InternalApiError`, and `internal_api_client` is the sole origin of local-provider errors, the indirection adds a second name for the same concept without adding any wrapping, context, or differentiation. It also makes the dependency graph misleading: a reader of `app.py` sees a dependency on `local_tool_client` for error handling, when the actual source of truth is `internal_api_client`.
+
+Solution:
+Remove the `as LocalToolClientError` alias in `local_tool_client.py` (or, if external consumers might import the old name, keep it only as a deprecated re-export with a comment). Update `app.py` to import `InternalApiError` directly from `internal_api_client` and catch that name in `_call_chat` and any other relevant handlers. This makes the import graph reflect the actual data flow: `app.py` depends on `internal_api_client` for local-provider error types.
+
+Benefits:
+Eliminates a redundant class name that forces readers to mentally resolve the alias to understand which errors are actually being caught. Clarifies the dependency graph so that `app.py`'s imports directly name the module that defines the error. Removes the risk of future divergence if `local_tool_client` were ever refactored to wrap or re-raise errors differently, at which point the alias would silently change semantics for `app.py`'s catch blocks.
