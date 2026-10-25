@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  truncateTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
+  truncateTitle, fullTitle, statusWord, secondsSince, formatDuration, timerLabel, providerLabel,
   orderSessions, nextSelectionAfterClose, formatRow,
   formatTokens, contextLabel, terminalTimer, STALE_BUSY_SECS, formatTerminalRow, orderTerminalSessions, applyTerminalEvent,
+  filterRows, filterChats, emptyLabel, jumpTarget,
 } from '../static/sessions-view.js';
+import { rowKey, hostsOf, filterByHost } from '../static/sessions-view.js';
+import { skippedLabel } from '../static/sessions-view.js';
 
 const NOW = Date.parse('2026-10-19T12:00:00Z');
 
@@ -17,6 +20,44 @@ test('truncateTitle', () => {
   const out = truncateTitle(long, 10);
   assert.equal(out.length, 10);
   assert.ok(out.endsWith('…'));
+});
+
+test('fullTitle: 90-character title survives intact', () => {
+  const t90 = 'x'.repeat(90);
+  assert.equal(t90.length, 90);
+  assert.equal(fullTitle(t90), t90);
+});
+
+test('fullTitle: 300-character title is cut to 200 characters ending in …', () => {
+  const t300 = 'z'.repeat(300);
+  const out = fullTitle(t300);
+  assert.equal(out.length, 201); // 200 kept chars + the ellipsis
+  assert.ok(out.endsWith('…'));
+  assert.equal(out, t300.slice(0, 200) + '…');
+});
+
+test('fullTitle: runs of whitespace and newlines collapse to single spaces', () => {
+  assert.equal(fullTitle('  hello\n\n  world\t\ttab '), 'hello world tab');
+  assert.equal(fullTitle('\n'), 'New chat');
+});
+
+test('fullTitle: empty and null titles give New chat', () => {
+  assert.equal(fullTitle(''), 'New chat');
+  assert.equal(fullTitle(null), 'New chat');
+});
+
+test('formatRow title: full titles survive, only beyond 200 is cut, empty is New chat', () => {
+  const base = { id: 'x', provider: 'local', busy: false, turnCount: 0 };
+  const t90 = 'x'.repeat(90);
+  assert.equal(formatRow({ ...base, title: t90 }, NOW).title, t90);
+  const t300 = 'y'.repeat(300);
+  const cut = formatRow({ ...base, title: t300 }, NOW).title;
+  assert.equal(cut.length, 201);
+  assert.ok(cut.endsWith('…'));
+  assert.equal(cut, t300.slice(0, 200) + '…');
+  assert.equal(formatRow({ ...base, title: '  a\n  b\n' }, NOW).title, 'a b');
+  assert.equal(formatRow({ ...base, title: '' }, NOW).title, 'New chat');
+  assert.equal(formatRow({ ...base, title: null }, NOW).title, 'New chat');
 });
 
 test('statusWord', () => {
@@ -141,4 +182,197 @@ test('busy with no transcript activity for a long time is flagged, not timed', (
   assert.equal(terminalTimer({ status: 'idle', statusSince: '2026-10-19T00:00:00Z',
     lastActivityAt: '2026-10-19T00:00:00Z' }, NOW), 'idle 12h'); // only busy rows are flagged
   assert.equal(STALE_BUSY_SECS, 3600);
+});
+
+test('host-aware events: the same session id on two hosts coexists', () => {
+  let rows = applyTerminalEvent([], 'session.updated', { id: 'a', host: 'h1', status: 'idle' });
+  rows = applyTerminalEvent(rows, 'session.updated', { id: 'a', host: 'h2', status: 'busy' });
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map(rowKey).sort(), ['h1/a', 'h2/a']);
+});
+
+test('host-aware events: session.removed with a host removes only that host\'s row', () => {
+  const rows = [{ id: 'a', host: 'h1' }, { id: 'a', host: 'h2' }, { id: 'b', host: 'h1' }];
+  const next = applyTerminalEvent(rows, 'session.removed', { id: 'a', host: 'h1' });
+  assert.deepEqual(next, [{ id: 'a', host: 'h2' }, { id: 'b', host: 'h1' }]);
+  assert.equal(rows.length, 3, 'the input is not mutated');
+});
+
+test('host-aware events: session.updated with a host replaces only that host\'s row', () => {
+  const rows = [{ id: 'a', host: 'h1', status: 'idle' }, { id: 'a', host: 'h2', status: 'idle' }];
+  const next = applyTerminalEvent(rows, 'session.updated', { id: 'a', host: 'h2', status: 'busy' });
+  assert.deepEqual(next, [{ id: 'a', host: 'h1', status: 'idle' }, { id: 'a', host: 'h2', status: 'busy' }]);
+});
+
+test('legacy events with no host behave exactly as before (id-only matching)', () => {
+  let rows = applyTerminalEvent([], 'session.updated', { id: 'a', status: 'idle' });
+  rows = applyTerminalEvent(rows, 'session.updated', { id: 'a', status: 'busy' });
+  assert.deepEqual(rows, [{ id: 'a', status: 'busy' }]);
+  assert.deepEqual(applyTerminalEvent(rows, 'session.removed', { id: 'a' }), []);
+  // a hostless event cannot say which host it means, so it matches the id on every host
+  assert.deepEqual(applyTerminalEvent([{ id: 'a', host: 'h1' }, { id: 'a', host: 'h2' }, { id: 'b', host: 'h1' }], 'session.removed', { id: 'a' }), [{ id: 'b', host: 'h1' }]);
+});
+
+test('formatTerminalRow carries host and a host-qualified key', () => {
+  const withHost = formatTerminalRow({ id: 'a', host: 'h1', status: 'idle' }, NOW);
+  assert.equal(withHost.host, 'h1');
+  assert.equal(withHost.key, 'h1/a');
+  const legacy = formatTerminalRow({ id: 'a', status: 'idle' }, NOW);
+  assert.equal(legacy.host, '');
+  assert.equal(legacy.key, '/a');
+  assert.equal(rowKey({ id: 'a', host: 'h1' }), 'h1/a');
+});
+
+test('orderTerminalSessions breaks status ties by host, then name', () => {
+  const rows = [
+    { id: '1', host: 'hB', name: 'a', status: 'idle' },
+    { id: '2', host: 'hA', name: 'z', status: 'idle' },
+    { id: '3', host: 'hA', name: 'b', status: 'idle' },
+    { id: '4', host: 'hZ', name: 'a', status: 'waiting' },
+  ];
+  assert.deepEqual(orderTerminalSessions(rows).map((r) => r.id), ['4', '3', '2', '1']);
+});
+
+test('hostsOf returns the sorted, unique, non-empty hosts', () => {
+  assert.deepEqual(hostsOf([{ host: 'b' }, { host: 'a' }, { host: 'b' }, {}, { host: '' }]), ['a', 'b']);
+  assert.deepEqual(hostsOf([]), []);
+});
+
+test('filterByHost keeps one host\'s rows, and everything when no host is given', () => {
+  const rows = [{ id: '1', host: 'h1' }, { id: '2', host: 'h2' }, { id: '3' }];
+  assert.deepEqual(filterByHost(rows, 'h1').map((r) => r.id), ['1']);
+  assert.deepEqual(filterByHost(rows, '').map((r) => r.id), ['1', '2', '3']);
+  assert.equal(filterByHost(rows, null), rows);
+  assert.equal(filterByHost(rows, undefined), rows);
+  assert.deepEqual(filterByHost(rows, 'nobody'), []);
+});
+
+test('skippedLabel names each skipped host with its reason, never [object Object]', () => {
+  assert.equal(skippedLabel([{ host: 'grimm', reason: 'ConnectionError' }]), 'grimm (ConnectionError)');
+  assert.equal(skippedLabel([{ host: 'grimm', reason: 'Timeout' }, { host: 'wok', reason: 'unexpected shape' }]), 'grimm (Timeout), wok (unexpected shape)');
+  assert.ok(!skippedLabel([{ host: 'grimm', reason: 'x' }]).includes('[object Object]'));
+});
+
+test('skippedLabel accepts the older bare host name, skips unusable entries, and gives an empty string for nothing', () => {
+  assert.equal(skippedLabel(['grimm', { host: 'wok' }]), 'grimm, wok');
+  assert.equal(skippedLabel([{ host: '', reason: 'x' }, {}, null, 7, '']), '');
+  assert.equal(skippedLabel([]), '');
+  assert.equal(skippedLabel(undefined), '');
+  assert.equal(skippedLabel('grimm'), '');
+  assert.equal(skippedLabel([{ host: 'wok', reason: '' }]), 'wok');
+});
+
+test('skippedLabel returns raw text (the caller escapes it)', () => {
+  assert.equal(skippedLabel([{ host: '<b>', reason: 'x&y' }]), '<b> (x&y)');
+});
+
+
+const FILTER_ROWS = [
+  { id: 'a', name: 'Build Server', cwd: '/home/wok/agent-manager', host: 'wok' },
+  { id: 'b', name: 'docs', cwd: '/srv/Notes', host: 'grimm' },
+  { id: 'c', cwd: '/tmp/scratch' },
+  { id: 'd', name: 'other', cwd: null, host: null },
+];
+
+test('filterRows matches name, cwd and host', () => {
+  assert.deepEqual(filterRows(FILTER_ROWS, 'server').map((r) => r.id), ['a']);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'agent-manager').map((r) => r.id), ['a']);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'grimm').map((r) => r.id), ['b']);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'scratch').map((r) => r.id), ['c']);
+});
+
+test('filterRows is case-insensitive and trims the query', () => {
+  assert.deepEqual(filterRows(FILTER_ROWS, 'BUILD').map((r) => r.id), ['a']);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'notes').map((r) => r.id), ['b']);
+  assert.deepEqual(filterRows(FILTER_ROWS, '  grimm  ').map((r) => r.id), ['b']);
+});
+
+test('filterRows with an empty, whitespace or missing query returns every row in order', () => {
+  assert.equal(filterRows(FILTER_ROWS, ''), FILTER_ROWS);
+  assert.equal(filterRows(FILTER_ROWS, '   '), FILTER_ROWS);
+  assert.equal(filterRows(FILTER_ROWS, null), FILTER_ROWS);
+  assert.equal(filterRows(FILTER_ROWS, undefined), FILTER_ROWS);
+});
+
+test('filterRows with no match gives [], treats missing fields as empty, and does not match the string "null"', () => {
+  assert.deepEqual(filterRows(FILTER_ROWS, 'zzz'), []);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'null'), []);
+  assert.deepEqual(filterRows(FILTER_ROWS, 'undefined'), []);
+});
+
+test('filterRows skips null entries instead of throwing', () => {
+  assert.deepEqual(filterRows([null, { id: 'k', name: 'keep' }, undefined], 'keep').map((r) => r.id), ['k']);
+});
+
+test('filterRows does not mutate its input and keeps the order', () => {
+  const rows = [{ id: 'x', name: 'm2' }, { id: 'y', name: 'm1' }, { id: 'z', name: 'other' }];
+  const before = JSON.stringify(rows);
+  assert.deepEqual(filterRows(rows, 'm').map((r) => r.id), ['x', 'y']);
+  assert.equal(JSON.stringify(rows), before);
+});
+
+test('jumpTarget returns the key of the nth row of the order given', () => {
+  const rows = ['r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9', 'r10'].map((id) => ({ id }));
+  assert.equal(jumpTarget(rows, 1), 'r1');
+  assert.equal(jumpTarget(rows, 9), 'r9');
+  const reversed = [...rows].reverse();
+  assert.equal(jumpTarget(reversed, 1), 'r10');
+});
+
+test('jumpTarget is null for n outside 1-9, non-integers and past the end', () => {
+  const rows = Array.from({ length: 12 }, (_, i) => ({ id: 'r' + (i + 1) }));
+  assert.equal(jumpTarget(rows, 10), null);
+  assert.equal(jumpTarget(rows, 0), null);
+  assert.equal(jumpTarget(rows, -1), null);
+  assert.equal(jumpTarget(rows, 1.5), null);
+  assert.equal(jumpTarget(rows, '2'), null);
+  assert.equal(jumpTarget(rows, NaN), null);
+  assert.equal(jumpTarget([{ id: 'only' }], 2), null);
+  assert.equal(jumpTarget([], 1), null);
+  assert.equal(jumpTarget(null, 1), null);
+});
+
+test('jumpTarget prefixes the host when the row has one and not otherwise', () => {
+  const rows = [{ id: 'a', host: 'wok' }, { id: 'b', host: '' }, { id: 'c' }, { id: 'd', host: null }];
+  assert.equal(jumpTarget(rows, 1), 'wok/a');
+  assert.equal(jumpTarget(rows, 2), 'b');
+  assert.equal(jumpTarget(rows, 3), 'c');
+  assert.equal(jumpTarget(rows, 4), 'd');
+});
+
+test('emptyLabel names the hosts that were asked', () => {
+  assert.equal(emptyLabel(['default']), 'No terminal sessions on default');
+  assert.equal(emptyLabel(['wok', 'grimm']), 'No terminal sessions on wok, grimm');
+});
+
+test('emptyLabel falls back to the plain text for no, bad or blank host lists', () => {
+  assert.equal(emptyLabel([]), 'No terminal sessions');
+  assert.equal(emptyLabel(undefined), 'No terminal sessions');
+  assert.equal(emptyLabel(null), 'No terminal sessions');
+  assert.equal(emptyLabel('wok'), 'No terminal sessions');
+  assert.equal(emptyLabel(['', null, 7, 'wok']), 'No terminal sessions on wok');
+});
+
+const CHAT_ROWS = [
+  { id: 'c1', title: 'Task: author a new selectable PromptForge scene', provider: 'local', model: 'qwen3' },
+  { id: 'c2', title: 'New chat', provider: 'claude', model: 'claude-sonnet-5-5' },
+  { id: 'c3', title: null, provider: 'local', model: null },
+];
+
+test('filterChats matches the full title and the provider/model label, case-insensitively', () => {
+  assert.deepEqual(filterChats(CHAT_ROWS, 'PROMPTFORGE').map((r) => r.id), ['c1']);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'sonnet').map((r) => r.id), ['c2']);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'claude').map((r) => r.id), ['c2']);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'new chat').map((r) => r.id), ['c2']);
+});
+
+test('filterChats: an empty or whitespace query returns the rows as given; no match returns []', () => {
+  assert.equal(filterChats(CHAT_ROWS, ''), CHAT_ROWS);
+  assert.equal(filterChats(CHAT_ROWS, '   '), CHAT_ROWS);
+  assert.equal(filterChats(CHAT_ROWS, null), CHAT_ROWS);
+  assert.deepEqual(filterChats(CHAT_ROWS, 'zzzz'), []);
+});
+
+test('filterChats tolerates null fields and null rows', () => {
+  assert.deepEqual(filterChats([null, ...CHAT_ROWS], 'local').map((r) => r.id), ['c1', 'c3']);
 });

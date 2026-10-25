@@ -3,11 +3,21 @@
 // `node --test` (test/sessions-view.test.mjs): the current time is always injected.
 
 const TITLE_MAX = 40;
+const ROW_TITLE_MAX = 200;
 
 export function truncateTitle(title, max = TITLE_MAX) {
   const text = String(title == null ? '' : title).replace(/\s+/g, ' ').trim();
   if (!text) return 'New chat';
   return text.length <= max ? text : text.slice(0, max - 1) + '…';
+}
+
+// Row/button title: the whitespace-normalised FULL title, cut only beyond
+// ROW_TITLE_MAX (the row and the button clip themselves visually, so a short
+// JS cut just hid text the reader could see). 'New chat' when there is none.
+export function fullTitle(raw) {
+  const text = String(raw == null ? '' : raw).replace(/\s+/g, ' ').trim();
+  if (!text) return 'New chat';
+  return text.length <= ROW_TITLE_MAX ? text : text.slice(0, ROW_TITLE_MAX) + '…';
 }
 
 export function statusWord(row) {
@@ -67,7 +77,7 @@ export function nextSelectionAfterClose(rows, closedId) {
 export function formatRow(row, now) {
   return {
     id: row.id,
-    title: truncateTitle(row.title),
+    title: fullTitle(row.title),
     fullTitle: row.title || '',
     provider: providerLabel(row),
     status: statusWord(row),
@@ -125,6 +135,10 @@ function lastSegment(path) {
   return parts.length ? parts[parts.length - 1] : '';
 }
 
+export function rowKey(row) {
+  return (row.host || '') + '/' + row.id;
+}
+
 export function formatTerminalRow(row, now) {
   const status = Object.hasOwn(STATUS_WORDS, row.status) ? row.status : 'idle';
   return {
@@ -138,25 +152,110 @@ export function formatTerminalRow(row, now) {
     step: row.step || '',
     context: contextLabel(row.contextTokens, row.contextWindow),
     model: row.model || '',
+    host: row.host || '',
+    key: rowKey(row),
   };
 }
 
-// Waiting (needs you) first, then busy, then idle; ties by title so the list does not jump.
+export function hostsOf(rows) {
+  const set = new Set();
+  for (const r of rows) {
+    const h = r.host || '';
+    if (h !== '') set.add(h);
+  }
+  return [...set].sort();
+}
+
+export function filterByHost(rows, host) {
+  if (host === '' || host == null) return rows;
+  return rows.filter((r) => (r.host || '') === host);
+}
+
+// Type-to-filter (HUB0010 8/10): case-insensitive substring match of the trimmed query
+// against a row's name, cwd and host (a missing field counts as empty). An empty or
+// whitespace-only query returns `rows` itself, in the order given.
+export function filterRows(rows, query) {
+  const needle = String(query == null ? '' : query).trim().toLowerCase();
+  if (needle === '') return rows;
+  const has = (value) => String(value == null ? '' : value).toLowerCase().includes(needle);
+  return rows.filter((r) => !!r && (has(r.name) || has(r.cwd) || has(r.host)));
+}
+
+// Same filter for the CHAT rows (the switcher box is labelled 'Filter chats'): case-insensitive substring of
+// the trimmed query against the full title and the provider/model label ('Local · qwen3'). An empty or
+// whitespace-only query returns `rows` itself; a null row or a missing field never throws.
+export function filterChats(rows, query) {
+  const needle = String(query == null ? '' : query).trim().toLowerCase();
+  if (needle === '') return rows;
+  const has = (value) => String(value == null ? '' : value).toLowerCase().includes(needle);
+  return rows.filter((r) => !!r && (has(r.title) || has(providerLabel(r)) || has(r.model)));
+}
+
+// Ctrl+1..9 jump: the key of the nth row of the order GIVEN (the caller passes the order on
+// screen), or null for n outside 1-9 or past the end. The key is host/id when the row has a
+// host and just the id otherwise: the same form the attention code uses for newly waiting
+// sessions (not rowKey, which always carries the slash).
+export function jumpTarget(rows, n) {
+  if (!Array.isArray(rows) || !Number.isInteger(n) || n < 1 || n > 9) return null;
+  const row = rows[n - 1];
+  if (!row) return null;
+  return row.host ? row.host + '/' + row.id : row.id;
+}
+
+// Waiting (needs you) first, then busy, then idle; ties by host, then title, so the list
+// does not jump.
 export function orderTerminalSessions(rows) {
   const rank = { waiting: 0, busy: 1, idle: 2 };
   const key = (r) => (Object.hasOwn(rank, r.status) ? rank[r.status] : 2);
-  return [...rows].sort((a, b) => key(a) - key(b) || String(a.name || '').localeCompare(String(b.name || '')));
+  return [...rows].sort((a, b) => {
+    const byStatus = key(a) - key(b);
+    if (byStatus !== 0) return byStatus;
+    const hostA = a.host || '';
+    const hostB = b.host || '';
+    if (hostA !== hostB) return hostA.localeCompare(hostB);
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
 }
 
 // SSE reducer: 'session.updated' upserts a full row, 'session.removed' drops it; anything
 // else (e.g. 'transcript.append') leaves the rows alone. Never mutates its input.
+// When data carries a non-empty host, match host-aware (rowKey) so a session id shared
+// across hosts stays distinct; otherwise fall back to id-only matching.
+function matchesRow(row, data) {
+  if (typeof data.host === 'string' && data.host !== '') return rowKey(row) === rowKey(data);
+  return row.id === data.id;
+}
+
 export function applyTerminalEvent(rows, event, data) {
   if (!data || typeof data.id !== 'string') return rows;
-  if (event === 'session.removed') return rows.filter((r) => r.id !== data.id);
+  if (event === 'session.removed') return rows.filter((r) => !matchesRow(r, data));
   if (event !== 'session.updated') return rows;
-  const i = rows.findIndex((r) => r.id === data.id);
+  const i = rows.findIndex((r) => matchesRow(r, data));
   if (i === -1) return [...rows, data];
   const next = [...rows];
   next[i] = data;
   return next;
 }
+
+// The empty-state line for the terminal group: names the host(s) that were asked (the `hosts` array GET api/chat/terminal-sessions
+// already returns) so an operator can tell the feature is pointed at the wrong machine. Plain text, the caller escapes it. Non-string and
+// blank entries are ignored; no usable host gives the plain 'No terminal sessions'. No URL or token ever reaches this.
+export function emptyLabel(hosts) {
+  const names = Array.isArray(hosts) ? hosts.filter((h) => typeof h === 'string' && h.trim() !== '') : [];
+  return names.length ? 'No terminal sessions on ' + names.join(', ') : 'No terminal sessions';
+}
+
+// The line naming the hosts whose session agent could not be reached. GET api/chat/terminal-sessions reports each as {host, reason} (agent_client.list_all);
+// an older shape, a bare host name, still works. Returns plain text ('grimm (ConnectionError), wok'), '' when nothing usable: the caller escapes it.
+export function skippedLabel(skipped) {
+  if (!Array.isArray(skipped)) return '';
+  const parts = [];
+  for (const s of skipped) {
+    if (typeof s === 'string' && s !== '') parts.push(s);
+    else if (s && typeof s === 'object' && typeof s.host === 'string' && s.host !== '') {
+      parts.push(typeof s.reason === 'string' && s.reason !== '' ? `${s.host} (${s.reason})` : s.host);
+    }
+  }
+  return parts.join(', ');
+}
+

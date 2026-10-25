@@ -51,6 +51,21 @@ def get_roots() -> list:
         raise InternalApiError(f"GET /api/internal/chat/roots failed: {e}") from e
 
 
+def run_command(argv: list, repo: str, proposal_id: str, confirmed_at: str, session_id: str = None) -> dict:
+    """Asks core to run ONE owner-confirmed, allowlisted command (POST /api/internal/chat/run-command; core re-validates everything itself). Returns core's reply:
+    { ok, exitCode, stdout, stderr, durationMs } for a command that ran, { ok: False, refused } for one that did not. A transport failure raises InternalApiError."""
+    try:
+        r = requests.post(
+            f"{CORE_DASHBOARD_URL}/api/internal/chat/run-command", headers=_headers(),
+            json={"argv": argv, "repo": repo, "proposalId": proposal_id, "confirmedAt": confirmed_at, "sessionId": session_id},
+            timeout=960,  # core caps a command at 900 s
+        )
+        r.raise_for_status()
+        return r.json()
+    except (requests.RequestException, ValueError) as e:
+        raise InternalApiError(f"POST /api/internal/chat/run-command failed: {e}") from e
+
+
 def preempt() -> list:
     try:
         r = requests.post(f"{CORE_DASHBOARD_URL}/api/internal/chat/preempt", headers=_headers(), timeout=20)
@@ -60,7 +75,9 @@ def preempt() -> list:
         raise InternalApiError(f"POST /api/internal/chat/preempt failed: {e}") from e
 
 
-def reserve(reservation_id: str, model: str, on: bool) -> dict:
+def reserve(reservation_id: str, model: str = None, on: bool = True) -> dict:
+    if model is None:
+        model = os.environ.get("LOCAL_MODEL")
     body = {"reservationId": reservation_id, "on": on}
     if model:
         body["model"] = model

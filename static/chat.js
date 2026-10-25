@@ -23,8 +23,35 @@
 // markdown they're asking to be formatted, and rendering it would just be a bigger HTML
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
-import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
-  formatTerminalRow, orderTerminalSessions, applyTerminalEvent } from "./sessions-view.js";
+import { fullTitle, orderSessions, nextSelectionAfterClose, formatRow,
+  formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel, filterRows, filterChats, emptyLabel, jumpTarget } from "./sessions-view.js";
+// HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
+// (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
+// split. providerLabel drives the header label, swapOptions builds the Swap menu,
+// swapBody builds each POST body, offerText renders the failed-turn one-click offer.
+import { providerLabel, swapOptions, offerText, swapBody } from "./swap-view.js";
+// The tools an assistant turn ran (stored by tool_log.py), shown as a collapsed list under its reply.
+import { renderToolsHtml } from "./tools-view.js";
+// Proposed write commands (Confirm / Deny) and the results of the ones that ran (command_runs.py stores them on the assistant entry).
+import { renderCommandsHtml } from "./commands-view.js";
+// Piece 2/10: the pure "needs you" attention logic (which rows newly became waiting,
+// how many are waiting) lives in attention-view.js (piece 1). This file only calls it
+// and applies the result to the DOM; keep the decision logic there.
+import { attentionStep, shouldChime } from "./attention-view.js";
+
+// HUB0010 3/10: the optional chime when another chat needs you. The decision (is any newly waiting key off screen, is the setting on) is
+// attention-view.js shouldChime; this file only stores the setting, finds what is on screen and plays one short beep. Every storage access is
+// guarded: the page works with storage blocked, the setting then just does not persist.
+const CHIME_KEY = 'chat-chime';
+const LAYOUT_KEY = 'chat-workspace-layout'; // multi-chat.js's saved layout
+
+function readChimeSetting() {
+  try { return window.localStorage.getItem(CHIME_KEY) === '1'; } catch (e) { return false; }
+}
+
+function writeChimeSetting(on) {
+  try { window.localStorage.setItem(CHIME_KEY, on ? '1' : '0'); } catch (e) { /* storage unavailable: the choice lasts until reload */ }
+}
 
 let toastHideTimer = null;
 
@@ -85,8 +112,10 @@ function renderMarkdown(text) {
 function chatRenderTranscript(transcript, session) {
   const assistantLabel = session && session.provider === 'claude' ? 'Claude' : 'Local';
   const rows = transcript.map((t, idx) => {
-    const roleLabel = t.role === 'assistant' ? assistantLabel : 'You';
-    const cls = (t.role === 'assistant' ? 'chat-msg-assistant' : 'chat-msg-user') + (t.error ? ' chat-msg-error' : '');
+    // 2026-10-25 (walkthrough): system rows are the "Project changed to: … (chosen)"
+    // notes the project selector appends to the transcript.
+    const roleLabel = t.role === 'assistant' ? assistantLabel : (t.role === 'system' ? 'System' : 'You');
+    const cls = (t.role === 'assistant' ? 'chat-msg-assistant' : (t.role === 'system' ? 'chat-msg-system' : 'chat-msg-user')) + (t.error ? ' chat-msg-error' : '');
     const isAssistant = t.role === 'assistant' && !t.error; // error notices stay literal text, not markdown (underscores in env var names get eaten)
     let body;
     if (t.timestamp) {
@@ -111,7 +140,7 @@ function chatRenderTranscript(transcript, session) {
         <textarea class="tpl-text" rows="6" ${done ? 'disabled' : ''}>${escapeHtml(tp.text)}</textarea>
         <button type="button" class="tpl-save" ${done ? 'disabled' : ''}>${done ? 'Saved' : 'Save template'}</button>${note}</div>`;
     }).join('');
-    return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div>${cards}</div>`;
+    return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div>${renderToolsHtml(t.tools)}${renderCommandsHtml(t)}${cards}</div>`;
   }).join('');
   return `<div class="field-label">Conversation</div><div class="chat-transcript">${rows}</div>`;
 }
@@ -119,6 +148,17 @@ function chatRenderTranscript(transcript, session) {
 
 function providerButtonLabel(provider) {
   return provider === 'claude' ? 'Claude' : 'Local';
+}
+
+// Menu / offer-button text for one swap option. swap-view.js's swapOptions entries
+// carry a `label`; the failed-turn offer options the route builds (HUB0008 8/11,
+// routes/chat.py) only carry {provider, account?}, so fall back to the account's
+// label, or 'Local model' -- the exact label swap-view.js uses for its own local entry.
+function swapOptionLabel(option) {
+  const o = option || {};
+  if (o.label) return o.label;
+  if (o.provider === 'local') return 'Local model';
+  return o.account || 'Claude';
 }
 
 // One chat: owns its session, its DOM (built inside `root`), its isSending guard and its
@@ -153,7 +193,13 @@ class ChatPane {
     this.root.innerHTML = `
   <div class="chat-header">
     <div class="chat-switcher-slot"></div>
+    <span class="chat-pane-title"></span>
     <span class="chat-provider-container"></span>
+    <span class="chat-provider-label" hidden></span>
+    <span class="chat-swap-slot">
+      <button type="button" class="secondary chat-swap-btn" hidden>Swap</button>
+      <div class="chat-swap-menu" hidden></div>
+    </span>
     <button type="button" class="secondary chat-reserve-btn" style="display:none" title="Hold the local model exclusively for this conversation until you turn it back off">Reserve</button>
     <button type="button" class="secondary chat-context-log-btn" title="View this session's context log -- a compacted, durable record built from CONTEXT-LOG: blocks at the end of each response, cross-referenced to any task discussed">Log</button>
   </div>
@@ -164,6 +210,10 @@ class ChatPane {
     </div>
     <div class="chat-context-log-content"></div>
   </div>
+  <div class="chat-project-row" hidden>
+    <span class="chat-project-label"></span>
+    <select class="chat-project-select" aria-label="Project this chat acts on"></select>
+  </div>
   <div class="chat-body">
     <div class="chat-transcript-host"></div>
     <textarea class="chat-input" rows="3" placeholder="Talk to the chat... (Enter to send, Shift+Enter for a new line)"></textarea>
@@ -173,12 +223,28 @@ class ChatPane {
   </div>`;
     const q = (sel) => this.root.querySelector(sel);
     this.switcherSlot = q('.chat-switcher-slot');
+    this.titleEl = q('.chat-pane-title');
     this.providerContainer = q('.chat-provider-container');
+    // HUB0008 10/11: header provider label + Swap menu (see syncSwapHeader below).
+    this.providerLabelEl = q('.chat-provider-label');
+    this.swapBtn = q('.chat-swap-btn');
+    this.swapMenu = q('.chat-swap-menu');
+    this.swapOpen = false;
+    this.swapChoices = [];      // current menu/offer entries; data-swap-index points into this
+    this.pendingSwapOffer = null; // failed-turn swapOffer (error event, piece 8), rendered by render()
     this.reserveBtn = q('.chat-reserve-btn');
     this.logBtn = q('.chat-context-log-btn');
     this.logPanel = q('.chat-context-log-panel');
     this.logContent = q('.chat-context-log-content');
     this.logClose = q('.chat-context-log-close');
+    // 2026-10-25 (walkthrough): the "Acting on: <project>" selector (see renderProjectRow).
+    this.projectRow = q('.chat-project-row');
+    this.projectLabelEl = q('.chat-project-label');
+    this.projectSelect = q('.chat-project-select');
+    this.projectOptions = [];
+    this.projectActiveLabel = null;
+    this.projectSelect.addEventListener('change', () => this.changeProject(this.projectSelect.value));
+    this.loadProjects();
     this.transcriptEl = q('.chat-transcript-host');
     this.input = q('.chat-input');
     this.sendBtn = q('.chat-send-btn');
@@ -199,6 +265,12 @@ class ChatPane {
       this.syncProviderToggle();
       await this.startNew();
     };
+
+    // HUB0008 10/11: Swap menu button; outside clicks and Escape close it (same
+    // pattern as the session switcher's menu).
+    this.swapBtn.onclick = (e) => { e.stopPropagation(); this.setSwapOpen(!this.swapOpen); };
+    document.addEventListener('click', (e) => { if (this.swapOpen && !this.root.contains(e.target)) this.setSwapOpen(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.swapOpen) this.setSwapOpen(false); });
 
     this.sendBtn.onclick = () => this.send();
     this.input.onkeydown = (e) => {
@@ -221,9 +293,24 @@ class ChatPane {
   }
 
   setSession(session) {
+    const prevId = this.sessionId;
     this.session = session;
     this.sessionId = session ? session.id : null;
+    // A DIFFERENT chat was loaded: a pending swap offer or an open Swap menu belong to
+    // the previous chat and must not leak into this one. (Same-id updates -- e.g. the
+    // swap response itself -- keep state; performSwap() clears the offer explicitly.)
+    if (prevId !== this.sessionId) {
+      this.pendingSwapOffer = null;
+      this.setSwapOpen(false);
+    }
     this.onSessionChange(session);
+  }
+
+  // The chat's real title, from the sessions list (the multi-chat bar passes it in); shown in the pane header while this pane still shows the same chat.
+  setTitle(text) {
+    this.titleText = typeof text === 'string' ? text : '';
+    this.titleFor = this.sessionId;
+    this.titleEl.textContent = this.titleText || (this.session ? fullTitle(this.session.title) : '');
   }
 
   syncProviderToggle() {
@@ -231,6 +318,81 @@ class ChatPane {
     this.providerBtn.dataset.provider = this.providerChoice;
     this.providerBtn.textContent = providerButtonLabel(this.providerChoice);
     this.providerBtn.classList.toggle('provider-toggle-claude', claude);
+  }
+
+  // HUB0008 10/11: the header provider label (swap-view.providerLabel) and the Swap
+  // button's visibility track the loaded session. All decisions -- what the label is,
+  // which entries the menu lists, what each POST body looks like -- live in
+  // static/swap-view.js (piece 9); this method only places them in the DOM. No token
+  // or token path ever touches the client here: the menu entries and the swap body
+  // carry only labels (swapBody), and the accounts endpoint returns public_view only.
+  syncSwapHeader() {
+    const has = !!this.session;
+    this.providerLabelEl.textContent = has ? providerLabel(this.session) : '';
+    this.providerLabelEl.hidden = !has;
+    this.swapBtn.hidden = !has;
+    if (!has) this.setSwapOpen(false);
+  }
+
+  setSwapOpen(open) {
+    this.swapOpen = open;
+    this.swapMenu.hidden = !open;
+    if (open) this.renderSwapMenu();
+  }
+
+  // Builds the Swap menu from GET api/chat/accounts (public_view shape: {accounts:
+  // [{label, host, live}]}) through swap-view.swapOptions, which drops the session's
+  // pinned account and appends the local model (unless the session is already local).
+  async renderSwapMenu() {
+    const session = this.session;
+    if (!session) return;
+    this.swapMenu.innerHTML = '<div class="chat-switcher-empty">Loading accounts&hellip;</div>';
+    let accounts;
+    try {
+      const body = await fetchJson('api/chat/accounts');
+      accounts = Array.isArray(body.accounts) ? body.accounts : [];
+    } catch (e) {
+      this.swapMenu.innerHTML = `<div class="chat-switcher-empty">Could not load accounts: ${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    const options = swapOptions(accounts, session);
+    this.swapChoices = options;
+    this.swapMenu.innerHTML = options.length
+      ? options.map((o, i) =>
+        `<div class="chat-switcher-row" role="option" data-swap-index="${i}">
+           <span class="chat-switcher-main"><span class="chat-switcher-title">${escapeHtml(swapOptionLabel(o))}</span></span>
+         </div>`).join('')
+      : '<div class="chat-switcher-empty">Nothing else to switch to.</div>';
+  }
+
+  // Performs the swap -- the ONE code path shared by a Swap-menu entry and a
+  // one-click offer button. POSTs api/chat/<id>/swap with swapBody(option) (piece 7's
+  // route validates the account label server-side and returns the updated session
+  // with its new marker row in the transcript); setSession + render show it.
+  async performSwap(option) {
+    const session = this.session;
+    if (!session) return;
+    if (this.isSending) {
+      showToast('Wait for the current reply to finish before switching model.', 'info');
+      return;
+    }
+    this.setSwapOpen(false);
+    this.swapBtn.disabled = true;
+    try {
+      const resp = await fetch(`api/chat/${encodeURIComponent(session.id)}/swap`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(swapBody(option)),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
+      this.pendingSwapOffer = null; // the swap succeeded; the offer is stale now
+      this.setSession(body);       // updated session -- the marker row renders with it
+    } catch (e) {
+      showToast('Could not switch model: ' + e.message);
+    } finally {
+      this.swapBtn.disabled = false;
+    }
+    this.render();
   }
 
   // Fetches the pane's CURRENT session (by remembered id), falling back to the most
@@ -287,6 +449,21 @@ class ChatPane {
   }
 
   async onRootClick(e) {
+    // HUB0008 10/11: Swap-menu entries and one-click offer buttons both resolve to a
+    // data-swap-index into this.swapChoices and share performSwap (same POST body path
+    // as the header menu). Checked before the template-card handler below.
+    const swapEl = e.target.closest &&
+      (e.target.closest('.chat-swap-menu [data-swap-index]') || e.target.closest('.chat-swap-offer-btn'));
+    if (swapEl) {
+      const option = this.swapChoices[Number(swapEl.dataset.swapIndex)];
+      if (option) { this.setSwapOpen(false); this.performSwap(option); }
+      return;
+    }
+    const cmdBtn = e.target.closest && e.target.closest('.cmd-confirm, .cmd-deny');
+    if (cmdBtn && this.session && this.root.contains(cmdBtn)) {
+      await this.decideCommand(cmdBtn);
+      return;
+    }
     const btn = e.target.closest && e.target.closest('.tpl-save');
     if (!btn || !this.session || !this.root.contains(btn)) return;
     const card = btn.closest('.tpl-card');
@@ -306,6 +483,27 @@ class ChatPane {
       showToast(body.proposal.message, body.proposal.status === 'saved' ? 'info' : 'error');
     } catch (err) {
       showToast('Could not save template: ' + err.message);
+    }
+    this.render();
+  }
+
+  // Confirm / Deny on a proposed command. The route persists the decision first and, for Confirm, waits for core's runner (up to 15 minutes), so the card shows
+  // 'Running...' meanwhile; the stored session that comes back holds the result. An error leaves the proposal as the server has it.
+  async decideCommand(btn) {
+    const card = btn.closest('.cmd-card');
+    if (!card) return;
+    const confirm = btn.classList.contains('cmd-confirm');
+    for (const b of card.querySelectorAll('button')) b.disabled = true;
+    btn.textContent = confirm ? 'Running...' : 'Denying...';
+    try {
+      const resp = await fetch(`api/chat/${encodeURIComponent(this.session.id)}/command/${encodeURIComponent(card.dataset.proposal)}/${confirm ? 'confirm' : 'deny'}`, { method: 'POST' });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
+      this.setSession(body.session);
+    } catch (err) {
+      showToast('Could not record that decision: ' + err.message);
+      await this.load();
+      return;
     }
     this.render();
   }
@@ -357,6 +555,7 @@ class ChatPane {
     const message = this.input.value.trim();
     if (!message || !this.session) return;
     const session = this.session; // a mid-stream switch is blocked, but never write into another chat
+    this.pendingSwapOffer = null; // a new turn supersedes any previous failed-turn offer
     this.isSending = true;
     this.input.value = '';
     this.input.disabled = true;
@@ -380,6 +579,24 @@ class ChatPane {
       // Root-caused live 2026-09-22 (Grimmethy, through the dashboard's proxied iframe --
       // this bug never showed hitting the plugin directly on :7442, only through :7420's
       // proxy): this fetch() had no Accept header at all.
+      // Pure helper (kept dependency-free so test/chat-preempt-text.test.mjs can lift it):
+      // turn the core's preempt rows into the operator-visible chat text. 'killed' -> freed,
+      // 'spared' -> spared (as before); 'busy' -> a holder on this chat's GPU that
+      // survived the preempt, so the operator knows their turn is queued behind it.
+      // Unknown actions are ignored (no crash, no text).
+      function buildPreemptText(lanes) {
+        const killed = lanes.filter((l) => l.action === 'killed').map((l) => l.lane);
+        const spared = lanes.filter((l) => l.action === 'spared')
+          .map((l) => `${l.lane} (${Math.round((l.ageSeconds || 0) / 60)}m in)`);
+        const busy = lanes.filter((l) => l.action === 'busy')
+          .map((l) => `busy: ${l.lane} ${l.taskId} (${l.phase}) - your turn is queued behind it`);
+        const bits = [];
+        if (killed.length) bits.push('freed ' + killed.join(', '));
+        if (spared.length) bits.push('spared ' + spared.join(', '));
+        if (busy.length) bits.push(busy.join(', '));
+        if (!bits.length) return '';
+        return `⚡ ${bits.join(' · ')}\n\n`;
+      }
       const resp = await fetch(`api/chat/${encodeURIComponent(session.id)}/message`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
         body: JSON.stringify({ message }),
@@ -404,14 +621,8 @@ class ChatPane {
           if (!line) continue;
           const evt = JSON.parse(line.slice(6));
           if (evt.type === 'preempt') {
-            const lanes = evt.lanes || [];
-            const killed = lanes.filter((l) => l.action === 'killed').map((l) => l.lane);
-            const spared = lanes.filter((l) => l.action === 'spared')
-              .map((l) => `${l.lane} (${Math.round((l.ageSeconds || 0) / 60)}m in)`);
-            const bits = [];
-            if (killed.length) bits.push('freed ' + killed.join(', '));
-            if (spared.length) bits.push('spared ' + spared.join(', '));
-            if (bits.length) { assistantEntry.text = `⚡ ${bits.join(' · ')}\n\n`; this.render(); }
+            const preemptText = buildPreemptText(evt.lanes || []);
+            if (preemptText) { assistantEntry.text = preemptText; this.render(); }
           } else if (evt.type === 'chunk') {
             assistantEntry.text += evt.text;
             this.render();
@@ -419,6 +630,11 @@ class ChatPane {
             finalSession = evt.session;
           } else if (evt.type === 'error') {
             streamErr = evt.error;
+            // HUB0008 10/11: a failed CLAUDE turn classified as a limit error carries
+            // swapOffer {kind, options} on the SAME error event (routes/chat.py, piece
+            // 8). Hold it so render() shows the one-click offer; absent on every other
+            // error (local turns, unclassified) -- then nothing extra is rendered.
+            this.pendingSwapOffer = evt.swapOffer || null;
           }
         }
       }
@@ -472,8 +688,67 @@ class ChatPane {
     this.render();
   }
 
+  // 2026-10-25 (walkthrough): "Acting on: <label> (active|chosen)" under the chat title.
+  // A new chat used to open with no indication of its target project, so the dashboard's
+  // active project could silently become the wrong task queue. Options come from
+  // GET api/chat/projects (the same registry the core list_projects tool reads);
+  // changing one PATCHes api/chat/<id>/project and appends a one-line system note
+  // to the transcript (rendered as a "System" row by chatRenderTranscript).
+  async loadProjects() {
+    try {
+      const data = await fetchJson('api/chat/projects');
+      this.projectOptions = Array.isArray(data && data.projects) ? data.projects : [];
+      this.projectActiveLabel = data && data.active;
+    } catch (e) {
+      this.projectOptions = [];
+      this.projectActiveLabel = null;
+    }
+    this.renderProjectRow();
+  }
+
+  renderProjectRow() {
+    const opts = this.projectOptions || [];
+    if (!opts.length) { this.projectRow.hidden = true; return; }
+    this.projectRow.hidden = false;
+    const chosen = this.session && this.session.chosen_project;
+    const current = chosen || this.projectActiveLabel || opts[0].label;
+    this.projectSelect.innerHTML = opts.map(o =>
+      `<option value="${escapeHtml(o.label)}"${o.label === current ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+    ).join('');
+    this.projectLabelEl.textContent = `Acting on: ${current}${chosen ? ' (chosen)' : ' (active)'}`;
+  }
+
+  async changeProject(label) {
+    if (!label || !this.session || !this.session.id) return;
+    if (label === this.session.chosen_project) { this.renderProjectRow(); return; }
+    if (this.isSending) {
+      showToast('Wait for the current reply to finish before changing project.', 'info');
+      this.renderProjectRow();
+      return;
+    }
+    try {
+      const resp = await fetch(`api/chat/${encodeURIComponent(this.session.id)}/project`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project: label }),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error((body && body.error) || `HTTP ${resp.status}`);
+      if (this.session) this.session.chosen_project = body.chosen_project || label;
+      this.renderProjectRow();
+      showToast(`Now acting on: ${label}`, 'info');
+    } catch (e) {
+      this.renderProjectRow();
+      showToast('Could not change project: ' + e.message);
+    }
+  }
+
   render() {
     const session = this.session;
+    this.syncSwapHeader();
+    // A loaded session has no `title` (only the sessions list does), so the host page hands the real title in through setTitle(); it counts only while this pane still shows that chat.
+    this.titleEl.textContent = this.titleText && this.titleFor === this.sessionId ? this.titleText : (session ? fullTitle(session.title) : '');
+    this.renderProjectRow();
     if (session && session.provider && this.providerChoice !== session.provider) {
       this.providerChoice = session.provider;
       this.syncProviderToggle();
@@ -492,6 +767,30 @@ class ChatPane {
     this.transcriptEl.innerHTML = session && session.transcript.length
       ? chatRenderTranscript(session.transcript, session)
       : '<div class="empty">Say something to the chat.</div>';
+    // HUB0008 10/11: the failed-turn one-click swap offer. offerText (swap-view, piece 9)
+    // decides whether there is anything to offer at all -- null/missing offer, unknown
+    // kind or an empty options list all yield '' and we render NOTHING extra. When it
+    // speaks, one button per option, each wired (via onRootClick) to the same
+    // performSwap POST as the header Swap menu. Appended INSIDE the transcript scroll
+    // box when one exists so it scrolls with the failed turn.
+    if (this.pendingSwapOffer) {
+      const offer = this.pendingSwapOffer;
+      const text = offerText(offer);
+      const options = Array.isArray(offer.options) ? offer.options : [];
+      if (text && options.length) {
+        this.swapChoices = options;
+        const html =
+          `<div class="chat-swap-offer">` +
+          `<div class="chat-swap-offer-text">${escapeHtml(text)}</div>` +
+          `<div class="chat-swap-offer-actions">` +
+          options.map((o, i) =>
+            `<button type="button" class="secondary chat-swap-offer-btn" data-swap-index="${i}">` +
+            `Switch to ${escapeHtml(swapOptionLabel(o))}</button>`).join('') +
+          `</div></div>`;
+        const target = this.transcriptEl.querySelector('.chat-transcript') || this.transcriptEl;
+        target.insertAdjacentHTML('beforeend', html);
+      }
+    }
     const scrollBox = this.transcriptEl.querySelector('.chat-transcript');
     if (scrollBox) scrollBox.scrollTop = scrollBox.scrollHeight;
   }
@@ -501,8 +800,9 @@ class ChatPane {
 // lives in sessions-view.js; this class only does DOM + fetches. The list re-fetches every
 // 5s while the dropdown is open and after any action.
 class SessionSwitcher {
-  constructor(slot, { getSelectedId, onSelect, onNew, onClose, getRoots }) {
+  constructor(slot, { getSelectedId, onSelect, onNew, onClose, getRoots, buttonLabel }) {
     this.slot = slot;
+    this.buttonLabel = buttonLabel || null; // a fixed button text (the multi-chat bar's 'All chats'); null shows the selected chat's title
     this.getSelectedId = getSelectedId;
     this.onSelect = onSelect;
     this.onNew = onNew;
@@ -510,24 +810,55 @@ class SessionSwitcher {
     this.getRoots = getRoots || (() => []);
     this.rows = [];
     // Read-only terminal sessions from the optional session agent (see agent_client.py).
-    this.terminal = { enabled: false, reachable: false, rows: [] };
-    this.events = null;
+    this.terminal = { enabled: false, reachable: false, rows: [], hosts: [], skipped: [] };
+    // One EventSource per host (HUB0017), keyed by host name; '' is the single-host
+    // fallback stream. Closed together by stopEvents().
+    this.hostEvents = {};
+    this._eventSignature = null;
+    // Terminal-section host filter: '' means All.
+    this.hostFilter = '';
+    // HUB0010 9/10: the type-to-filter query (terminal rows only), the terminal rows as
+    // last DISPLAYED (what Ctrl+1..9 counts), and the key of the row Ctrl+N jumped to.
+    this.filterQuery = '';
+    this.displayedTerminalRows = [];
+    this.jumpedKey = null;
     this.open = false;
     this.pollTimer = null;
+    // Attention state (piece 2/10): the previous {key: status} map returned by
+    // attentionStep (attention-view.js, piece 1), the set of keys that newly became
+    // waiting on the last step (drives the amber flash class), the count we last
+    // posted, and the page's original <title> so we can prefix/restore it. Holds only
+    // row identity + status strings -- never any token/credential.
+    this.attentionPrev = null;
+    this.attentionNewlyWaiting = new Set();
+    this.lastAttentionCount = null;
+    this.originalTitle = (typeof document !== 'undefined' && document) ? document.title : null;
+    // Chime (HUB0010 3/10): off by default, remembered under localStorage 'chat-chime'; the AudioContext is created lazily after a user gesture.
+    this.chimeEnabled = readChimeSetting();
+    this.audioCtx = null;
     this.slot.innerHTML = `
       <button type="button" class="secondary chat-switcher-btn" aria-haspopup="listbox" aria-expanded="false"></button>
       <div class="chat-switcher-menu" hidden></div>`;
     this.btn = this.slot.querySelector('.chat-switcher-btn');
     this.menu = this.slot.querySelector('.chat-switcher-menu');
+    // The filter box lives outside the list that render() rebuilds, so typing never
+    // loses its value or focus when the list refreshes.
+    this.menu.innerHTML = '<input type="text" class="chat-switcher-filter" placeholder="Filter chats" aria-label="Filter chats" autocomplete="off"><div class="chat-switcher-list"></div>';
+    this.filterInput = this.menu.querySelector('.chat-switcher-filter');
+    this.list = this.menu.querySelector('.chat-switcher-list');
+    this.filterInput.addEventListener('input', () => { this.filterQuery = this.filterInput.value; this.jumpedKey = null; this.render(); });
     this.btn.onclick = (e) => { e.stopPropagation(); this.setOpen(!this.open); };
     this.menu.addEventListener('click', (e) => this.onMenuClick(e));
+    this.menu.addEventListener('change', (e) => this.onMenuChange(e));
     document.addEventListener('click', (e) => { if (this.open && !this.slot.contains(e.target)) this.setOpen(false); });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.open) this.setOpen(false); });
+    document.addEventListener('keydown', (e) => this.onJumpKey(e));
     this.renderButton();
   }
 
   setOpen(open) {
     this.open = open;
+    if (!open) this.jumpedKey = null;
     this.menu.hidden = !open;
     this.btn.setAttribute('aria-expanded', String(open));
     clearInterval(this.pollTimer);
@@ -539,24 +870,91 @@ class SessionSwitcher {
     }
   }
 
-  // Live terminal-session updates while the dropdown is open. EventSource reconnects by
-  // itself; the 5s refresh() above is the fallback when the stream is down.
+  // Live terminal-session updates while the dropdown is open. One EventSource per host
+  // (HUB0017); each reconnects by itself, and the 5s refresh() above is the fallback
+  // when a stream is down. A single host uses the plain single-host URL.
   startEvents() {
-    if (this.events || !this.terminal.enabled || !this.terminal.reachable || typeof EventSource === 'undefined') return;
-    this.events = new EventSource('api/chat/terminal-sessions/events');
+    if (!this.terminal.enabled || !this.terminal.reachable || typeof EventSource === 'undefined') return;
+    const hosts = (Array.isArray(this.terminal.hosts) && this.terminal.hosts.length)
+      ? this.terminal.hosts
+      : hostsOf(this.terminal.rows);
+    if (!hosts.length) return;
+    const signature = hosts.join('\u0000');
+    if (this._eventSignature === signature) return; // streams already match the host list
+    this.stopEvents(); // host list changed: close all, reopen fresh
+    this._eventSignature = signature;
+    if (hosts.length === 1) {
+      this.openEventStream(hosts[0], 'api/chat/terminal-sessions/events');
+    } else {
+      for (const host of hosts) {
+        this.openEventStream(host, 'api/chat/terminal-sessions/events?host=' + encodeURIComponent(host));
+      }
+    }
+  }
+
+  openEventStream(host, url) {
+    const events = new EventSource(url);
+    this.hostEvents[host] = events;
     for (const name of ['session.updated', 'session.removed']) {
-      this.events.addEventListener(name, (e) => {
+      events.addEventListener(name, (e) => {
         let data = null;
         try { data = JSON.parse(e.data); } catch (err) { return; }
         this.terminal.rows = applyTerminalEvent(this.terminal.rows, name, data);
+        this.applyAttention(); // piece 2/10: after each terminal-rows update
         this.render();
       });
     }
   }
 
   stopEvents() {
-    if (this.events) this.events.close();
-    this.events = null;
+    for (const host of Object.keys(this.hostEvents)) this.hostEvents[host].close();
+    this.hostEvents = {};
+    this._eventSignature = null;
+  }
+
+  // Piece 2/10: after EVERY terminal-rows update, run the pure attention step
+  // (attention-view.js, piece 1) and apply its result to the DOM:
+  //   - the amber classes come from this.attentionNewlyWaiting (used in
+  //     renderTerminalSection/renderTerminalRow below),
+  //   - the tab <title> becomes '(N) <original>' while anything is waiting and is
+  //     restored at 0,
+  //   - the parent (dashboard) is told the count via postMessage.
+  // NOTE: the dashboard's own tab BADGE is a separate change in the dashboard repo and
+  // is intentionally NOT implemented here -- we only post the count.
+  // All decision logic stays in attention-view.js; this method only reads its result
+  // and wires the DOM. Every browser API (document, window.parent, postMessage,
+  // location.origin) is guarded so nothing throws in a non-DOM / test environment.
+  applyAttention() {
+    if (typeof attentionStep !== 'function') return;
+    const rows = (this.terminal && Array.isArray(this.terminal.rows)) ? this.terminal.rows : [];
+    let res;
+    try {
+      res = attentionStep(this.attentionPrev, rows);
+    } catch (err) {
+      return; // never let attention break the switcher
+    }
+    this.attentionPrev = res.map;
+    this.attentionNewlyWaiting = new Set(res.newlyWaiting);
+    if (res.newlyWaiting.length) this.maybeChime(res.newlyWaiting);
+
+    // Tab title: '(N) <original>' while N > 0, restored when N is 0.
+    if (typeof document !== 'undefined' && document && this.originalTitle != null) {
+      document.title = res.count > 0 ? '(' + res.count + ') ' + this.originalTitle : this.originalTitle;
+    }
+
+    // Tell the dashboard on every change of count (its badge is a separate repo change).
+    if (res.count !== this.lastAttentionCount) {
+      this.lastAttentionCount = res.count;
+      try {
+        if (typeof window !== 'undefined' && window && window.parent &&
+            typeof window.parent.postMessage === 'function') {
+          const origin = (window.location && window.location.origin) ? window.location.origin : '*';
+          window.parent.postMessage({ type: 'chat-attention', count: res.count }, origin);
+        }
+      } catch (err) {
+        // postMessage to an opaque/unknown origin can throw SecurityError -- ignore.
+      }
+    }
   }
 
   async refresh() {
@@ -567,17 +965,26 @@ class SessionSwitcher {
     }
     try {
       const t = await fetchJson('api/chat/terminal-sessions');
-      this.terminal = { enabled: !!t.enabled, reachable: !!t.reachable, rows: Array.isArray(t.sessions) ? t.sessions : [] };
+      this.terminal = {
+        enabled: !!t.enabled,
+        reachable: !!t.reachable,
+        rows: Array.isArray(t.sessions) ? t.sessions : [],
+        hosts: Array.isArray(t.hosts) ? t.hosts : [],
+        skipped: Array.isArray(t.skipped) ? t.skipped : [],
+      };
     } catch (e) {
       // Same: keep what we had.
     }
+    this.applyAttention(); // piece 2/10: after each terminal-rows update
+    // Host list can change between polls (agent added/removed): re-sync the streams.
+    if (this.open) this.startEvents();
     this.render();
     return this.rows;
   }
 
   renderButton() {
     const row = this.rows.find((r) => r.id === this.getSelectedId());
-    this.btn.textContent = (row ? truncateTitle(row.title) : 'Chats') + ' ▾';
+    this.btn.textContent = (this.buttonLabel || (row ? fullTitle(row.title) : 'Chats')) + ' ▾';
     const roots = this.getRoots();
     this.btn.title = roots.length
       ? 'Switch chat. Accessible repos (roots[0] is primary):\n' + roots.join('\n')
@@ -604,11 +1011,21 @@ class SessionSwitcher {
   }
 
   // A terminal session row: display only (no select, no close) until a handoff exists.
-  renderTerminalRow(fmt) {
+  // `showHost` gates the host badge: pointless when every row shares one host. `newlyWaiting` (piece 2/10): a row that just became waiting also flashes amber.
+  renderTerminalRow(fmt, newlyWaiting, showHost, jumped) {
     const ctx = fmt.context ? `<span class="chat-switcher-context">${escapeHtml(fmt.context)}</span>` : '';
     const step = fmt.step ? `<div class="chat-switcher-step">${escapeHtml(fmt.step)}</div>` : '';
-    return `<div class="chat-switcher-trow" title="${escapeHtml(fmt.fullTitle)}">
-      <div class="chat-switcher-title">${escapeHtml(fmt.title)}</div>
+    const badge = (showHost && fmt.host)
+      ? `<span class="terminal-row-host-badge">${escapeHtml(fmt.host)}</span>`
+      : '';
+    // Piece 2/10: a waiting row is steady-amber (.waiting); a row that newly became
+    // waiting additionally flashes amber (.waiting-flash) for 10s via chat.css.
+    const trowCls = 'chat-switcher-trow'
+      + (fmt.waiting ? ' waiting' : '')
+      + (fmt.waiting && newlyWaiting ? ' waiting-flash' : '')
+      + (jumped ? ' jumped' : '');
+    return `<div class="${trowCls}" title="${escapeHtml(fmt.fullTitle)}">
+      <div class="chat-switcher-title">${escapeHtml(fmt.title)}${badge}</div>
       <div class="chat-switcher-meta">
         <span class="chat-switcher-status${fmt.busy ? ' busy' : ''}${fmt.waiting ? ' waiting' : ''}">${escapeHtml(fmt.status)}</span>
         <span>${escapeHtml(fmt.timer)}</span>${ctx}
@@ -619,24 +1036,156 @@ class SessionSwitcher {
   renderTerminalSection(now) {
     const t = this.terminal;
     if (!t.enabled) return '';
+    const rows = orderTerminalSessions(t.rows);
+    // Host badge + All/each-host filter only make sense with more than one host.
+    const hosts = hostsOf(rows);
+    const multiHost = hosts.length > 1;
+    // A stale filter (e.g. its host vanished from the list) would empty the rows; clamp.
+    let selectedHost = multiHost ? this.hostFilter : '';
+    if (selectedHost && !hosts.includes(selectedHost)) selectedHost = '';
     let body;
+    // What is on screen, in order (host filter, then the text filter): Ctrl+1..9 counts these.
+    const displayed = (t.reachable && t.rows.length) ? filterRows(filterByHost(rows, selectedHost), this.filterQuery) : [];
+    this.displayedTerminalRows = displayed;
     if (!t.reachable) body = '<div class="chat-switcher-empty">Session agent unreachable</div>';
-    else if (!t.rows.length) body = '<div class="chat-switcher-empty">No terminal sessions</div>';
-    else body = orderTerminalSessions(t.rows).map((r) => this.renderTerminalRow(formatTerminalRow(r, now))).join('');
-    return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${body}`;
+    else if (!t.rows.length) body = `<div class="chat-switcher-empty">${escapeHtml(emptyLabel(t.hosts))}</div>`;
+    else if (!displayed.length) body = '<div class="chat-switcher-empty">No sessions match</div>';
+    else body = displayed.map((r) => {
+      // Piece 2/10: match this row against the newly-waiting keys from the last
+      // attention step (key rule mirrors attention-view.js keyOf: host/id when a host
+      // is present, else the id) to add the amber-flash class.
+      const key = r.host ? (r.host || '') + '/' + r.id : r.id;
+      const newly = (r.status === 'waiting') && this.attentionNewlyWaiting.has(key);
+      return this.renderTerminalRow(formatTerminalRow(r, now), newly, multiHost, key === this.jumpedKey);
+    }).join('');
+    let filterHtml = '';
+    if (multiHost) {
+      const options = [''].concat(hosts);
+      filterHtml = '<div class="chat-switcher-host-filter">'
+        + options.map((h) => {
+            const active = (selectedHost || '') === (h || '');
+            return `<button type="button" class="secondary chat-switcher-host-filter-btn${active ? ' active' : ''}" data-host-filter="${escapeHtml(h || '')}">${h ? escapeHtml(h) : 'All'}</button>`;
+          }).join('')
+        + '</div>';
+    }
+    const skippedText = skippedLabel(t.skipped);
+    const skippedLine = skippedText
+      ? `<div class="chat-switcher-empty">Some hosts were skipped: ${escapeHtml(skippedText)}</div>`
+      : '';
+    return `<div class="chat-switcher-group">Terminal sessions · read-only</div>${filterHtml}${body}${skippedLine}`;
+  }
+
+  // The chime setting row at the foot of the switcher menu.
+  renderChimeSetting() {
+    return `<label class="chat-chime-setting"><input type="checkbox" class="chat-chime-input"${this.chimeEnabled ? ' checked' : ''}> Chime when another chat needs me</label>`;
+  }
+
+  // Keys of the chat panes on screen: the panes multi-chat.js mounts, or just the active chat when multi-chat.js is not loaded. chat.js must not import
+  // multi-chat.js statically (that module's browser adapter sets window.__CHAT_MULTI_PANES__ and imports this file), so it is loaded on demand, and only
+  // when the flag shows it is already running: the import then returns the same module instance.
+  async onScreenKeys() {
+    const active = this.getSelectedId();
+    const fallback = active ? [active] : [];
+    try {
+      if (typeof window === 'undefined' || !window.__CHAT_MULTI_PANES__) return fallback;
+      let raw = null;
+      try { raw = window.localStorage.getItem(LAYOUT_KEY); } catch (e) { raw = null; }
+      if (raw == null) return fallback;
+      const mc = await import('./multi-chat.js');
+      return [...mc.mountedSet(mc.deserialize(raw), active)];
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  ensureAudio() {
+    try {
+      if (this.audioCtx) {
+        if (this.audioCtx.state === 'suspended') this.audioCtx.resume();
+        return this.audioCtx;
+      }
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return null;
+      this.audioCtx = new Ctx();
+      return this.audioCtx;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // One short beep (880 Hz, about 200 ms); no audio file. Silent when audio is unavailable or blocked.
+  beep() {
+    try {
+      const ctx = this.ensureAudio();
+      if (!ctx) return;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = 880;
+      gain.gain.value = 0.08;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.2);
+    } catch (e) { /* never let a chime break the switcher */ }
+  }
+
+  async maybeChime(newlyWaiting) {
+    try {
+      if (!this.chimeEnabled) return;
+      const keys = await this.onScreenKeys();
+      if (shouldChime(newlyWaiting, keys, this.chimeEnabled)) this.beep();
+    } catch (e) { /* attention must never break the switcher */ }
+  }
+
+  onMenuChange(e) {
+    const box = e.target.closest ? e.target.closest('.chat-chime-input') : null;
+    if (!box) return;
+    this.chimeEnabled = !!box.checked;
+    writeChimeSetting(this.chimeEnabled);
+    if (this.chimeEnabled) this.ensureAudio(); // the change event is the user gesture that lets audio start
   }
 
   render() {
     this.renderButton();
     const now = Date.now();
     const selectedId = this.getSelectedId();
-    this.menu.innerHTML = `<div class="chat-switcher-new" role="option">+ New chat</div>`
-      + this.rows.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('')
-      + this.renderTerminalSection(now);
+    const chats = filterChats(this.rows, this.filterQuery);
+    const chatsEmpty = this.rows.length && !chats.length
+      ? '<div class="chat-switcher-empty">No chats match</div>' : '';
+    this.list.innerHTML = `<div class="chat-switcher-new" role="option">+ New chat</div>`
+      + chats.map((r) => this.renderRow(formatRow(r, now), r.id === selectedId)).join('') + chatsEmpty
+      + this.renderTerminalSection(now)
+      + this.renderChimeSetting();
+  }
+
+  // Ctrl+1..Ctrl+9 while the switcher is open: jump to the nth DISPLAYED terminal row. Terminal
+  // rows are read-only (no hand-off exists yet), so "select" means highlight the row and scroll it
+  // into view. Nothing else is touched, and the key is left alone (no preventDefault) unless a
+  // row was actually found.
+  onJumpKey(e) {
+    try {
+      if (!this.open || !e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+      if (typeof e.key !== 'string' || !/^[1-9]$/.test(e.key)) return;
+      const key = jumpTarget(this.displayedTerminalRows, Number(e.key));
+      if (key === null) return;
+      e.preventDefault();
+      this.jumpedKey = key;
+      this.render();
+      const el = this.list.querySelector('.chat-switcher-trow.jumped');
+      if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'nearest' });
+    } catch (err) { /* a shortcut must never break the switcher */ }
   }
 
   async onMenuClick(e) {
     e.stopPropagation();
+    // Host filter (terminal section): pick All / one host and re-render only.
+    const hostFilterBtn = e.target.closest('.chat-switcher-host-filter-btn');
+    if (hostFilterBtn) {
+      this.hostFilter = hostFilterBtn.dataset.hostFilter || '';
+      this.render();
+      return;
+    }
     if (e.target.closest('.chat-switcher-new')) {
       this.setOpen(false);
       await this.onNew();
@@ -658,6 +1207,7 @@ class SessionSwitcher {
 }
 
 function mountChat() {
+  if (window.__CHAT_MULTI_PANES__) return;
   // #chat-panel (in templates/chat.html) is the sole id-based contract between
   // this file and the template; every other selector here is class-based.
   const root = document.getElementById('chat-panel');
@@ -720,3 +1270,5 @@ function mountChat() {
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mountChat);
 else mountChat();
+
+export { ChatPane, SessionSwitcher, showToast };

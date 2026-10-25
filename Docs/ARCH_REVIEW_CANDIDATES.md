@@ -383,3 +383,180 @@ Introduce a shared utility function—e.g. `run_node_script(script_path, payload
 
 Benefits:
 The temp-file lifecycle, timeout handling, and error-reporting logic live in exactly one place, eliminating the risk of the two implementations drifting apart. A future change to the invocation mechanism (pipes, a different runtime, structured error codes) is a single-file edit. The client modules become shorter and more readable, and the shared utility is trivially unit-testable in isolation using `unittest` (mocking `subprocess.run`) without importing either client or the Flask app.
+
+### AC-31 · AC-27a – Create config.py with CORE_REPO_ROOT
+Strength: Strong
+Split-Depth: 1
+Files: .venv/lib/python3.12/site-packages/flask/config.py
+
+Problem:
+Both claude_client.py and model_stats_client.py import CORE_REPO_ROOT from app (the Flask entry-point module), which forces a dependency on the entire Flask application just to obtain a single path constant. app.py defines it as `CORE_REPO_ROOT = Path(os.environ.get("AGENT_MANAGER_CORE_REPO_ROOT", "/media/model-cache/github/agent-manager")).resolve()` at module level. There is no standalone module that holds this value, so any non-Flask consumer must pull in Flask transitively.
+
+Solution:
+Create a new file `config.py` at the repository root containing exactly: a one-line module docstring (e.g. `"""Shared path constants for the Chat plugin."""`), the two stdlib imports needed (`import os` and `from pathlib import Path`), and the single constant definition copied verbatim from app.py: `CORE_REPO_ROOT = Path(os.environ.get("AGENT_MANAGER_CORE_REPO_ROOT", "/media/model-cache/github/agent-manager")).resolve()`. The file must not import Flask, app, any client module, or any other project-internal module. No functions, no classes, no side effects beyond the Path.resolve() call.
+
+Benefits:
+Provides a zero-dependency (stdlib-only) module that any consumer can import without pulling in Flask or the rest of the application. Establishes the single source of truth for the core-repo path that the next two sub-candidates will point at.
+
+### AC-32 · AC-27b – app.py imports CORE_REPO_ROOT from config
+Strength: Strong
+Split-Depth: 1
+Files: app.py
+Depends-On: AC-31
+
+Problem:
+app.py currently defines `CORE_REPO_ROOT = Path(os.environ.get("AGENT_MANAGER_CORE_REPO_ROOT", "/media/model-cache/github/agent-manager")).resolve()` at module level (line ~30, after the Flask import). The derived constants `ENV_FILE_PATH` and `DASHBOARD_SETTINGS_PATH` are computed from it in the same module. Once config.py exists (AC-27a), app.py should import the constant rather than define it, so there is exactly one definition in the codebase.
+
+Solution:
+In app.py, replace the three-line `CORE_REPO_ROOT = Path(os.environ.get(...)).resolve()` statement with `from config import CORE_REPO_ROOT`. Place this import alongside the other top-level imports (after the stdlib imports, before or after the Flask import—either is fine since config has no Flask dependency). The subsequent lines `ENV_FILE_PATH = CORE_REPO_ROOT / "agent-manager.env"` and `DASHBOARD_SETTINGS_PATH = CORE_REPO_ROOT / "dashboard-settings.json"` remain unchanged; they now reference the imported name. Remove the now-redundant `import os` and `from pathlib import Path` ONLY if no other code in app.py uses them (os is still used by `_active_project_setting` and `_chat_roots`; Path is still used by `get_pipeline_dir`, `get_second_brain_dir`, `STATE_DIR`, etc.—so in practice both stay). No other line in app.py changes.
+
+Benefits:
+Eliminates the duplicate definition. app.py's namespace still exposes `CORE_REPO_ROOT` (via the from-import), so any existing `app.CORE_REPO_ROOT` access pattern or `__all__` export continues to work. The single source of truth now lives in config.py.
+
+### AC-33 · AC-27c – claude_client.py imports CORE_REPO_ROOT from config
+Strength: Strong
+Split-Depth: 1
+Files: claude_client.py
+Depends-On: AC-31
+
+Problem:
+claude_client.py has the line `from app import CORE_REPO_ROOT` (after the long comment block about claude-client.js not being vendored). This forces importing the entire Flask application module just to get a path constant. The only use is `CLAUDE_CLIENT_JS = CORE_REPO_ROOT / "src" / "claude-client.js"`. No other symbol is imported from app in this file.
+
+Solution:
+Change the single import line `from app import CORE_REPO_ROOT` to `from config import CORE_REPO_ROOT`. No other line in claude_client.py changes. The `CLAUDE_CLIENT_JS` assignment and all function bodies remain identical.
+
+Benefits:
+claude_client.py no longer depends on the Flask entry-point module. It can be imported in isolation (e.g. in a test or a standalone script) without Flask being installed or the Flask app object being constructed. The dependency graph becomes: claude_client → config (stdlib only), not claude_client → app → Flask.
+
+### AC-34 · AC-27d – model_stats_client.py imports CORE_REPO_ROOT from config
+Strength: Strong
+Split-Depth: 1
+Files: model_stats_client.py
+Depends-On: AC-31
+
+Problem:
+model_stats_client.py has the line `from app import CORE_REPO_ROOT` (after the module docstring and stdlib imports). This forces importing the entire Flask application module just to get a path constant. The only use is `MODEL_STATS_DB_JS = CORE_REPO_ROOT / "src" / "model-stats-db.js"`. No other symbol is imported from app in this file.
+
+Solution:
+Change the single import line `from app import CORE_REPO_ROOT` to `from config import CORE_REPO_ROOT`. No other line in model_stats_client.py changes. The `MODEL_STATS_DB_JS` assignment and all function bodies remain identical.
+
+Benefits:
+model_stats_client.py no longer depends on the Flask entry-point module. It can be imported in isolation without Flask. The dependency graph becomes: model_stats_client → config (stdlib only), not model_stats_client → app → Flask. Together with AC-27c, both clients are now decoupled from the Flask app for their sole shared dependency.
+
+### AC-35 · Create node_client_util.py with shared temp-file subprocess helper
+Strength: Strong
+Split-Depth: 1
+Files: node_client_util.py
+
+Problem:
+claude_client.py's generate() and model_stats_client.py's _run_event() each independently implement the same mechanical pattern: generate a unique temp-file path via tempfile.gettempdir() + uuid4, serialize a dict as JSON into it, invoke node <script> [extra-args] <temp-file> via subprocess.run with a timeout, and unlink the temp file in a finally block. Any fix to the temp-file lifecycle (encoding, race on cleanup, missing kwarg) must be made in two places. The two implementations also differ in subtle ways (claude_client passes text=True and no extra args; model_stats passes an event string as an extra arg and omits text=True), making a blind copy-paste refactor unsafe without a single parameterized function.
+
+Solution:
+Create node_client_util.py at the project root (same directory as the two client modules). Expose one public function: run_node_with_tempfile(script_path: str, extra_args: list[str], payload: dict, timeout: float, *, text: bool = False) -> subprocess.CompletedProcess. The function body: (1) build a unique temp path as Path(tempfile.gettempdir()) / f"node-req-{uuid.uuid4().hex}.json"; (2) write json.dumps(payload) to it with encoding="utf-8"; (3) call subprocess.run(["node", str(script_path), *extra_args, str(tmp_path)], capture_output=True, text=text, timeout=timeout); (4) in a finally block, unlink the temp file suppressing OSError. The function does NOT catch TimeoutExpired, does NOT check returncode, and does NOT parse stdout — those remain caller responsibilities so each module keeps its own error contract (ClaudeClientError vs. log-and-swallow). Add a module docstring stating the contract.
+
+Benefits:
+Single implementation of the temp-file create/write/invoke/cleanup lifecycle; both callers become thinner; a future change to the invocation mechanism (e.g. stdin pipes) touches one function instead of two; the parameterized extra_args and text kwargs capture the real differences between the two call sites without forcing them into a false common shape.
+
+### AC-36 · Refactor claude_client.py to use run_node_with_tempfile
+Strength: Strong
+Split-Depth: 1
+Files: claude_client.py
+Depends-On: AC-35
+
+Problem:
+generate() inlines the full temp-file → subprocess → cleanup block: it builds tmp_path via tempfile.gettempdir() + uuid4, writes json.dumps(request), calls subprocess.run(["node", str(CLAUDE_CLIENT_JS), str(tmp_path)], capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S), catches subprocess.TimeoutExpired to raise ClaudeClientError, and unlinks in a finally. This is the same mechanical pattern as model_stats_client.py and should be delegated to the shared utility.
+
+Solution:
+Replace the inline block (from tmp_path = Path(tempfile.gettempdir()) … through the finally: tmp_path.unlink() / except OSError: pass) with: result = run_node_with_tempfile(CLAUDE_CLIENT_JS, [], request, SUBPROCESS_TIMEOUT_S, text=True). Keep the surrounding logic exactly as-is: the try/except subprocess.TimeoutExpired → raise ClaudeClientError(...) from e wrapper, the if result.returncode != 0: raise ClaudeClientError(...) check, and the json.loads(result.stdout) parsing. Remove imports that are now unused in this file: tempfile and uuid (neither is referenced anywhere else in claude_client.py). Keep json (still used for json.dumps in payload construction and json.loads for result parsing), os (used for os.environ.get), subprocess (still needed for the TimeoutExpired exception type in the except clause), and Path (still used for CLAUDE_CLIENT_JS). Add from node_client_util import run_node_with_tempfile.
+
+Benefits:
+claude_client.py is shorter and no longer owns the temp-file lifecycle; the ClaudeClientError contract (timeout, non-zero exit, bad JSON) stays in the caller where it belongs; removing tempfile and uuid imports reduces the module's surface area for accidental misuse.
+
+### AC-37 · Refactor model_stats_client.py _run_event to use run_node_with_tempfile
+Strength: Strong
+Split-Depth: 1
+Files: model_stats_client.py
+Depends-On: AC-35
+
+Problem:
+_run_event() inlines the same temp-file → subprocess → cleanup block: it builds tmp_path via tempfile.gettempdir() + uuid4, writes json.dumps(payload), calls subprocess.run(["node", str(MODEL_STATS_DB_JS), event, str(tmp_path)], capture_output=True, timeout=15), catches (OSError, subprocess.SubprocessError) to log a warning, and unlinks in a finally. This duplicates the pattern in claude_client.py. Note: get_turns_summary() does NOT use a temp file (it passes no payload, just a subcommand) and must be left untouched.
+
+Solution:
+Replace the inline block in _run_event() (from tmp_path = Path(tempfile.gettempdir()) … through the finally: tmp_path.unlink() / except OSError: pass) with: run_node_with_tempfile(MODEL_STATS_DB_JS, [event], payload, 15). Keep the surrounding try/except (OSError, subprocess.SubprocessError) → logger.warning(...) wrapper in _run_event() itself. Remove the tempfile import (it is used only in _run_event). Keep subprocess (still used in get_turns_summary), uuid (still used in record_call for call_id), json (still used in get_turns_summary for json.loads), and Path (still used for MODEL_STATS_DB_JS). Add from node_client_util import run_node_with_tempfile.
+
+Benefits:
+model_stats_client.py's _run_event is shorter and no longer owns the temp-file lifecycle; the 'swallow all errors and log a warning' contract stays in the caller; removing the tempfile import reduces surface area; get_turns_summary is untouched since it uses a different (no-payload) invocation pattern.
+
+### AC-38 · Add unit tests for node_client_util.run_node_with_tempfile
+Strength: Strong
+Split-Depth: 1
+Files: test_node_client_util.py
+Depends-On: AC-35
+
+Problem:
+The new shared function run_node_with_tempfile in node_client_util.py has no test coverage. Both client modules now depend on it for their temp-file lifecycle, so a regression (wrong arg order, missing cleanup, lost encoding) would silently break both Claude and model-stats calls with no unit-level signal.
+
+Solution:
+Create test_node_client_util.py in the project's test directory using unittest (the project's existing Python test framework). Write tests that mock subprocess.run (via unittest.mock.patch) and verify: (a) the correct argument list ["node", script_path, *extra_args, temp_path] is passed to subprocess.run; (b) the JSON payload is written to the temp file before the subprocess call (assert file contents via a mock or a real temp dir); (c) on subprocess.TimeoutExpired the exception propagates to the caller (assertRaises); (d) the temp file is unlinked in all paths — success, TimeoutExpired, and a generic OSError from subprocess.run. These tests must import only node_client_util and standard-library modules; they must NOT import claude_client, model_stats_client, or the Flask app.
+
+Benefits:
+The shared utility is covered independently of either caller; regressions in the temp-file lifecycle (missing cleanup, wrong arg order, lost encoding) are caught at the unit level before they affect either client module.
+
+### AC-39 · Route handlers directly import model client to satisfy reserve() parameter
+Strength: Strong
+Files: routes/chat.py, internal_api_client.py, ollama_client.py
+
+Problem:
+In routes/chat.py, the api_chat_close, api_chat_message, and api_chat_reserve handlers each execute a local import of ollama_client solely to pass ollama_client.MODEL into internal_api_client.reserve(). This forces the routing layer to know which specific model provider is active and to resolve the model name itself, creating a hidden coupling between the chat routes and the provider configuration module. If the model source changes (different provider, config-driven selection, or a renamed constant), every handler in chat.py that calls reserve() must be updated, even though "which model is active" is a concern of the provider/client layer, not the routing layer. The principle of least knowledge is violated: the route handler should not need to dereference a constant from a sibling client module to fulfill a parameter that the internal API client expects.
+
+Solution:
+Move model-name resolution out of the route handlers. Either have internal_api_client.reserve() resolve the model internally by importing or receiving the provider configuration, or inject the active model name into the route context (e.g., via a dependency-injection container or a request-scoped config object) so that reserve() receives it without the handler reaching into ollama_client. In either case, routes/chat.py calls reserve() with a value obtained from the application's configuration layer rather than from a specific client module, and the coupling to ollama_client is eliminated from the routing code.
+
+Benefits:
+The routing layer becomes provider-agnostic: swapping ollama for another local model backend, or moving the model name into a central config, requires no changes in routes/chat.py. The reserve() call site reads as a simple API invocation rather than a hidden cross-module lookup. Future refactors of the provider layer (renaming the constant, making it dynamic, supporting multiple models) are contained within the provider/client modules, reducing the blast radius of configuration changes and making the dependency graph between routing and provider layers explicit and auditable.
+
+### AC-40 · Duplicated HTTP error-handling pattern across internal_api_client functions
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+internal_api_client.py defines four public functions—get_roots, preempt, reserve, and stream_local_turn—that each independently construct a URL, issue a requests call, catch requests.RequestException, and raise InternalApiError from the caught exception. The try/except/raise block and the URL-construction idiom are repeated across all four functions. This is a missing-locality defect: the error-reporting contract (exception type, message format, whether the HTTP status code is included, whether a log line is emitted) is defined in four places rather than one. If the error format needs to change—for example, to include the response status code, to add structured logging, or to switch to a different exception hierarchy—all four functions must be updated in lockstep, and any missed update silently produces inconsistent error reporting to callers.
+
+Solution:
+Introduce a private helper, e.g. `_request(method, url, **kwargs)`, that encapsulates the requests call, the try/except requests.RequestException block, and the raise InternalApiError(...) from e normalization, then returns the raw Response object. The three request-response functions (get_roots, preempt, reserve) reduce to constructing their URL and payload, calling `_request`, and parsing the returned response (e.g. `r.json()`).
+
+For stream_local_turn, the initial POST call (with `stream=True`) shares the same connection-level error contract and can call the same `_request` helper to obtain the open Response object. However, the subsequent iteration over `r.iter_lines()` and the per-chunk `yield` logic are structurally different from the request-response pattern: the function must remain a generator, and mid-stream read errors (broken pipe, timeout during transfer) occur after the helper has returned. Therefore stream_local_turn retains its own try/except around the iteration loop (or wraps it in a small `_iter_stream(r)` generator helper if the mid-stream error contract also needs centralizing), while the initial-connection error handling is unified with the other three functions via `_request`.
+
+In both cases, the public function signatures and the module's public surface remain unchanged; no caller code needs modification.
+
+Benefits:
+The initial-connection error-handling contract (exception type, message format, logging) lives in exactly one place for all four functions, making it trivial to audit and to evolve (add status codes, structured logging, circuit-breaker logic) without hunting through four functions. New internal API endpoints added to the module automatically inherit the correct connection-level error behavior by calling `_request`. The three non-streaming functions become shorter and more readable, each focusing on its unique payload/response logic. The streaming function's iteration logic remains explicit and generator-appropriate, avoiding a forced abstraction that would obscure the yield contract. Cross-cutting concerns that apply to all four (connection timeout, retry policy, metrics) are centralized in `_request`; streaming-specific concerns (chunk framing, mid-stream error reporting) stay where they logically belong.
+
+### AC-41 · Resolve model name inside reserve() so callers need not supply it
+Strength: Strong
+Split-Depth: 1
+Files: internal_api_client.py
+
+Problem:
+reserve(reservation_id, model, on) requires the caller to pass the model name explicitly. The only callers in routes/chat.py obtain it via a local `import ollama_client` + `ollama_client.MODEL`, which is itself just `os.environ.get("LOCAL_MODEL")`. This forces the routing layer to import the Ollama provider module solely to read an environment variable, coupling routes to a specific provider implementation.
+
+Solution:
+Change the `reserve()` signature to `def reserve(reservation_id: str, model: str = None, on: bool = True) -> dict:`. At the top of the function body, add: `if model is None: model = os.environ.get("LOCAL_MODEL")`. The existing `if model:` guard before adding it to the JSON body already handles the falsy case correctly (omits the key), so no further body changes are needed. This makes the model argument truly optional and resolves it from the same env var `ollama_client.MODEL` reads, without importing that module.
+
+Benefits:
+Callers can omit the model argument entirely. The routing layer no longer needs to know where the model name originates. The env-var read is co-located with the HTTP call that actually consumes the value, making the dependency explicit in one place rather than scattered across route handlers.
+
+### AC-42 · Remove ollama_client import from chat route handlers
+Strength: Strong
+Split-Depth: 1
+Files: routes/chat.py
+Depends-On: AC-41
+
+Problem:
+Each of the three handlers that release or acquire a reservation (api_chat_close, api_chat_message, api_chat_reserve) performs a local `import ollama_client` and passes `ollama_client.MODEL` as the second positional argument to `internal_api_client.reserve()`. This is the only reference to `ollama_client` in the routing layer, and it exists purely to supply a value that `reserve()` can now resolve on its own (see the internal_api_client.py change).
+
+Solution:
+In each of the three handlers, delete the `import ollama_client` line and change the `reserve()` call to omit the model argument. For example, in api_chat_close the current line `internal_reserve(session_id, ollama_client.MODEL, False)` becomes `internal_reserve(session_id, None, False)` (or equivalently `internal_reserve(session_id, on=False)` using the keyword). Repeat the same two-line edit in api_chat_message and api_chat_reserve. After the edits, confirm no `ollama_client` identifier remains anywhere in routes/chat.py.
+
+Benefits:
+The routing layer is now provider-agnostic: it depends only on internal_api_client and the shared app helpers, not on a specific model-client module. Adding or swapping the local model provider later requires no changes to route files.
