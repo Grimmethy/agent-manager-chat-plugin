@@ -1162,3 +1162,29 @@ This finding was predicated on AC-002's recommendation to delete `local_tool_cli
 ---
 
 **Summary:** All three original findings were based on misreadings of the code's design intent. The streaming error-dict contract, the `local_tool_client.py` compatibility layer, and the `LocalToolClientError` alias are each intentional, documented, and load-bearing. No code change is warranted.
+
+### AC-88 · `providerLabel` export-name collision between `sessions-view.js` and `swap-view.js`
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js, static/chat.js
+
+Problem:
+Both `sessions-view.js` and `swap-view.js` export a function named `providerLabel`, but the two implementations differ in signature (they accept `row` vs `session`), in output format (the sessions version yields `"Claude · model"`; the swap version yields `"Claude · model · live account"` and also handles an `"Unknown"` provider), and in the "no model" fallback rule. Because `chat.js` is the documented consumer of both modules, it must alias one of the imports (e.g. `import { providerLabel as swapProviderLabel } from './swap-view.js'`), and every reader of `chat.js` must track which `providerLabel` is in scope at each call site. The two functions are not interchangeable even after disambiguation, so the shared name actively misleads rather than merely requiring a rename.
+
+Solution:
+Rename the export in `swap-view.js` to a name that reflects its distinct responsibility—e.g. `swapProviderLabel` or `accountLabel`—and update the single import site in `chat.js` accordingly. The function body and its internal logic remain unchanged; only the exported identifier and the one import binding are touched.
+
+Benefits:
+The import block in `chat.js` becomes self-documenting: each name at the call site immediately signals which module's formatting rules apply, eliminating the need for an alias and removing a class of copy-paste or shadowing bugs. Future contributors adding a third view module no longer face the temptation (or pressure) to reuse the same generic name, and the two modules' distinct contracts are visible at the module boundary rather than only discoverable by reading both implementations.
+
+### AC-89 · Duplicated filter scaffolding in `filterRows` / `filterChats`
+Strength: Worth exploring
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+The first three lines of `filterRows` and `filterChats` (needle normalisation, empty-query short-circuit, and the inner `has` helper) are textually identical; only the set of fields checked in the predicate differs (`name/cwd/host` vs `title/providerLabel/model`). This is a small amount of repetition in an otherwise well-factored module, but it is the one place where the "same logic, different field list" pattern is likely to grow—e.g. adding a `model` field to the terminal filter or a `cwd` field to the chat filter—and the two copies will drift independently.
+
+Solution:
+Extract the shared scaffolding into a small helper, e.g. `filterByFields(rows, query, fields)`, that performs needle normalisation, the empty-query short-circuit, and the `has` check over a caller-supplied field list. `filterRows` and `filterChats` each become a one-line delegation passing their respective field arrays.
+
+Benefits:
+Adding a new searchable field to either filter is a one-element change to an array literal rather than a copy of the helper body. The two filter functions can no longer silently diverge in normalisation or short-circuit behaviour, and the shared helper has a single, testable location for edge-case logic (unicode normalisation, case-folding, etc.).
