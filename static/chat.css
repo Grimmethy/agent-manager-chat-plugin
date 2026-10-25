@@ -206,6 +206,8 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
   .multi-chat-new-btn,
   .multi-chat-switcher .chat-switcher-btn,
   .multi-chat-strip-btn,
+  .cmd-confirm,
+  .cmd-deny,
   .chat-chime-setting { min-height: 44px; min-width: 44px; }
   .chat-chime-setting input { width: 20px; height: 20px; }
 }
@@ -297,3 +299,19 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 .chat-tool-args { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
 .chat-tool-outcome { grid-column: 2; }
 .chat-tool-bad .chat-tool-outcome { color: var(--bad); }
+
+/* Proposed write commands: a card with the exact command, why, and Confirm / Deny while it waits; the stored result under it once it has run. */
+.cmd-block { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.cmd-card { padding: 8px 10px; background: var(--panel); border: 2px solid var(--border); border-radius: 6px; }
+.cmd-pending { border-color: var(--warn); }
+.cmd-denied { opacity: .75; }
+.cmd-head { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-bottom: 4px; }
+.cmd-argv { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; }
+.cmd-meta, .cmd-status { font-size: 12px; color: var(--muted); margin-top: 4px; overflow-wrap: anywhere; }
+.cmd-why { font-size: 13px; margin-top: 4px; }
+.cmd-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.cmd-run { font-size: 12px; border: 2px solid var(--border); border-radius: 6px; padding: 6px 10px; }
+.cmd-run summary { cursor: pointer; overflow-wrap: anywhere; }
+.cmd-run-bad { border-color: var(--bad); }
+.cmd-out, .cmd-err { margin: 6px 0 0; padding: 6px 8px; max-height: 240px; overflow: auto; background: var(--bg); border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.cmd-err { color: var(--bad); }

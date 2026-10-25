@@ -32,6 +32,8 @@ import { fullTitle, orderSessions, nextSelectionAfterClose, formatRow,
 import { providerLabel, swapOptions, offerText, swapBody } from "./swap-view.js";
 // The tools an assistant turn ran (stored by tool_log.py), shown as a collapsed list under its reply.
 import { renderToolsHtml } from "./tools-view.js";
+// Proposed write commands (Confirm / Deny) and the results of the ones that ran (command_runs.py stores them on the assistant entry).
+import { renderCommandsHtml } from "./commands-view.js";
 // Piece 2/10: the pure "needs you" attention logic (which rows newly became waiting,
 // how many are waiting) lives in attention-view.js (piece 1). This file only calls it
 // and applies the result to the DOM; keep the decision logic there.
@@ -136,7 +138,7 @@ function chatRenderTranscript(transcript, session) {
         <textarea class="tpl-text" rows="6" ${done ? 'disabled' : ''}>${escapeHtml(tp.text)}</textarea>
         <button type="button" class="tpl-save" ${done ? 'disabled' : ''}>${done ? 'Saved' : 'Save template'}</button>${note}</div>`;
     }).join('');
-    return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div>${renderToolsHtml(t.tools)}${cards}</div>`;
+    return `<div class="${cls}"><div class="chat-msg-role">${escapeHtml(roleLabel)}</div><div class="chat-msg-text">${body}</div>${renderToolsHtml(t.tools)}${renderCommandsHtml(t)}${cards}</div>`;
   }).join('');
   return `<div class="field-label">Conversation</div><div class="chat-transcript">${rows}</div>`;
 }
@@ -443,6 +445,11 @@ class ChatPane {
       if (option) { this.setSwapOpen(false); this.performSwap(option); }
       return;
     }
+    const cmdBtn = e.target.closest && e.target.closest('.cmd-confirm, .cmd-deny');
+    if (cmdBtn && this.session && this.root.contains(cmdBtn)) {
+      await this.decideCommand(cmdBtn);
+      return;
+    }
     const btn = e.target.closest && e.target.closest('.tpl-save');
     if (!btn || !this.session || !this.root.contains(btn)) return;
     const card = btn.closest('.tpl-card');
@@ -462,6 +469,27 @@ class ChatPane {
       showToast(body.proposal.message, body.proposal.status === 'saved' ? 'info' : 'error');
     } catch (err) {
       showToast('Could not save template: ' + err.message);
+    }
+    this.render();
+  }
+
+  // Confirm / Deny on a proposed command. The route persists the decision first and, for Confirm, waits for core's runner (up to 15 minutes), so the card shows
+  // 'Running...' meanwhile; the stored session that comes back holds the result. An error leaves the proposal as the server has it.
+  async decideCommand(btn) {
+    const card = btn.closest('.cmd-card');
+    if (!card) return;
+    const confirm = btn.classList.contains('cmd-confirm');
+    for (const b of card.querySelectorAll('button')) b.disabled = true;
+    btn.textContent = confirm ? 'Running...' : 'Denying...';
+    try {
+      const resp = await fetch(`api/chat/${encodeURIComponent(this.session.id)}/command/${encodeURIComponent(card.dataset.proposal)}/${confirm ? 'confirm' : 'deny'}`, { method: 'POST' });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
+      this.setSession(body.session);
+    } catch (err) {
+      showToast('Could not record that decision: ' + err.message);
+      await this.load();
+      return;
     }
     this.render();
   }
