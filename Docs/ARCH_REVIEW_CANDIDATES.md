@@ -1414,3 +1414,27 @@ Move the model-name resolution inside `internal_api_client.reserve()` itself. Th
 
 Benefits:
 The routing layer no longer depends on a specific provider's client module or its exported constants. Adding a new provider that manages its own reservations (e.g., a GPU pool or a rate-limited remote service) requires no changes to the swap route—only a new branch inside `internal_api_client.reserve()` or a provider-specific override. The "what model to release" knowledge is co-located with the reservation mechanism that actually uses it, improving locality, testability, and long-term maintainability.
+
+### AC-106 · Duplicated and divergent provider-labeling logic across view modules
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` independently define a `providerLabel` function that maps a `provider` field to a human-readable display string, but they handle the `claude` provider differently: `sessions-view.js` renders `'Claude'` or `'Claude · <model>'`, while `swap-view.js` renders `'Claude · <model> · <account>'` or `'Claude · live account'`. Beyond the formatting divergence, the two implementations also guard against `null`/`undefined` inputs with different patterns (`row &&` vs. `session || {}`), so a change to the backend's data shape requires touching both files independently and keeping them in sync by hand. The split logic creates a tight coupling to each file's assumed data shape and invites subtle inconsistency the moment the provider or account fields evolve.
+
+Solution:
+Extract the provider-labeling logic into a single shared utility module (e.g. `static/provider-label.js`) that exports one `providerLabel(session, options)` function. The function should:
+
+1. Normalize the input with a single guard (`const s = session || {}`).
+2. Accept an `options` object (defaulting to `{ includeAccount: false }`) that controls whether the `account` field is appended to the display string.
+3. Build the display string from whichever of `provider`, `model`, and `account` are present, including `account` **only** when `options.includeAccount` is truthy.
+
+Call sites:
+
+- `static/sessions-view.js` calls `providerLabel(row)` (or `providerLabel(row, { includeAccount: false })`), preserving its existing `'Claude · <model>'` format without an account segment.
+- `static/swap-view.js` calls `providerLabel(session, { includeAccount: true })`, preserving its existing `'Claude · <model> · <account>'` format.
+
+Both files import the shared function, replacing their local definitions. The shared module becomes the single source of truth for the base mapping (provider → display name, model suffix), while the `includeAccount` flag lets each view opt in or out of the account segment without duplicating the core logic. The null/undefined guard is written once and applied uniformly.
+
+Benefits:
+A future change to how the backend reports provider or model requires editing exactly one file instead of two, eliminating the risk that the two views drift apart. The unified null-guard removes a class of subtle bugs where one view crashes or renders `undefined` while the other silently defaults. The explicit `includeAccount` option makes the formatting contract at each call site self-documenting: a reader of `sessions-view.js` sees that it intentionally omits account, and a reader of `swap-view.js` sees that it intentionally includes it. New view modules that need a provider label can import the same function and pass the appropriate option rather than re-implementing the mapping, keeping the display contract consistent across the application.
