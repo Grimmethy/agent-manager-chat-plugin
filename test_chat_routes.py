@@ -239,7 +239,8 @@ class SessionListAndCloseRouteTest(RouteTestBase):
             resp = self.client.post("/api/chat/chat-1-aaaaaaaa/close")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(reserve.call_args[0][0], "chat-1-aaaaaaaa")
-        self.assertIs(reserve.call_args[0][2], False)
+        # the route now passes `on` by keyword and lets reserve() default the model
+        self.assertIs(reserve.call_args.kwargs["on"], False)
 
     def test_get_returns_the_full_session(self):
         resp = self.client.get("/api/chat/chat-1-aaaaaaaa")

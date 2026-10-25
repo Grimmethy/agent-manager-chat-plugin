@@ -239,9 +239,8 @@ def api_chat_close(session_id):
         abort(404)
     if session.get("reserved"):
         from internal_api_client import InternalApiError, reserve as internal_reserve
-        import ollama_client
         try:
-            internal_reserve(session_id, ollama_client.MODEL, False)
+            internal_reserve(session_id, on=False)
         except InternalApiError as e:  # noqa: BLE001 -- never block closing a chat on this
             print(f"[chat-close] reservation release failed (non-fatal): {e}", file=sys.stderr, flush=True)
     ended = end_session(CHAT_STORAGE_DIR, session_id)
@@ -418,8 +417,7 @@ def api_chat_message(session_id):
     if existing.get("reserved"):
         try:
             from internal_api_client import reserve as internal_reserve
-            import ollama_client
-            internal_reserve(session_id, ollama_client.MODEL, True)
+            internal_reserve(session_id, on=True)
         except InternalApiError as e:  # noqa: BLE001 -- best-effort refresh, never block the turn
             print(f"[chat-reserve] refresh failed (non-fatal): {e}", file=sys.stderr, flush=True)
 
@@ -442,7 +440,6 @@ def api_chat_reserve(session_id):
     from app import CHAT_STORAGE_DIR
     from chat_sessions import get_session, set_reserved, PROVIDER_LOCAL
     from internal_api_client import InternalApiError, reserve as internal_reserve
-    import ollama_client
 
     session = get_session(CHAT_STORAGE_DIR, session_id)
     if not session:
@@ -458,7 +455,7 @@ def api_chat_reserve(session_id):
     # _internal_chat_reservations registry -- this repo no longer holds an OS file
     # handle or a lock of its own for this at all, session_id is just an opaque key.
     try:
-        internal_reserve(session_id, ollama_client.MODEL, want_on)
+        internal_reserve(session_id, on=want_on)
     except InternalApiError as e:
         abort(502, description=f"reservation call to the core dashboard failed: {e}")
 

@@ -75,7 +75,9 @@ def preempt() -> list:
         raise InternalApiError(f"POST /api/internal/chat/preempt failed: {e}") from e
 
 
-def reserve(reservation_id: str, model: str, on: bool) -> dict:
+def reserve(reservation_id: str, model: str = None, on: bool = True) -> dict:
+    if model is None:
+        model = os.environ.get("LOCAL_MODEL")
     body = {"reservationId": reservation_id, "on": on}
     if model:
         body["model"] = model
