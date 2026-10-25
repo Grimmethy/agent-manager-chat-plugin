@@ -1680,3 +1680,42 @@ Solution:
 
 Benefits:
 Host resolution logic is centralized in the configuration module, ensuring consistent error handling and eliminating code duplication. Because `AgentError` now lives in a shared leaf module, `agent_hosts.py` can raise it without importing from `agent_client.py`, preserving the existing one-way dependency (`agent_client` → `agent_hosts`) and avoiding a circular import. `agent_client.py` becomes a thinner HTTP layer that delegates all host and token concerns to `agent_hosts.py`, improving separation of concerns.
+
+### AC-125 · Duplicated "plain row" filter logic between handoff and chat_sessions
+Strength: Strong
+Files: handoff.py, chat_sessions.py
+
+Problem:
+`handoff.py` defines `_is_plain_row` whose docstring explicitly states it mirrors the two skip rules in `chat_sessions._build_local_messages` (skip rows with a truthy `error` field, skip rows with `marker: True`). The same predicate is therefore implemented in two modules, and the only link between them is a prose note in a docstring. If the definition of a "plain row" ever changes—a new row type is introduced, the `marker` key is renamed, or an additional skip condition is added—both implementations must be updated in lockstep, and nothing in the type system or test suite enforces that they stay in agreement.
+
+Solution:
+Extract the predicate into a single shared helper (e.g. a `is_plain_row(row)` function in a small utility module or in `chat_sessions` itself, imported by `handoff`). Both `handoff.build_handoff` and `chat_sessions._build_local_messages` call the same function, eliminating the duplicated rule and the docstring cross-reference.
+
+Benefits:
+A single source of truth for the "plain row" rule removes the risk of the two implementations drifting apart. Future changes to the row schema require editing exactly one function. The docstring cross-reference becomes unnecessary, and a unit test on the shared helper covers both call sites.
+
+### AC-126 · Inconsistent backend-location strategy between model_stats_client and ollama_client
+Strength: Worth exploring
+Files: model_stats_client.py, ollama_client.py
+
+Problem:
+`model_stats_client.py` resolves its backend path (`model-stats-db.js`) at import time by concatenating a `CORE_REPO_ROOT` constant with a relative sub-path, a choice its own docstring flags as a workaround for the repo's directory depth. `ollama_client.py`, in the same community, locates its backend (the Ollama server URL and model name) via environment variables read at import time. The two clients therefore use different mechanisms for the same concern—"where is my backend?"—and the `model_stats_client` approach is brittle to any reorganisation of the repository layout.
+
+Solution:
+Adopt a single convention for backend location across the community. The simplest path is to let `model_stats_client.py` read its script path from an environment variable (e.g. `MODEL_STATS_DB_JS`) with a sensible default that still uses `CORE_REPO_ROOT`, mirroring the env-var pattern already used by `ollama_client.py`. Alternatively, introduce a tiny shared configuration module that both clients import, so the "where is my backend" question is answered in one place.
+
+Benefits:
+Both clients follow the same configuration-locality convention, making the community easier to reason about and to deploy in different directory layouts. The fragile hard-coded relative path in `model_stats_client.py` becomes overridable without code changes, and the two modules no longer disagree on how to locate their backends.
+
+### AC-127 · Account-registry shape duplicated across two test files
+Strength: Worth exploring
+Files: test_chat_routes_swap.py, test_chat_sessions_account.py
+
+Problem:
+Both `test_chat_routes_swap.py` and `test_chat_sessions_account.py` construct a fake account registry with the same set of keys (`label`, `host`, `tokenFile`, `live`). The swap test does so through an `_add_account` helper that calls `accounts.add(self.storage, label, "example.invalid", FAKE_TOKEN_FILE)`, while the account test builds the registry dict directly via a `_registry` helper. The registry schema is therefore encoded in two test files, and a change to the registry shape (a new required key, a renamed field) would require updating both files independently.
+
+Solution:
+Factor the fake-registry construction into a single shared test helper (e.g. a `make_fake_registry(label, host, token_file, live=True)` function in a small `test_helpers.py` or in a shared `conftest`-style module within the test directory). Both test files import and call that helper, so the registry shape lives in exactly one place.
+
+Benefits:
+A registry-schema change requires editing one helper instead of two test files. New tests that need a fake registry can reuse the same helper, reducing the chance of a subtly wrong shape being introduced. The test suite becomes easier to maintain as the account model evolves.
