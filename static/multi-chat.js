@@ -154,6 +154,23 @@ export function stripButtons(index, paneCount, visibleCount) {
   return { canPrev: i > 0, canNext: i < lastStripIndex(paneCount, visibleCount) };
 }
 
+// Which pane is first on screen after the user scrolls or swipes the strip: the first pane whose left edge is at or past the scroll position (4px of slack for
+// sub-pixel snapping), clamped to the last pane; 0 when there are no panes. `paneLefts` are the panes' left offsets inside the strip, in order.
+export function indexFromScroll(scrollLeft, paneLefts) {
+  const lefts = Array.isArray(paneLefts) ? paneLefts : [];
+  if (!lefts.length) return 0;
+  const x = typeof scrollLeft === 'number' && Number.isFinite(scrollLeft) ? scrollLeft : 0;
+  const i = lefts.findIndex((l) => typeof l === 'number' && Number.isFinite(l) && l >= x - 4);
+  return i === -1 ? lefts.length - 1 : i;
+}
+
+// The arrow keys move the strip only when the user is not typing: false inside an input, a textarea, a select or a contenteditable element.
+export function shouldHandleArrowKey(tagName, isContentEditable = false) {
+  if (isContentEditable) return false;
+  const tag = String(tagName == null ? '' : tagName).toUpperCase();
+  return !(tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT');
+}
+
 // Layout templates (HUB0010 6/10): named {preset, count} recipes. Plain data in, plain data
 // out; nothing here touches storage or the DOM, and no input is ever mutated.
 function slotsFor(preset) {
@@ -366,6 +383,86 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     tplBox.appendChild(tplSaveRow);
     toolbar.appendChild(tplBox);
 
+    // --- toolbar: previous / next buttons and the position label for the pane strip ----------------
+    // The strip (.multi-chat-flex, one snap row) scrolls natively by touch swipe or mouse; these buttons, the label and the arrow keys are the other ways to move.
+    const nav = document.createElement('div');
+    nav.className = 'multi-chat-strip-nav';
+    nav.hidden = true;
+    const prevBtn = document.createElement('button');
+    prevBtn.type = 'button';
+    prevBtn.className = 'secondary multi-chat-strip-btn';
+    prevBtn.textContent = '\u25C0';
+    prevBtn.title = 'Previous chat';
+    prevBtn.setAttribute('aria-label', 'Previous chat');
+    const stripLabelEl = document.createElement('span');
+    stripLabelEl.className = 'multi-chat-strip-label';
+    stripLabelEl.setAttribute('aria-live', 'polite');
+    const nextBtn = document.createElement('button');
+    nextBtn.type = 'button';
+    nextBtn.className = 'secondary multi-chat-strip-btn';
+    nextBtn.textContent = '\u25B6';
+    nextBtn.title = 'Next chat';
+    nextBtn.setAttribute('aria-label', 'Next chat');
+    nav.appendChild(prevBtn);
+    nav.appendChild(stripLabelEl);
+    nav.appendChild(nextBtn);
+    toolbar.appendChild(nav);
+
+    let strip = null; // the current .multi-chat-flex element, or null (dockview, or nothing drawn)
+    let stripIndex = 0;
+    let stripScrollTimer = null;
+    const stripPanes = () => (strip ? Array.from(strip.children) : []);
+    const stripLefts = () => stripPanes().map((p) => p.offsetLeft - strip.offsetLeft);
+    function updateStripNav() {
+      const count = stripPanes().length;
+      nav.hidden = !strip || count < 2;
+      if (nav.hidden) return;
+      const visible = stripVisibleCount(window.innerWidth || 1024);
+      stripIndex = clampStripIndex(stripIndex, count, visible);
+      stripLabelEl.textContent = stripLabel(stripIndex, count, visible);
+      const b = stripButtons(stripIndex, count, visible);
+      prevBtn.disabled = !b.canPrev;
+      nextBtn.disabled = !b.canNext;
+    }
+    function scrollStripTo(i, smooth) {
+      const pane = stripPanes()[i];
+      if (!strip || !pane) return;
+      strip.scrollTo({ left: pane.offsetLeft - strip.offsetLeft, behavior: smooth ? 'smooth' : 'auto' });
+    }
+    function stepStripBy(delta) {
+      const count = stripPanes().length;
+      const next = stepStrip(stripIndex, delta, count, stripVisibleCount(window.innerWidth || 1024));
+      if (!strip || next === stripIndex) return false;
+      stripIndex = next;
+      scrollStripTo(next, true);
+      updateStripNav();
+      return true;
+    }
+    // Called with each freshly built strip: keep the position across a re-render, follow the user's own scrolling and swiping (debounced 80 ms).
+    function attachStrip(flex) {
+      strip = flex;
+      scrollStripTo(clampStripIndex(stripIndex, stripPanes().length, stripVisibleCount(window.innerWidth || 1024)), false);
+      updateStripNav();
+      flex.addEventListener('scroll', () => {
+        if (stripScrollTimer !== null) clearTimeout(stripScrollTimer);
+        stripScrollTimer = setTimeout(() => {
+          stripScrollTimer = null;
+          if (strip !== flex) return;
+          stripIndex = clampStripIndex(indexFromScroll(flex.scrollLeft, stripLefts()), stripPanes().length, stripVisibleCount(window.innerWidth || 1024));
+          updateStripNav();
+        }, 80);
+      });
+    }
+    prevBtn.onclick = () => stepStripBy(-1);
+    nextBtn.onclick = () => stepStripBy(1);
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const t = e.target;
+      if (!shouldHandleArrowKey(t && t.tagName, !!(t && t.isContentEditable))) return;
+      if (stepStripBy(e.key === 'ArrowRight' ? 1 : -1)) e.preventDefault();
+    });
+
     function refreshTemplateMenu() {
       tplSelect.innerHTML = '';
       const head = document.createElement('option');
@@ -527,6 +624,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     function render() {
       host.innerHTML = ''; // unmounts every previous pane's DOM -- no network
+      strip = null;
+      updateStripNav();
       markPreset();
       // Owner 2026-10-24: the strip always shows the saved layout at every width.
       // Below 760px the CSS sets --strip-visible to 1 (static/chat.css), so a phone
@@ -579,6 +678,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
       if (filled === 0) flex.appendChild(placeholder('+ New chat', openNewChat, wide));
       host.appendChild(flex);
+      attachStrip(flex);
     }
 
     function closeSlot(id) {
@@ -615,6 +715,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         }
       });
       host.appendChild(flex);
+      attachStrip(flex);
     }
 
     // Re-render only when crossing the 760px boundary (a plain resize must not
@@ -629,6 +730,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         if (mobile !== lastMobile) {
           lastMobile = mobile;
           render();
+        } else {
+          updateStripNav();
         }
       }, 150);
     });
