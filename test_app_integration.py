@@ -56,7 +56,8 @@ class AgentRouteIntegrationTests(unittest.TestCase):
     def test_disabled_without_url(self):
         with self.env(url=False):
             body = self.client.get("/api/chat/terminal-sessions").get_json()
-            self.assertEqual(body, {"enabled": False, "reachable": False, "sessions": []})
+            self.assertEqual(body, {"enabled": False, "reachable": False, "sessions": [],
+                                   "hosts": [], "skipped": []})
             self.assertEqual(self.client.get("/api/chat/terminal-sessions/events").status_code, 404)
 
     def test_lists_sessions(self):
@@ -69,7 +70,13 @@ class AgentRouteIntegrationTests(unittest.TestCase):
         with self.env(token="wrong"):
             resp = self.client.get("/api/chat/terminal-sessions")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.get_json(), {"enabled": True, "reachable": False, "sessions": []})
+        body = resp.get_json()
+        self.assertEqual(body["enabled"], True)
+        self.assertFalse(body["reachable"])
+        self.assertEqual(body["sessions"], [])
+        self.assertEqual(body["hosts"], ["default"])
+        self.assertEqual([s["host"] for s in body["skipped"]], ["default"])
+        self.assertTrue(body["skipped"][0]["reason"])
 
     def test_agent_down(self):
         self._stop()
