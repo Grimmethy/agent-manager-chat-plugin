@@ -1544,3 +1544,29 @@ Benefits:
 A single, importable source of truth for token estimation means that adjusting the strategy (e.g., switching to a model-specific tokenizer) is a one-line change in one file rather than a search across the codebase for every place the heuristic was re-implemented.
 
 NOTE: Flag 1's core factual point (the design is documented and intentional, not an accidental OCP violation) was applied; the "violation" language was removed and the item reframed as an optional extensibility improvement. Flag 2's point that no duplication is evidenced in the provided inputs was applied; the speculative "likely duplicated in chat_sessions.py / ollama_client.py" claim was removed and the problem restated as a centralisation/fragility concern rather than an asserted duplication.
+
+### AC-115 · Route layer duplicates label validation via private method
+Strength: Strong
+Files: routes/accounts.py, accounts.py
+
+Problem:
+In `api_chat_accounts_make_live`, the route handler calls `accounts._valid_label(label)` — a private method on the accounts module — to decide whether to return a 400 (invalid label) or let `accounts.make_live` raise a `KeyError` for a 404 (unknown label). The `make_live` method itself performs no label-format validation; it only checks membership. This means the route layer must reach into a private helper to replicate business-logic validation, creating a tight coupling: if the label-regex or validation rules in `accounts.py` are updated, the route's pre-check can silently drift out of sync, or the private method can be renamed/removed without the route layer failing at import time.
+
+Solution:
+Move the label-format validation into the public API of `accounts.py`. Either have `make_live` raise a `ValueError` for malformed labels (in addition to the existing `KeyError` for unknown ones), or expose a dedicated `accounts.validate_label(label)` public function. The route handler then simply catches `ValueError` → 400 and `KeyError` → 404, with no direct call to any private helper. Unit tests for `accounts.py` can exercise both error paths without spinning up an HTTP layer, and tests in `routes/` can mock `make_live` to raise either exception and assert the correct status code.
+
+Benefits:
+The route layer becomes a thin exception-to-HTTP-code mapper with no knowledge of label grammar. The public surface of `accounts.py` is self-contained and independently testable with plain `unittest` (no Flask test client required for the validation logic). Renaming or tightening the label regex in one place is sufficient; there is no second copy of the check to keep in sync.
+
+### AC-116 · Lazy import of CHAT_STORAGE_DIR from app.py to dodge circular dependency
+Strength: Worth exploring
+Files: routes/accounts.py, app.py
+
+Problem:
+The module docstring and inline comments in `routes/accounts.py` explicitly note that `from app import CHAT_STORAGE_DIR` is deferred into the body of each view function because `app.py` imports the blueprint from `routes/accounts.py`, which would otherwise create a circular import at module-load time. This forces every view that needs the storage path to repeat the lazy import, makes the blueprint unimportable in isolation (e.g., in a unit test that does `import routes.accounts` without first importing `app`), and ties the route module's runtime behaviour to the specific entry-point module rather than to a stable configuration surface.
+
+Solution:
+Extract `CHAT_STORAGE_DIR` (and any other shared constants) into a standalone `config.py` module that has no imports from `app.py` or `routes/`. Both `app.py` and `routes/accounts.py` import from `config.py` at the top of the module, eliminating the circular dependency entirely. If the value must be set at runtime (e.g., from an environment variable or CLI flag), `config.py` can expose a `configure(...)` function that `app.py` calls once at startup; the route module simply reads `config.CHAT_STORAGE_DIR` at call time without an import-time cycle.
+
+Benefits:
+The lazy-import workaround and its explanatory comments disappear, making `routes/accounts.py` importable and unit-testable with plain `unittest` without first importing the full application. The blueprint can be registered in a test app or a different entry point without special-casing the import order. Adding a new route that needs the storage path no longer requires remembering to place the import inside the function body.
