@@ -40,6 +40,7 @@ from pathlib import Path
 
 import accounts
 import claude_client
+import command_runs
 import handoff
 import local_tool_client
 import model_stats_client
@@ -748,7 +749,7 @@ def _build_local_messages(session: dict, message: str) -> list:
             # "marker" has no marker key and is replayed normally.
             continue
         role = "assistant" if turn["role"] == "assistant" else "user"
-        messages.append({"role": role, "content": turn["text"]})
+        messages.append({"role": role, "content": turn["text"] + command_runs.context_note(turn)})
     messages.append({"role": "user", "content": message})
     return messages
 
@@ -901,6 +902,7 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
     if result_box is not None:
         result_box["final_text"] = final_text
         result_box["tools"] = tool_log.summarize_tool_calls((result or {}).get("toolCallLog"))
+        result_box["proposals"] = (result or {}).get("commandProposals") or []
 
 
 def stream_message(storage_dir: Path, session_id: str, message: str):
@@ -975,6 +977,8 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     session["transcript"][-1]["text"] = reply.strip()
     if result_box.get("tools"):
         session["transcript"][-1]["tools"] = result_box["tools"]
+    if result_box.get("proposals"):
+        command_runs.record_proposals(session["transcript"][-1], result_box["proposals"])
     if proposals:
         session["transcript"][-1]["templates"] = proposals
     _write_session(storage_dir, session)
