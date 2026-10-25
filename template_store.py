@@ -132,8 +132,8 @@ def save_template(block: dict) -> dict:
             stored = (verify.json().get("value") or "").strip()
             if stored != block["text"].strip():
                 out["message"] = (
-                    f"'{block['key']}' was modified by a concurrent writer between "
-                    f"our check and write -- not saved (pick another name or retry)"
+                    f"'{block['key']}' was saved but then overwritten by a concurrent writer "
+                    f"before we could confirm it -- your text was replaced (re-save or edit it in {kind['app']})"
                 )
                 return out
         except (requests.RequestException, ValueError) as e:
