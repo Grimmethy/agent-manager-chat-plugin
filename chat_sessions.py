@@ -150,6 +150,28 @@ def _migrate_session(session: dict) -> dict:
     session.setdefault("swaps", [])
     # Later shape: {'upToIndex': int, 'text': str, 'at': iso}
     session.setdefault("summary", None)
+    # 2026-10-25 (walkthrough): label of the project this chat acts on by default;
+    # None = fall back to the dashboard's active project.
+    session.setdefault("chosen_project", None)
+    return session
+
+
+def set_chosen_project(storage_dir: Path, session_id: str, project: str):
+    """2026-10-25 (walkthrough): set which project this chat acts on by default.
+    Persists the session, appends a one-line system note to the transcript (so the
+    model and the UI both see the change), and returns the updated session -- or
+    None if the session does not exist or is no longer active."""
+    session = _read_session(storage_dir, session_id)
+    if session is None or session.get("status") != "active":
+        return None
+    session["chosen_project"] = project
+    # Transcript rows use `text` (see _build_local_messages's replay loop) and `role`;
+    # a system row replays as a user-side note the model can still see each turn.
+    session.setdefault("transcript", []).append(
+        {"role": "system", "text": f"Project changed to: {project} (chosen)"}
+    )
+    _touch(session)
+    _write_session(storage_dir, session)
     return session
 
 
@@ -262,6 +284,10 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
         "swaps": [],
         # Later shape: {'upToIndex': int, 'text': str, 'at': iso}
         "summary": None,
+        # 2026-10-25 (walkthrough): the project label this chat acts on by default --
+        # passed as the default `project` for the task tools; None = the dashboard's
+        # active project. An explicit `project` tool argument still wins.
+        "chosen_project": None,
     }
 
 
@@ -658,7 +684,18 @@ _LOCAL_SYSTEM_PROMPT = (
 
 
 def _local_system_prompt(session: dict) -> str:
-    prompt = _LOCAL_SYSTEM_PROMPT + "\n\nAccessible repos:\n" + _roots_blurb(session)
+    prompt = _LOCAL_SYSTEM_PROMPT
+    # 2026-10-25 (walkthrough): a new chat opened with no indication of its target
+    # project; the dashboard's active project was the wrong queue's project. When the
+    # user picked one for this session, make it the default project for the task tools.
+    if session.get("chosen_project"):
+        prompt += (
+            f"\nThis chat is acting on project: {session['chosen_project']} (chosen). "
+            "Use that label as the default `project` argument for the task tools "
+            "(queue_reviewed_task, read_task, search_tasks, and the unstick tools). "
+            "An explicit `project` argument in a tool call still overrides this default."
+        )
+    prompt += "\n\nAccessible repos:\n" + _roots_blurb(session)
     agents_md = _read_agents_md(session)
     if agents_md:
         prompt += "\n\n---\n\n" + _agents_md_blurb(agents_md)
