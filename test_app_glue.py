@@ -181,6 +181,36 @@ class TestChatRoots(unittest.TestCase):
             self.assertEqual(app._chat_roots(), [os.path.realpath(str(d))])
 
 
+class TestChatExtraRoots(unittest.TestCase):
+    """AGENT_MANAGER_CHAT_EXTRA_ROOTS adds repos that are neither plugins nor projects (e.g. crosslister) after core's roots."""
+
+    def _env(self, value):
+        return mock.patch.dict(os.environ, {"AGENT_MANAGER_CHAT_EXTRA_ROOTS": value} if value is not None else {}, clear=False)
+
+    def test_unset_leaves_the_core_roots_unchanged(self):
+        os.environ.pop("AGENT_MANAGER_CHAT_EXTRA_ROOTS", None)
+        with mock.patch("internal_api_client.get_roots", return_value=["/a", "/b"]):
+            self.assertEqual(app._chat_roots(), ["/a", "/b"])
+
+    def test_existing_extra_directories_are_appended_after_the_core_roots(self):
+        x, y = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+        with self._env(os.pathsep.join([str(x), str(y)])), mock.patch("internal_api_client.get_roots", return_value=["/a"]):
+            self.assertEqual(app._chat_roots(), ["/a", os.path.realpath(str(x)), os.path.realpath(str(y))])
+
+    def test_missing_paths_blank_entries_and_duplicates_are_skipped(self):
+        x = Path(tempfile.mkdtemp())
+        value = os.pathsep.join([str(x), "/no/such/dir-xyz", "", "  ", str(x), str(x) + "/../" + x.name])
+        with self._env(value), mock.patch("internal_api_client.get_roots", return_value=[os.path.realpath(str(x)), "/a"]):
+            self.assertEqual(app._chat_roots(), [os.path.realpath(str(x)), "/a"])
+
+    def test_extras_are_also_added_when_core_is_unreachable(self):
+        from internal_api_client import InternalApiError
+        core, x = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+        with self._env(str(x)), mock.patch.object(app, "CORE_REPO_ROOT", core), \
+             mock.patch("internal_api_client.get_roots", side_effect=InternalApiError("down")):
+            self.assertEqual(app._chat_roots(), [os.path.realpath(str(core)), os.path.realpath(str(x))])
+
+
 class TestDiscussProviderArgs(unittest.TestCase):
     def test_defaults_to_local_with_no_model_effort(self):
         provider, model, effort = app._discuss_provider_args({})
