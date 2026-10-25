@@ -7,6 +7,7 @@ model-stats.db: 2 of 3 real Chat calls in one session showed that exact false me
 
 Run: .venv/bin/python -m unittest test_chat_sessions -v
 """
+import inspect
 import sys
 import tempfile
 import unittest
@@ -265,6 +266,23 @@ class NoGitHandoffPromptTest(unittest.TestCase):
         prompt = chat_sessions._LOCAL_SYSTEM_PROMPT
         self.assertIn("worker-3090", prompt)
         self.assertNotIn("worker-reasoning", prompt)
+
+
+class FreshnessRulesPromptTest(unittest.TestCase):
+    """2026-10-25: the chat reported months-old sales as 'the most recent' and said 'nothing to do' after silently swapping its data source."""
+
+    def test_rules_name_newest_date_today_could_not_run_and_stale(self):
+        rules = chat_sessions._FRESHNESS_RULES
+        for phrase in ("newest date", "today's date", "could not run", "possibly stale", "never by row id", "nothing to do"):
+            self.assertIn(phrase, rules)
+
+    def test_local_system_prompt_includes_the_rules(self):
+        self.assertIn(chat_sessions._FRESHNESS_RULES, chat_sessions._LOCAL_SYSTEM_PROMPT)
+        self.assertIn(chat_sessions._FRESHNESS_RULES, chat_sessions._local_system_prompt({"repoRoot": "/x", "roots": ["/x"]}))
+
+    def test_claude_first_turn_preamble_includes_the_rules(self):
+        src = inspect.getsource(chat_sessions._send_claude)
+        self.assertIn("preamble_parts.append(_FRESHNESS_RULES)", src, "the Claude first-turn preamble carries the same rules")
 
 
 class RecordTurnErrorTest(unittest.TestCase):

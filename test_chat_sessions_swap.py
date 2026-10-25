@@ -244,10 +244,12 @@ class HandOffFirstTurnTests(unittest.TestCase):
         # The current turn's own rows are not replayed inside the hand-off.
         self.assertNotIn("User: and now delete bar.py", out)
 
-    def test_fresh_session_first_turn_is_unchanged(self):
-        # No earlier rows at all: the prompt is exactly the new message.
+    def test_fresh_session_first_turn_has_only_the_freshness_rules_before_the_message(self):
+        # No earlier rows at all: no hand-off; the only addition is the freshness rules preamble, and the new message stays the tail.
         out = self._send_captured(self._session(), "hello world")
-        self.assertEqual(out, "hello world")
+        self.assertTrue(out.startswith(chat_sessions._FRESHNESS_RULES))
+        self.assertTrue(out.endswith("\n\n---\n\nhello world"))
+        self.assertNotIn("HANDOFF:", out)
 
     def test_later_turn_with_resume_id_has_no_handoff(self):
         s = self._session()
