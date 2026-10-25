@@ -352,7 +352,31 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     let switcher = null;
     const refreshSwitcher = () => { if (switcher) switcher.refresh(); };
 
-    // --- toolbar: preset buttons (existing .secondary class) ----------------
+    // --- toolbar: one "Layout" control at the end of the bar; the presets and the templates live in its popover ----------------
+    const layoutBox = document.createElement('div');
+    layoutBox.className = 'multi-chat-layout';
+    const layoutBtn = document.createElement('button');
+    layoutBtn.type = 'button';
+    layoutBtn.className = 'secondary multi-chat-layout-btn';
+    layoutBtn.textContent = 'Layout \u25BE';
+    layoutBtn.setAttribute('aria-haspopup', 'true');
+    layoutBtn.setAttribute('aria-expanded', 'false');
+    const layoutMenu = document.createElement('div');
+    layoutMenu.className = 'multi-chat-layout-menu';
+    layoutMenu.hidden = true;
+    const presetRow = document.createElement('div');
+    presetRow.className = 'multi-chat-presets';
+    layoutMenu.appendChild(presetRow);
+    layoutBox.appendChild(layoutBtn);
+    layoutBox.appendChild(layoutMenu);
+    function setLayoutOpen(open) {
+      layoutMenu.hidden = !open;
+      layoutBtn.setAttribute('aria-expanded', String(open));
+    }
+    layoutBtn.onclick = (e) => { e.stopPropagation(); setLayoutOpen(layoutMenu.hidden); };
+    document.addEventListener('click', (e) => { if (!layoutMenu.hidden && !layoutBox.contains(e.target)) setLayoutOpen(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !layoutMenu.hidden) setLayoutOpen(false); });
+
     const presetButtons = {};
     const PRESET_LABELS = { '1': 'Single', '2col': 'Two columns', '2x2': 'Grid 2x2' };
     for (const preset of PRESETS) {
@@ -365,9 +389,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         state = applyPreset(state, preset);
         activeId = firstOpenPane(state) || activeId;
         saveLayout(state);
+        setLayoutOpen(false);
         render();
       };
-      toolbar.appendChild(btn);
+      presetRow.appendChild(btn);
       presetButtons[preset] = btn;
     }
     function markPreset() {
@@ -403,7 +428,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     tplBox.appendChild(tplSelect);
     tplBox.appendChild(tplSaveBtn);
     tplBox.appendChild(tplSaveRow);
-    toolbar.appendChild(tplBox);
+    layoutMenu.appendChild(tplBox);
 
     // --- toolbar: previous / next buttons and the position label for the pane strip ----------------
     // The strip (.multi-chat-flex, one snap row) scrolls natively by touch swipe or mouse; these buttons, the label and the arrow keys are the other ways to move.
@@ -429,6 +454,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     nav.appendChild(stripLabelEl);
     nav.appendChild(nextBtn);
     toolbar.appendChild(nav);
+    toolbar.appendChild(layoutBox); // last: the Layout control closes the bar
 
     let strip = null; // the current .multi-chat-flex element, or null (dockview, or nothing drawn)
     let stripIndex = 0;
@@ -509,6 +535,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       state = applyTemplate(templates, name, state, openList);
       activeId = firstOpenPane(state) || activeId;
       saveLayout(state);
+      setLayoutOpen(false);
       render();
     };
     function closeTemplateSave() {

@@ -150,10 +150,10 @@ test('the page is one full-height column: #chat-panel fills the dynamic viewport
   assert.match(blocksFor('.multi-chat-toolbar').join(' '), /flex:\s*0 0 auto/);
 });
 
-test('under 760px only the layout presets and the templates menu are hidden; the toolbar itself stays', () => {
+test('under 760px only the Layout control (presets and templates) is hidden; the toolbar itself stays', () => {
   const hide = css.match(/@media \(max-width: 759px\)\s*\{\s*([^{}]*)\{\s*display:\s*none/);
   assert.ok(hide, 'no phone rule hides anything');
-  assert.deepEqual(hide[1].split(',').map((x) => x.trim()).sort(), ['.multi-chat-preset-btn', '.multi-chat-templates']);
+  assert.deepEqual(hide[1].split(',').map((x) => x.trim()).sort(), ['.multi-chat-layout']);
   assert.equal(blocksFor('.multi-chat-toolbar').some((b) => /display:\s*none/.test(b)), false);
 });
 
@@ -180,4 +180,16 @@ test('the strip fills the host and a pane body is a column, so the transcript ge
   const body = blocksFor('.multi-chat-pane-body').join(' ');
   assert.match(body, /display:\s*flex/);
   assert.match(body, /flex-direction:\s*column/);
+});
+
+test('the Layout control: one button at the end of the bar with a popover for the presets and the templates, 44px on touch', () => {
+  assert.match(blocksFor('.multi-chat-layout').join(' '), /position:\s*relative/);
+  const menu = blocksFor('.multi-chat-layout-menu').join(' ');
+  assert.match(menu, /position:\s*absolute/);
+  assert.match(menu, /z-index:\s*100/);
+  assert.match(blocksFor('.multi-chat-layout-menu[hidden]').join(' '), /display:\s*none/);
+  assert.match(blocksFor('.multi-chat-preset-btn[aria-pressed="true"]').join(' '), /background:\s*var\(--accent\)/);
+  for (const selector of ['.multi-chat-layout-btn', '.multi-chat-preset-btn']) {
+    assert.match(mediaBlocksFor('(pointer: coarse)', selector).join(' '), /min-height:\s*44px/, selector + ' needs a 44px touch target');
+  }
 });
