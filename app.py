@@ -51,11 +51,13 @@ STATE_DIR = Path(os.environ.get(
 STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 try:
     os.chmod(STATE_DIR, 0o700)
-except OSError:
+except OSError as _chmod_err:
     # Dir pre-exists and is owned by another user (e.g. leftover from a
     # previous install or a shared home). Best-effort: we still want to use
-    # the dir for session storage rather than crash at import time.
-    pass
+    # the dir for session storage rather than crash at import time -- but say so,
+    # because a dir that stays world-readable holds private session JSON.
+    print(f"[state-dir] could not chmod {STATE_DIR} to 0700 (non-fatal): {_chmod_err}",
+          file=sys.stderr, flush=True)
 CHAT_STORAGE_DIR = STATE_DIR
 
 
