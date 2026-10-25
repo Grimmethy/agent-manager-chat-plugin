@@ -1637,3 +1637,16 @@ Benefits:
 Fixes an active correctness bug: the handoff logic and the provider call now agree on the context window, so handoff text is no longer sized for a window the model will not honour. A single source of truth means changing the local model's window size or the estimation heuristic requires editing one file rather than hunting for hardcoded values across modules, eliminating the entire class of silent-mismatch bugs where the two modules disagree about available tokens.
 
 NOTE: Flag 3 (AC-001) was not applied because the critique's own re-evaluation confirmed that `test_chat_routes_swap.py` does import `ollama_client` and that the draft's description and solution are accurate; no correction was warranted.
+
+### AC-122 · Fragile exception aliasing obscures the true error hierarchy
+Strength: Strong
+Files: local_tool_client.py, internal_api_client.py, app.py
+
+Problem:
+`local_tool_client.py` is a thin compatibility shim that delegates to `internal_api_client.stream_local_turn()`. To preserve its public interface it aliases `InternalApiError` as `LocalToolClientError` (`from internal_api_client import InternalApiError as LocalToolClientError`). Downstream, `app.py`'s `_call_chat` catches `LocalToolClientError` and `ClaudeClientError` as if they were distinct error families. In reality `LocalToolClientError` *is* `InternalApiError`; the alias creates a false abstraction. If `internal_api_client` later introduces sub-types (e.g., `AuthError`, `TimeoutError`) or restructures its hierarchy, the single-class alias in `local_tool_client` silently breaks the contract, and `app.py` will either miss new error types or catch them under the wrong name. The alias also forces `app.py` to import from two modules to handle what is fundamentally one error type, obscuring the true dependency graph.
+
+Solution:
+Remove the alias in `local_tool_client.py`. Either (a) have `local_tool_client.stream_plan_with_tools` catch `InternalApiError` and re-raise it as a genuinely distinct `LocalToolClientError` subclass that carries shim-specific context, or (b) let `InternalApiError` propagate unchanged and update `app.py` to catch `InternalApiError` directly, eliminating `LocalToolClientError` from the public surface. Option (b) is simpler if the shim adds no extra semantics; option (a) is preferable if the shim needs to attach its own diagnostic information. Either way the error hierarchy becomes explicit and the alias is gone.
+
+Benefits:
+The error-handling path in `app.py` reflects the actual type relationships, making it straightforward to reason about which exceptions can be raised from which call site. Adding new error sub-types in `internal_api_client` no longer risks silently breaking the shim's contract, because the shim either re-raises the real type or wraps it in a properly derived class. The dependency graph becomes honest: `app.py` depends on `internal_api_client`'s error types directly rather than through an opaque alias, simplifying refactors and onboarding.
