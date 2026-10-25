@@ -1438,3 +1438,16 @@ Both files import the shared function, replacing their local definitions. The sh
 
 Benefits:
 A future change to how the backend reports provider or model requires editing exactly one file instead of two, eliminating the risk that the two views drift apart. The unified null-guard removes a class of subtle bugs where one view crashes or renders `undefined` while the other silently defaults. The explicit `includeAccount` option makes the formatting contract at each call site self-documenting: a reader of `sessions-view.js` sees that it intentionally omits account, and a reader of `swap-view.js` sees that it intentionally includes it. New view modules that need a provider label can import the same function and pass the appropriate option rather than re-implementing the mapping, keeping the display contract consistent across the application.
+
+### AC-107 · Centralize "Plain Row" Filtering in handoff.py
+Strength: Strong
+Files: handoff.py, chat_sessions.py
+
+Problem:
+The rule for which transcript rows count as "plain" conversational turns (excluding error notices and swap audit markers) is implemented independently in two modules. `handoff.py` defines `_is_plain_row` as a pure, I/O-free helper, and its docstring explicitly notes that it mirrors the logic in `chat_sessions._build_local_messages`. Because `chat_sessions.py` carries its own copy of the same classification logic, the definition of a valid transcript row is split across a pure-logic module and an I/O-heavy session-management module. If the criteria change—for example, a new system-message type that should be excluded from handoff summaries but retained in local context, or the inverse—a developer must remember to update both locations. Divergence between the two implementations would cause the handoff text and the local model context to include or exclude different rows during provider swaps, producing inconsistent model behavior.
+
+Solution:
+Refactor `chat_sessions.py` to import and call `handoff._is_plain_row` (or a thin public wrapper such as `handoff.is_plain_row`) inside `_build_local_messages`, removing the duplicated inline filtering. `handoff.py` already owns token-counting and handoff-text construction and is described as a "pure hand-off helper" with no I/O, making it the natural single home for the row-classification domain rule. No new dependency is introduced because `chat_sessions.py` already depends on `handoff.py` for swap operations.
+
+Benefits:
+The "plain row" rule now exists in exactly one place, eliminating the risk of silent logic drift between handoff calculation and local message building. Future changes to transcript row types (e.g., introducing "tool" or "system" rows) require a single edit in `handoff.py` and propagate automatically to `chat_sessions.py`. The pure-logic module retains full ownership of the domain rule, while the I/O-heavy session module simply consumes it, improving locality of behavior and reducing the cognitive load on developers touching either file.
