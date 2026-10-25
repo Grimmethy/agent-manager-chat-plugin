@@ -210,7 +210,7 @@ class ChatPane {
   </div>
   <div class="chat-body">
     <div class="chat-transcript-host"></div>
-    <textarea class="chat-input" rows="3" placeholder="Talk to the chat... (Enter to send, Shift+Enter for a new line)"></textarea>
+    <textarea class="chat-input" rows="1" placeholder="Talk to the chat... (Enter to send, Shift+Enter for a new line)"></textarea>
     <div class="chat-send-row">
       <button type="button" class="action chat-send-btn">Send</button>
     </div>
@@ -234,6 +234,18 @@ class ChatPane {
     this.transcriptEl = q('.chat-transcript-host');
     this.input = q('.chat-input');
     this.sendBtn = q('.chat-send-btn');
+    // HUB0024 2/5: wire the composer's auto-grow and the expand toggle.
+    // autoGrowTextarea() is defined at the bottom of this file (HUB0024 1/5); the
+    // .chat-expand-toggle button is added to the pane HTML by HUB0024 4/5, so it may
+    // not exist yet -- guard it so partial integration does not crash. The 'expanded'
+    // class (and its CSS) is HUB0024 3/5's job; we only flip it.
+    this.bodyEl = q('.chat-body');
+    this.input.addEventListener('input', () =>
+      autoGrowTextarea(this.input, Math.round(this.bodyEl.offsetHeight * 0.40)));
+    const expandToggle = q('.chat-expand-toggle');
+    if (expandToggle) {
+      expandToggle.onclick = () => this.bodyEl.classList.toggle('expanded');
+    }
 
     this.providerBtn = document.createElement('button');
     this.providerBtn.type = 'button';
@@ -544,6 +556,11 @@ class ChatPane {
     this.pendingSwapOffer = null; // a new turn supersedes any previous failed-turn offer
     this.isSending = true;
     this.input.value = '';
+    // HUB0024 2/5: collapse the composer for the next message -- drop the 'expanded'
+    // class and re-run the auto-grow on the now-empty textarea so it shrinks back to
+    // its natural (single-line-ish) height.
+    this.bodyEl.classList.remove('expanded');
+    autoGrowTextarea(this.input, Math.round(this.bodyEl.offsetHeight * 0.40));
     this.input.disabled = true;
     this.sendBtn.disabled = true;
     this.sendBtn.textContent = 'Thinking...';
