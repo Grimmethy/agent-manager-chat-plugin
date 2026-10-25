@@ -1802,3 +1802,29 @@ Files: app.py, internal_api_client.py
 ---
 
 **Summary:** Both items in the original draft were retracted. AC-001 was based on a misunderstanding of Python generator exception propagation (exceptions raised during iteration propagate to the caller's `except` clause, they are not silently converted to yielded values). AC-002 conflated two legitimately distinct mechanisms (local validation vs. server-side context) and proposed a removal that would break existing functionality. No defects were identified in the reviewed code.
+
+### AC-135 · Decouple usage enrichment from the account registry endpoint
+Strength: Strong
+Files: routes/accounts.py, test_accounts_routes.py
+
+Problem:
+The `GET /api/chat/accounts` endpoint in `routes/accounts.py` is responsible for aggregating data from two unrelated subsystems. The `_accounts_body` function iterates over accounts loaded from the registry and, for each account, performs a separate file-system read via `read_usage` to attach a `usage` snapshot to the response. This forces the account registry route to depend on the statusline/usage writer's on-disk layout (`AM_STATUSLINE_DIR`, `limits.<label>.json` files), violating locality. The test suite in `test_accounts_routes.py` (specifically `UsageExposureTest`) must mock `AM_STATUSLINE_DIR` and write `limits.<label>.json` files solely to exercise the account routes, creating a high degree of test coupling and making those tests brittle to environmental changes unrelated to the account registry itself.
+
+Solution:
+Remove the `usage` enrichment from `_accounts_body` in `routes/accounts.py` so that `GET /api/chat/accounts` returns only the account registry data (label, host, live) exactly as `accounts.public_view` provides it. Introduce a dedicated endpoint, e.g. `GET /api/chat/usage` (or `GET /api/chat/usage/<label>`), that reads from the statusline/usage writer and returns usage snapshots independently. The client-side account strip UI then issues two parallel requests—one for accounts, one for usage—and merges the results in the browser.
+
+Benefits:
+Locality is restored: the account routes depend only on the account registry module, and the usage routes depend only on the usage/statusline-writer module. Tests in `test_accounts_routes.py` no longer need to set up `AM_STATUSLINE_DIR` or write `limits.*.json` files, eliminating a class of false failures caused by environmental factors and simplifying the test harness. The usage data format can evolve independently of the account registry format, and new consumers of usage data can hit the dedicated endpoint without pulling in the entire account payload.
+
+### AC-136 · Extract SAVE-TEMPLATE parsing and validation into a dedicated module
+Strength: Strong
+Files: template_store.py
+
+Problem:
+`template_store.py` conflates three distinct responsibilities in a single module: (1) parsing `SAVE-TEMPLATE` blocks out of raw LLM response text (regex matching, text cleaning), (2) validating the parsed blocks against the `KINDS` registry and length constraints, and (3) persisting validated blocks via HTTP requests to the target application. Because `parse_blocks`, `_clean_text`, and `_validate` are tightly coupled to `save_template` within the same module, testing the regex parsing in isolation requires mocking `requests`, and testing the HTTP saving path requires constructing syntactically valid `SAVE-TEMPLATE` blocks. The module is therefore hard to unit-test at either end and resists reuse of the parsing/validation logic in other contexts (client-side validation, a different persistence backend, etc.).
+
+Solution:
+Split `template_store.py` into two modules. A new `template_parser.py` contains `parse_blocks`, `_clean_text`, `_validate`, and the `KINDS` registry—pure parsing and validation with no I/O dependencies. The remaining `template_store.py` retains `save_template`, `extract_proposals`, `save_proposal`, and all HTTP-client logic, importing the parser from `template_parser.py`.
+
+Benefits:
+`template_parser.py` can be exercised with pure unit tests (no `requests` mocking, no HTTP fixtures), while `template_store.py` can be tested with mocked `requests` calls without needing to construct complex `SAVE-TEMPLATE` blocks. Adding a new template kind becomes a one-line change to `KINDS` in `template_parser.py` with no risk of accidentally touching the saving path. Swapping the persistence mechanism (e.g., to a local file system or a message queue) requires modifying only `template_store.py`, leaving the parser untouched. The separation also makes it straightforward to reuse the parser in a client-side validation layer or a CLI tool without importing the HTTP client.
