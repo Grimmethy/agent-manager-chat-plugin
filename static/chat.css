@@ -267,16 +267,17 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 
 /* The top bar (owner 2026-10-24): the open chats as a row of buttons, "+" for a new chat, "All chats" for the rest, then the strip nav and Layout.
    Every control in the bar is the same 30px-high button; the active chat and a pressed preset share one accent look. */
-.multi-chat-toolbar { gap: 6px; padding: 6px 8px; }
+.multi-chat-toolbar { position: relative; gap: 6px; padding: 6px 8px; }
 .multi-chat-toolbar button, .multi-chat-toolbar select { height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap; border-radius: 6px; }
 .multi-chat-tabs { display: flex; flex: 0 1 auto; min-width: 0; gap: 6px; overflow-x: auto; scrollbar-width: none; }
 .multi-chat-tabs::-webkit-scrollbar { display: none; }
 .multi-chat-tab { flex: 0 0 auto; max-width: 16em; overflow: hidden; text-overflow: ellipsis; }
 .multi-chat-tab[aria-selected="true"] { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
 .multi-chat-new-btn { flex: 0 0 auto; min-width: 30px; margin-right: auto; }
-.multi-chat-switcher { position: relative; flex: 0 0 auto; }
+/* The All chats list is anchored to the whole bar, not to its button: the button sits mid-bar and a 360px list under it would stick out of a 378px sidebar. */
+.multi-chat-switcher { position: static; flex: 0 0 auto; }
 .multi-chat-switcher .chat-switcher-btn { width: auto; font-weight: 400; }
-.multi-chat-switcher .chat-switcher-menu { left: auto; right: 0; width: 360px; max-width: calc(100vw - 16px); }
+.multi-chat-switcher .chat-switcher-menu { left: auto; right: 8px; width: 360px; max-width: calc(100% - 16px); }
 @media (max-width: 759px) { .multi-chat-tabs { flex: 1 0 100%; order: -1; } }
 
 /* Narrow panes (the dashboard's chat sidebar is about 380px wide): the pane header must still fit on one line with the close button visible, so the
