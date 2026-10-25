@@ -534,6 +534,15 @@ _FRESHNESS_RULES = (
     "- Never answer 'nothing to do' without listing what you checked and the date of the newest thing you saw."
 )
 
+# 2026-10-25: two tasks about the chat plugin repo were filed into agent-manager's own queue because queue_reviewed_task had no project argument. The tools now
+# take one (core src/local-tool-client.js: list_projects, `project` on queue_reviewed_task, read_task, search_tasks and the four unstick tools).
+_PROJECT_RULES = (
+    "Projects and task queues: every project has its own task queue. Call list_projects first to see each project's label, repo root, whether it is pooled and which one is active. "
+    "File a task about another repo with queue_reviewed_task(project=<label>) and read, search or unstick tasks of that project with the same `project` argument "
+    "(search_tasks accepts project \"all\"). If you are unsure which project a change belongs to, ask the user. "
+    "Never file a task about repo X into another project's queue: the tool refuses a task whose file paths clearly belong to another project, and tells you which one."
+)
+
 _LOCAL_SYSTEM_PROMPT = (
     "You are a coding assistant embedded in the agent-manager system's own dashboard, "
     "with real Read/Grep/Glob access and READ-ONLY Bash access to live repositories via "
@@ -643,6 +652,7 @@ _LOCAL_SYSTEM_PROMPT = (
     "file yourself. Never claim a template is saved; the user saves it. Do not wrap the "
     "block in a code fence.\n\n"
     + _FRESHNESS_RULES
+    + "\n\n" + _PROJECT_RULES
 )
 
 
