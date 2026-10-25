@@ -603,8 +603,7 @@ def api_chat_template_save(session_id):
     outcome (saved, or why not) is persisted on the proposal so it survives a reload, and
     the updated session comes back so the UI renders it."""
     from app import CHAT_STORAGE_DIR
-    from chat_sessions import get_session, _write_session
-    import template_store
+    from chat_sessions import get_session, save_template
     body = request.get_json(silent=True) or {}
     try:
         entry, index = int(body["entry"]), int(body["index"])
@@ -614,8 +613,7 @@ def api_chat_template_save(session_id):
     if not session or session.get("status") != "active":
         abort(404)
     try:
-        prop = template_store.save_proposal(session, entry, index, body.get("key"), body.get("text"))
+        prop = save_template(CHAT_STORAGE_DIR, session, entry, index, body.get("key"), body.get("text"))
     except LookupError:
         abort(404, description="no such template proposal")
-    _write_session(CHAT_STORAGE_DIR, session)
     return jsonify({"session": session, "proposal": prop})
