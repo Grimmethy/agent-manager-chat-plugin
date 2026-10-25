@@ -285,6 +285,21 @@ class FreshnessRulesPromptTest(unittest.TestCase):
         self.assertIn("preamble_parts.append(_FRESHNESS_RULES)", src, "the Claude first-turn preamble carries the same rules")
 
 
+class ProjectRulesPromptTest(unittest.TestCase):
+    """2026-10-25: tasks about the chat plugin repo were filed into agent-manager's queue; the local prompt now tells the chat to use list_projects and `project`."""
+
+    def test_rules_name_the_tools_and_the_project_argument(self):
+        rules = chat_sessions._PROJECT_RULES
+        for phrase in ("list_projects", "queue_reviewed_task(project=<label>)", "search_tasks accepts project \"all\"", "ask the user", "Never file a task about repo X"):
+            self.assertIn(phrase, rules)
+
+    def test_local_system_prompt_includes_the_rules_after_the_freshness_rules(self):
+        prompt = chat_sessions._LOCAL_SYSTEM_PROMPT
+        self.assertIn(chat_sessions._PROJECT_RULES, prompt)
+        self.assertLess(prompt.index(chat_sessions._FRESHNESS_RULES), prompt.index(chat_sessions._PROJECT_RULES))
+        self.assertIn(chat_sessions._PROJECT_RULES, chat_sessions._local_system_prompt({"repoRoot": "/x", "roots": ["/x"]}))
+
+
 class RecordTurnErrorTest(unittest.TestCase):
     """record_turn_error() -- a failed turn's error lands IN the stored transcript (it used
     to exist only as a 3-second toast)."""
