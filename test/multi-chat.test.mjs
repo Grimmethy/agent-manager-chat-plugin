@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyPreset, closePane, serialize, deserialize, firstOpenPane, layoutForWidth,
-  stripVisibleCount, clampStripIndex, stepStrip, stripLabel, stripButtons, indexFromScroll, shouldHandleArrowKey,
+  stripVisibleCount, clampStripIndex, stepStrip, stripLabel, stripButtons, indexFromScroll, shouldHandleArrowKey, placeChatInStrip,
   DEFAULT_TEMPLATES, saveTemplate, applyTemplate, serializeTemplates, deserializeTemplates,
 } from '../static/multi-chat.js';
 
@@ -292,4 +292,17 @@ test('shouldHandleArrowKey: false while typing in an input, textarea, select or 
   for (const tag of ['INPUT', 'TEXTAREA', 'SELECT', 'input', 'textarea', 'select']) assert.equal(shouldHandleArrowKey(tag), false, tag);
   assert.equal(shouldHandleArrowKey('DIV', true), false, 'contenteditable');
   for (const tag of ['BODY', 'BUTTON', 'DIV', 'A', undefined, null, '']) assert.equal(shouldHandleArrowKey(tag), true, String(tag));
+});
+
+test('placeChatInStrip: an open chat only becomes active; a new one takes the first empty slot, else replaces the active pane', () => {
+  const full = { preset: '2col', panes: ['a', 'b'] };
+  const frozen = JSON.stringify(full);
+  assert.deepEqual(placeChatInStrip(full, 'b', 'a'), { state: { preset: '2col', panes: ['a', 'b'] }, activeId: 'b' }, 'already open: only activeId changes');
+  assert.deepEqual(placeChatInStrip({ preset: '2col', panes: ['a', null] }, 'c', 'a'), { state: { preset: '2col', panes: ['a', 'c'] }, activeId: 'c' }, 'first empty slot');
+  assert.deepEqual(placeChatInStrip(full, 'c', 'a'), { state: { preset: '2col', panes: ['c', 'b'] }, activeId: 'c' }, 'full strip: replaces the active pane');
+  assert.deepEqual(placeChatInStrip(full, 'c', null), { state: { preset: '2col', panes: ['a', 'c'] }, activeId: 'c' }, 'null activeId: replaces the last pane');
+  assert.deepEqual(placeChatInStrip(full, 'c', 'zzz'), { state: { preset: '2col', panes: ['a', 'c'] }, activeId: 'c' }, 'unknown activeId behaves like null');
+  assert.deepEqual(placeChatInStrip({ preset: '1', panes: [] }, 'c', null), { state: { preset: '1', panes: ['c'] }, activeId: 'c' }, 'no panes at all');
+  assert.equal(JSON.stringify(full), frozen, 'the input is never mutated');
+  assert.deepEqual(placeChatInStrip(full, '', 'a'), { state: { preset: '2col', panes: ['a', 'b'] }, activeId: 'a' }, 'an empty id changes nothing');
 });
