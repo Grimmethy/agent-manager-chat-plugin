@@ -28,6 +28,13 @@ body {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
 }
 .chat-switcher-slot { flex: 1 1 12rem; min-width: 0; position: relative; }
+.chat-switcher-slot:empty { display: none; }
+/* A pane's header is one line: the chat's title on the left (hidden when the pane carries its own switcher), then the action buttons, the close button last. */
+.chat-pane-title { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13px; }
+.chat-switcher-slot:not(:empty) ~ .chat-pane-title { display: none; }
+.chat-header { flex-wrap: nowrap; padding: 6px 8px; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.chat-header button, .multi-chat-close { height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap; }
+.chat-header .chat-provider-label { flex: 0 0 auto; }
 .chat-switcher-btn { width: 100%; text-align: left; font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-switcher-menu { position: absolute; top: calc(100% + 4px); left: 0; right: 0; min-width: 280px; max-height: 60vh; overflow-y: auto; background: var(--panel); border: 2px solid var(--border); border-radius: 6px; z-index: 100; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
 .chat-switcher-menu[hidden] { display: none; }
@@ -192,6 +199,7 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
   .chat-header button,
   .chat-send-row button,
   .chat-switcher-new,
+  .multi-chat-close,
   .multi-chat-strip-btn,
   .chat-chime-setting { min-height: 44px; min-width: 44px; }
   .chat-chime-setting input { width: 20px; height: 20px; }
@@ -203,6 +211,8 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
    and scrolls its own transcript; touch swipe works natively through scroll-snap. */
 .multi-chat-flex {
   --strip-visible: 2;
+  flex: 1 1 0;
+  min-height: 0;
   display: flex;
   flex-wrap: nowrap;
   gap: 8px;
@@ -235,3 +245,6 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 .multi-chat-strip-nav[hidden] { display: none; }
 .multi-chat-strip-label { min-width: 4.5em; text-align: center; font-size: 12px; color: var(--muted); }
 .multi-chat-strip-btn:disabled { opacity: .4; cursor: default; }
+
+/* A pane fills the strip's height; its body is a column so the transcript takes whatever the one-line header leaves. */
+.multi-chat-pane-body { display: flex; flex-direction: column; }

@@ -187,6 +187,7 @@ class ChatPane {
     this.root.innerHTML = `
   <div class="chat-header">
     <div class="chat-switcher-slot"></div>
+    <span class="chat-pane-title"></span>
     <span class="chat-provider-container"></span>
     <span class="chat-provider-label" hidden></span>
     <span class="chat-swap-slot">
@@ -212,6 +213,7 @@ class ChatPane {
   </div>`;
     const q = (sel) => this.root.querySelector(sel);
     this.switcherSlot = q('.chat-switcher-slot');
+    this.titleEl = q('.chat-pane-title');
     this.providerContainer = q('.chat-provider-container');
     // HUB0008 10/11: header provider label + Swap menu (see syncSwapHeader below).
     this.providerLabelEl = q('.chat-provider-label');
@@ -626,6 +628,7 @@ class ChatPane {
   render() {
     const session = this.session;
     this.syncSwapHeader();
+    this.titleEl.textContent = session ? fullTitle(session.title) : '';
     if (session && session.provider && this.providerChoice !== session.provider) {
       this.providerChoice = session.provider;
       this.syncProviderToggle();
