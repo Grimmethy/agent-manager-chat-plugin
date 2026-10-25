@@ -1828,3 +1828,31 @@ Split `template_store.py` into two modules. A new `template_parser.py` contains 
 
 Benefits:
 `template_parser.py` can be exercised with pure unit tests (no `requests` mocking, no HTTP fixtures), while `template_store.py` can be tested with mocked `requests` calls without needing to construct complex `SAVE-TEMPLATE` blocks. Adding a new template kind becomes a one-line change to `KINDS` in `template_parser.py` with no risk of accidentally touching the saving path. Swapping the persistence mechanism (e.g., to a local file system or a message queue) requires modifying only `template_store.py`, leaving the parser untouched. The separation also makes it straightforward to reuse the parser in a client-side validation layer or a CLI tool without importing the HTTP client.
+
+### AC-137 · Parallel URL/token resolution paths in agent_client.py
+Strength: Strong
+Files: agent_hosts.py
+
+Problem:
+`agent_hosts.py` contains two independent mechanisms for resolving the agent's base URL and authentication token. The `_singular()` function reads `AGENT_MANAGER_SESSION_AGENT_URL` and `AGENT_MANAGER_SESSION_AGENT_TOKEN` directly from `os.environ` to construct a `Host` namedtuple. Meanwhile, the multi-host path (or other resolution logic within `agent_hosts`) may resolve the same information through different configuration sources or logic paths. If `_singular()` is used in contexts where a `tokenFile`-based configuration is expected, the direct environment variable read for the token bypasses the `read_token()` mechanism that would otherwise resolve the token file. This creates a divergence where the token resolution logic is not consistently applied across all host resolution paths.
+
+Solution:
+Refactor `agent_hosts.py` so that all host resolution paths, including `_singular()`, consistently delegate token resolution to `read_token(host)`. Ensure that `_singular()` constructs the `Host` namedtuple with the `token_file` field populated from the appropriate configuration source (e.g., `AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE`), and that the final token value is always obtained via `read_token()` rather than by directly reading the token environment variable. This unifies the token resolution logic and ensures that the `tokenFile` mechanism is honored in all cases.
+
+Benefits:
+There is exactly one place to look when debugging "why is my request unauthorised?" or "why is the token wrong?" All host resolution paths now consistently use `read_token()` for token resolution, eliminating the risk of a silent no-auth failure mode caused by bypassing the token-file mechanism. New host-aware features (multi-host, per-host tokens, token rotation) only need to interact with the unified `read_token()` logic, reducing the surface area for future divergence.
+
+### AC-138 · Host-by-name lookup duplicated across agent_client.py and agent_hosts.py
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_client.py` contains host resolution logic (e.g., in `open_events` or `list_all`) that manually iterates over `agent_hosts.hosts()` to find a host by name. This logic is functionally identical to `agent_hosts.get_host(name)`—same iteration order, same equality check, same "return the first match" semantics. The only difference is the error style: `agent_client.py` may raise `AgentError` or handle the missing host differently, while `get_host` returns `None`. Because the matching loop is duplicated, any future change to the `Host` structure (an alias field, case-insensitive matching, a priority field) must be applied in two places in lockstep, and a missed update in one file produces a silent lookup miss.
+
+Solution:
+Refactor the host resolution logic in `agent_client.py` to call `agent_hosts.get_host(name)` for the name-matching step and layer only the error-handling logic on top: if `get_host` returns `None`, raise `AgentError` or handle the missing host according to `agent_client.py`'s error-style contract. The duplicated loop is removed entirely.
+
+Benefits:
+Host-name matching logic lives in exactly one module. Adding an alias, making lookup case-insensitive, or changing tie-breaking rules requires editing only `agent_hosts.py`. The `agent_client` module retains its error-style contract (`AgentError`) without re-implementing the search, reducing the surface area for future divergence.
+
+NOTE: The flags regarding `base_url()`, `_headers()`, and `_resolve_host()` in `agent_client.py` were not applied because the critique correctly identified that these functions do not exist in the provided source code. The corrected draft now accurately attributes the parallel resolution logic to `agent_hosts.py` (for AC-001) and describes the duplicated host-lookup loop in `agent_client.py` without referencing a non-existent `_resolve_host` function (for AC-002).
