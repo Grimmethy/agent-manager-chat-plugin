@@ -894,7 +894,7 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
             yield event["text"]
         elif event.get("type") == "final":
             result = event
-    model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
+    model_stats_client.record_call("chat-session", ollama_client.MODEL(), int((time.time() - started) * 1000),
                                     stage="chat", result=result or {}, source="chat")
     final_text = (result or {}).get("response")
     if final_text is None:

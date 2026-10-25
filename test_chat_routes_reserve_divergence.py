@@ -50,7 +50,7 @@ class ReserveDivergenceTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 500)
         reserve.assert_called_once()
         line = "\n".join(logs.output)
-        for needle in ("AC4_DIVERGENCE", SID, "model=" + str(ollama_client.MODEL), "OSError", "disk full", "Manual reconciliation required"):
+        for needle in ("AC4_DIVERGENCE", SID, "model=" + str(ollama_client.MODEL()), "OSError", "disk full", "Manual reconciliation required"):
             self.assertIn(needle, line)
 
     def test_the_happy_path_logs_nothing_and_persists_the_flag(self):
