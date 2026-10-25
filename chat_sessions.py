@@ -40,11 +40,13 @@ from pathlib import Path
 
 import accounts
 import claude_client
+import command_runs
 import handoff
 import local_tool_client
 import model_stats_client
 import ollama_client
 import template_store
+import tool_log
 
 PROVIDER_LOCAL = "local"
 PROVIDER_CLAUDE = "claude"
@@ -120,7 +122,8 @@ def _migrate_legacy_store(storage_dir: Path):
         except (OSError, json.JSONDecodeError) as e:
             print(f"[chat-sessions] legacy store {legacy} unreadable, not migrated: {e}", file=sys.stderr, flush=True)
             return
-        sessions_dir(storage_dir).mkdir(parents=True, exist_ok=True)
+        sessions_dir(storage_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(sessions_dir(storage_dir), 0o700)
         for sid, session in (sessions or {}).items():
             try:
                 if not _session_path(storage_dir, sid).exists():
@@ -167,7 +170,11 @@ def _write_session(storage_dir: Path, session: dict):
     """Writes ONE session atomically: a unique temp file in the same directory, then
     os.replace, so a reader never sees half a file and two writers never share a temp."""
     p = _session_path(storage_dir, session["id"])
-    p.parent.mkdir(parents=True, exist_ok=True)
+    # mode=0o700 so the sessions dir is owner-only even under a permissive umask
+    # (mkdir's mode is ignored when exist_ok=True and the dir already exists, so
+    # chmod the existing dir too -- same pattern as accounts.py's _save).
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(p.parent, 0o700)
     fd, tmp = tempfile.mkstemp(prefix=f".{session['id']}.", suffix=".tmp", dir=p.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -370,7 +377,7 @@ def _session_title(session: dict) -> str:
     for turn in session.get("transcript") or []:
         if turn.get("role") == "user" and (turn.get("text") or "").strip():
             text = " ".join(turn["text"].split())
-            return text if len(text) <= 60 else text[:59] + "…"
+            return text if len(text) <= 200 else text[:199] + "…"
     return "New chat"
 
 
@@ -450,6 +457,7 @@ def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
                 "You are rooted at the agent-manager repo and also have full read/write "
                 "access to these additional repos:\n" + _roots_blurb(session)
             )
+        preamble_parts.append(_FRESHNESS_RULES)
         agents_md = _read_agents_md(session)
         if agents_md:
             preamble_parts.append(_agents_md_blurb(agents_md))
@@ -513,6 +521,28 @@ def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
                                     stage="chat", result=result, source="chat")
     return result["response"].strip()
 
+
+# 2026-10-25 (sale-lookup test): the chat could not run the named ingest command, read the database file instead, called months-old rows
+# "the most recent" (it ordered by row id) and ended "nothing to do" without saying the newest record was older than the asked window.
+# One constant so the local prompt and the Claude first-turn preamble cannot drift apart.
+_FRESHNESS_RULES = (
+    "Freshness and honesty rules for questions about recent data:\n"
+    "- When asked for recent, latest, new or last-N-days records, order by the record's own date (never by row id), quote the "
+    "newest date you found next to today's date, and if the newest record is older than the window asked about, say so "
+    "('the data has nothing newer than <date>; it may need refreshing with <command>') -- never report old records as recent.\n"
+    "- If a command the user named could not run (read-only mount, missing path or repo, missing credentials), say exactly which "
+    "command could not run and why BEFORE using any substitute source, and label what the substitute shows as possibly stale.\n"
+    "- Never answer 'nothing to do' without listing what you checked and the date of the newest thing you saw."
+)
+
+# 2026-10-25: two tasks about the chat plugin repo were filed into agent-manager's own queue because queue_reviewed_task had no project argument. The tools now
+# take one (core src/local-tool-client.js: list_projects, `project` on queue_reviewed_task, read_task, search_tasks and the four unstick tools).
+_PROJECT_RULES = (
+    "Projects and task queues: every project has its own task queue. Call list_projects first to see each project's label, repo root, whether it is pooled and which one is active. "
+    "File a task about another repo with queue_reviewed_task(project=<label>) and read, search or unstick tasks of that project with the same `project` argument "
+    "(search_tasks accepts project \"all\"). If you are unsure which project a change belongs to, ask the user. "
+    "Never file a task about repo X into another project's queue: the tool refuses a task whose file paths clearly belong to another project, and tells you which one."
+)
 
 _LOCAL_SYSTEM_PROMPT = (
     "You are a coding assistant embedded in the agent-manager system's own dashboard, "
@@ -621,7 +651,9 @@ _LOCAL_SYSTEM_PROMPT = (
     "END-TEMPLATE\n"
     "The chat shows it as a card with a Save button -- you cannot and must not write the "
     "file yourself. Never claim a template is saved; the user saves it. Do not wrap the "
-    "block in a code fence."
+    "block in a code fence.\n\n"
+    + _FRESHNESS_RULES
+    + "\n\n" + _PROJECT_RULES
 )
 
 
@@ -717,7 +749,7 @@ def _build_local_messages(session: dict, message: str) -> list:
             # "marker" has no marker key and is replayed normally.
             continue
         role = "assistant" if turn["role"] == "assistant" else "user"
-        messages.append({"role": role, "content": turn["text"]})
+        messages.append({"role": role, "content": turn["text"] + command_runs.context_note(turn)})
     messages.append({"role": "user", "content": message})
     return messages
 
@@ -869,6 +901,8 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
         yield footer
     if result_box is not None:
         result_box["final_text"] = final_text
+        result_box["tools"] = tool_log.summarize_tool_calls((result or {}).get("toolCallLog"))
+        result_box["proposals"] = (result or {}).get("commandProposals") or []
 
 
 def stream_message(storage_dir: Path, session_id: str, message: str):
@@ -941,6 +975,10 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     # SAVE-TEMPLATE blocks become Save-button proposals (template_store.py); never auto-saved.
     reply, proposals = template_store.extract_proposals(reply)
     session["transcript"][-1]["text"] = reply.strip()
+    if result_box.get("tools"):
+        session["transcript"][-1]["tools"] = result_box["tools"]
+    if result_box.get("proposals"):
+        command_runs.record_proposals(session["transcript"][-1], result_box["proposals"])
     if proposals:
         session["transcript"][-1]["templates"] = proposals
     _write_session(storage_dir, session)

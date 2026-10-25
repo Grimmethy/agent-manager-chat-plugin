@@ -7,6 +7,7 @@ model-stats.db: 2 of 3 real Chat calls in one session showed that exact false me
 
 Run: .venv/bin/python -m unittest test_chat_sessions -v
 """
+import inspect
 import sys
 import tempfile
 import unittest
@@ -265,6 +266,38 @@ class NoGitHandoffPromptTest(unittest.TestCase):
         prompt = chat_sessions._LOCAL_SYSTEM_PROMPT
         self.assertIn("worker-3090", prompt)
         self.assertNotIn("worker-reasoning", prompt)
+
+
+class FreshnessRulesPromptTest(unittest.TestCase):
+    """2026-10-25: the chat reported months-old sales as 'the most recent' and said 'nothing to do' after silently swapping its data source."""
+
+    def test_rules_name_newest_date_today_could_not_run_and_stale(self):
+        rules = chat_sessions._FRESHNESS_RULES
+        for phrase in ("newest date", "today's date", "could not run", "possibly stale", "never by row id", "nothing to do"):
+            self.assertIn(phrase, rules)
+
+    def test_local_system_prompt_includes_the_rules(self):
+        self.assertIn(chat_sessions._FRESHNESS_RULES, chat_sessions._LOCAL_SYSTEM_PROMPT)
+        self.assertIn(chat_sessions._FRESHNESS_RULES, chat_sessions._local_system_prompt({"repoRoot": "/x", "roots": ["/x"]}))
+
+    def test_claude_first_turn_preamble_includes_the_rules(self):
+        src = inspect.getsource(chat_sessions._send_claude)
+        self.assertIn("preamble_parts.append(_FRESHNESS_RULES)", src, "the Claude first-turn preamble carries the same rules")
+
+
+class ProjectRulesPromptTest(unittest.TestCase):
+    """2026-10-25: tasks about the chat plugin repo were filed into agent-manager's queue; the local prompt now tells the chat to use list_projects and `project`."""
+
+    def test_rules_name_the_tools_and_the_project_argument(self):
+        rules = chat_sessions._PROJECT_RULES
+        for phrase in ("list_projects", "queue_reviewed_task(project=<label>)", "search_tasks accepts project \"all\"", "ask the user", "Never file a task about repo X"):
+            self.assertIn(phrase, rules)
+
+    def test_local_system_prompt_includes_the_rules_after_the_freshness_rules(self):
+        prompt = chat_sessions._LOCAL_SYSTEM_PROMPT
+        self.assertIn(chat_sessions._PROJECT_RULES, prompt)
+        self.assertLess(prompt.index(chat_sessions._FRESHNESS_RULES), prompt.index(chat_sessions._PROJECT_RULES))
+        self.assertIn(chat_sessions._PROJECT_RULES, chat_sessions._local_system_prompt({"repoRoot": "/x", "roots": ["/x"]}))
 
 
 class RecordTurnErrorTest(unittest.TestCase):
