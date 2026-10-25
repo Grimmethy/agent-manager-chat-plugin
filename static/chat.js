@@ -1190,3 +1190,15 @@ if (document.readyState === 'loading') document.addEventListener('DOMContentLoad
 else mountChat();
 
 export { ChatPane, SessionSwitcher, showToast };
+
+/**
+ * Grow a textarea to fit its content, capped at maxPx.
+ * @param {HTMLTextAreaElement} el
+ * @param {number} maxPx
+ */
+export function autoGrowTextarea(el, maxPx) {
+  el.style.height = 'auto';
+  const scrollHeight = el.scrollHeight;
+  el.style.height = Math.min(scrollHeight, maxPx) + 'px';
+  el.style.overflowY = scrollHeight > maxPx ? 'auto' : 'hidden';
+}
