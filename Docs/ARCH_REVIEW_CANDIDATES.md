@@ -1570,3 +1570,29 @@ Extract `CHAT_STORAGE_DIR` (and any other shared constants) into a standalone `c
 
 Benefits:
 The lazy-import workaround and its explanatory comments disappear, making `routes/accounts.py` importable and unit-testable with plain `unittest` without first importing the full application. The blueprint can be registered in a test app or a different entry point without special-casing the import order. Adding a new route that needs the storage path no longer requires remembering to place the import inside the function body.
+
+### AC-117 · Circular import workaround couples routing layer to application entry point
+Strength: Strong
+Files: routes/accounts.py, app.py
+
+Problem:
+`routes/accounts.py` performs a lazy import of `CHAT_STORAGE_DIR` from `app` inside both `_accounts_body` and the `api_chat_accounts_make_live` handler. The docstring in the file explicitly documents this as a workaround for the circular import that arises because `app.py` imports the module to register its blueprint. As a result, the routing layer is forced to reach into the application entry point to resolve a single configuration path, violating dependency inversion. Any consumer that wants to test or reuse the accounts blueprint in isolation must either stub out `app` or replicate the lazy-import dance, and the import graph acquires a back-edge from a leaf module to the composition root that is invisible to static analysis tools.
+
+Solution:
+Extract the storage-directory resolution logic (or the `CHAT_STORAGE_DIR` constant) into a dedicated configuration module such as `config.py`, or inject it through the blueprint's factory function so the value is passed in at registration time. `routes/accounts.py` then imports the configuration directly from `config` (or receives it as a closure parameter) and no longer references `app` at all. The circular import disappears because the dependency now flows one way: `app → config` and `routes/accounts → config`, with no back-edge to the entry point.
+
+Benefits:
+The routing module becomes provider-agnostic and independently importable, which simplifies unit testing (no need to mock `app`) and makes the blueprint reusable in alternate entry points or test harnesses. The import graph loses its cycle, so tools like `pylint`, `import-linter`, or IDE navigation no longer flag or mis-order the relationship. Future changes to where the storage directory lives require touching only `config.py` rather than hunting for every lazy-import site in the routing layer.
+
+### AC-118 · "Exactly one live account" invariant enforced in multiple places
+Strength: Worth exploring
+Files: accounts.py
+
+Problem:
+The invariant that exactly one account carries the `live` flag is enforced in at least three separate code paths within `accounts.py`: `_enforce_one_live` (invoked during `load`), the `make_live` function (which manually flips the flag), and the `add` function (which sets `live` on the first account). Each site re-implements the "turn off the others, turn on this one" logic independently. If the invariant ever evolves—say, to allow zero live accounts during a migration window, or to add an audit log entry on transition—every site must be found and updated in lockstep, and a missed site silently produces an inconsistent state.
+
+Solution:
+Introduce a single internal helper, e.g. `_ensure_single_live(storage_path, target_id)`, in `accounts.py` that encapsulates the full transition: read all accounts, clear the `live` flag on every record, set it on the target, and write back. `load`, `add`, and `make_live` all delegate to this helper rather than manipulating the flag themselves. The helper becomes the sole mutation point for the `live` field, and any future policy change (logging, validation, atomicity) is made in one place.
+
+Benefits:
+The invariant is auditable in a single function, reducing the risk of a future edit breaking the "exactly one" guarantee in one path while leaving others correct. New contributors see one canonical implementation instead of three subtly different ones. The helper is trivially unit-testable in isolation (feed it a temp directory, assert the post-condition), whereas testing the invariant today requires exercising each of the three entry points separately.
