@@ -131,7 +131,7 @@ class SwapReservationTest(SwapRouteTestBase):
             resp = self._post({"provider": "claude", "account": "acct-1"})
         self.assertEqual(resp.status_code, 200)
         # released exactly as api_chat_reserve does: internal reserve OFF...
-        self.assertEqual(reserve.call_args[0], (SID, ollama_client.MODEL, False))
+        self.assertEqual(reserve.call_args[0], (SID, ollama_client.MODEL(), False))
         # ...and the dashboard's display flag cleared
         self.assertFalse(self._stored()["reserved"])
         self.assertEqual(self._stored()["provider"], "claude")
