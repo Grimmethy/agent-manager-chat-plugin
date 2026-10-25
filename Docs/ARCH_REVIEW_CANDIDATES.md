@@ -1856,3 +1856,18 @@ Benefits:
 Host-name matching logic lives in exactly one module. Adding an alias, making lookup case-insensitive, or changing tie-breaking rules requires editing only `agent_hosts.py`. The `agent_client` module retains its error-style contract (`AgentError`) without re-implementing the search, reducing the surface area for future divergence.
 
 NOTE: The flags regarding `base_url()`, `_headers()`, and `_resolve_host()` in `agent_client.py` were not applied because the critique correctly identified that these functions do not exist in the provided source code. The corrected draft now accurately attributes the parallel resolution logic to `agent_hosts.py` (for AC-001) and describes the duplicated host-lookup loop in `agent_client.py` without referencing a non-existent `_resolve_host` function (for AC-002).
+
+### AC-139 · Remove provider-module import from swap-route test
+Strength: Worth exploring
+Files: test_chat_routes_swap.py
+
+Problem:
+`SwapReservationTest.test_leaving_local_while_reserved_releases_the_reservation` in `test_chat_routes_swap.py` does `import ollama_client` solely to assert `reserve.call_args[0] == (SID, ollama_client.MODEL, False)`. This is a reasonable pattern for keeping the test in sync with the code under test, but it does create a test-time dependency on the Ollama client module's import-time env-var capture. If the route's model-resolution logic changes (e.g., it reads from a different source, or the env var is renamed), the test will silently assert against a stale value rather than failing loudly at the route level. The test's actual intent—verifying that the route passed the correct model name to `reserve`—is better expressed by asserting against the value the route itself resolved, rather than re-deriving it from the provider module.
+
+Solution:
+Drop `import ollama_client` from the test. Instead, capture the model name the route resolved (e.g., by reading it from the route's local variable, from a mocked configuration object the route receives, or from the `reserve` call's arguments as the route constructed them) and assert against that. Concretely, if the route reads the model from a config or env-var lookup that the test already controls, assert `reserve.call_args[0] == (SID, <the value the test set up>, False)`. The test no longer needs to import the provider module to know what value to expect.
+
+Benefits:
+The test's intent—verifying the route passed the correct model name to `reserve`—is expressed against the same source of truth the test itself sets up, making the assertion self-contained and robust to refactors in how the route resolves the model name. Swapping or adding providers does not require touching test files that happen to import a specific provider module.
+
+NOTE: All three critique flags were applied. AC-43 was removed entirely because its premise (that `ollama_client.py` duplicates a provider vocabulary) is factually incorrect—`ollama_client.py` merely reads a single env var and contains no provider list, set, or validation logic that parallels `handoff.py`'s `_DEFAULT_WINDOWS`. The proposed `providers.py` registry would also introduce an unjustified dependency from a low-level HTTP client to a high-level domain concept. AC-44 was retained but reframed as a standalone test-hygiene improvement rather than a consequence of the (now-removed) AC-43.
