@@ -1490,3 +1490,29 @@ Introduce a private helper function in `agent_client.py` (e.g., `_auth_headers(h
 
 Benefits:
 Reduces code duplication and ensures that authentication changes are made in exactly one place. Improves readability by abstracting low-level HTTP setup details away from the endpoint-specific logic, and makes it straightforward to add new authenticated endpoints without re-implementing the header boilerplate.
+
+### AC-111 · Duplicated provider-labeling logic across view modules
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` export a function named `providerLabel` that formats provider/model display strings, but each implementation diverges: the sessions view produces `"Claude · <model>"` or `"Local · <model>"`, while the swap view appends an account segment (`"Claude · <model> · <account>"`). There is no shared abstraction, so any change to provider naming conventions—adding a new provider, altering the separator character, or updating how accounts are surfaced—requires synchronized edits in two separate files with no compile-time or test-time guarantee they stay consistent.
+
+Solution:
+Extract a single `formatProviderLabel(provider, model, account)` utility into a common module (e.g., `static/provider-label.js`) that both views import. The utility accepts an optional `account` parameter; when omitted it renders the two-segment form, when present it renders the three-segment form. Both `sessions-view.js` and `swap-view.js` delegate to this one function, eliminating the duplicated and divergent logic.
+
+Benefits:
+Provider display rules live in exactly one place, so adding a new provider, changing the separator, or adjusting account-display logic is a single-file edit. The risk of the two views silently drifting apart (e.g., one showing a new provider name and the other not) is eliminated, and a unit test against the shared utility covers both call-sites.
+
+### AC-112 · Implicit host-discriminator contract in SSE row matching
+Strength: Worth exploring
+Files: static/sessions-view.js
+
+Problem:
+In `static/sessions-view.js`, the `applyTerminalEvent` path uses `matchesRow` to decide whether an incoming SSE event upserts or removes a row. The matching key switches between a composite `rowKey` (host + id) and a bare `id` depending on whether the event payload carries a `host` field. This makes `host` the implicit discriminator for row identity, but the contract is undocumented and unenforced: if a `session.updated` event arrives with a `host` that differs from the row's stored host (a rename, a misconfigured relay), the row is treated as a new session and a duplicate appears; conversely, if `host` is simply omitted from an update for a host-aware session, matching falls back to `id` alone and can update the wrong row when the same `id` exists on multiple hosts.
+
+Solution:
+Make the identity contract explicit and uniform. Decide whether terminal-session rows are always keyed by `host/id` or always by `id` alone, and enforce that choice in `matchesRow` regardless of whether the event payload happens to include `host`. If host-aware matching is required, add a validation step in the reducer that rejects (or logs and drops) events whose `host`/`id` pair does not correspond to an existing row, and document the expectation that upstream emitters must always include `host` for host-scoped sessions.
+
+Benefits:
+The row-identity rule becomes a single, auditable decision rather than an emergent behavior of payload shape. Duplicate-row and wrong-row-update failure modes are either structurally impossible or explicitly logged, reducing debugging time for operators who see inconsistent terminal-session lists after a host rename or a relay misconfiguration.
