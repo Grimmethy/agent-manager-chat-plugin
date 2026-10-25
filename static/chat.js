@@ -565,6 +565,24 @@ class ChatPane {
       // Root-caused live 2026-09-22 (Grimmethy, through the dashboard's proxied iframe --
       // this bug never showed hitting the plugin directly on :7442, only through :7420's
       // proxy): this fetch() had no Accept header at all.
+      // Pure helper (kept dependency-free so test/chat-preempt-text.test.mjs can lift it):
+      // turn the core's preempt rows into the operator-visible chat text. 'killed' -> freed,
+      // 'spared' -> spared (as before); 'busy' -> a holder on this chat's GPU that
+      // survived the preempt, so the operator knows their turn is queued behind it.
+      // Unknown actions are ignored (no crash, no text).
+      function buildPreemptText(lanes) {
+        const killed = lanes.filter((l) => l.action === 'killed').map((l) => l.lane);
+        const spared = lanes.filter((l) => l.action === 'spared')
+          .map((l) => `${l.lane} (${Math.round((l.ageSeconds || 0) / 60)}m in)`);
+        const busy = lanes.filter((l) => l.action === 'busy')
+          .map((l) => `busy: ${l.lane} ${l.taskId} (${l.phase}) - your turn is queued behind it`);
+        const bits = [];
+        if (killed.length) bits.push('freed ' + killed.join(', '));
+        if (spared.length) bits.push('spared ' + spared.join(', '));
+        if (busy.length) bits.push(busy.join(', '));
+        if (!bits.length) return '';
+        return `⚡ ${bits.join(' · ')}\n\n`;
+      }
       const resp = await fetch(`api/chat/${encodeURIComponent(session.id)}/message`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
         body: JSON.stringify({ message }),
@@ -589,14 +607,8 @@ class ChatPane {
           if (!line) continue;
           const evt = JSON.parse(line.slice(6));
           if (evt.type === 'preempt') {
-            const lanes = evt.lanes || [];
-            const killed = lanes.filter((l) => l.action === 'killed').map((l) => l.lane);
-            const spared = lanes.filter((l) => l.action === 'spared')
-              .map((l) => `${l.lane} (${Math.round((l.ageSeconds || 0) / 60)}m in)`);
-            const bits = [];
-            if (killed.length) bits.push('freed ' + killed.join(', '));
-            if (spared.length) bits.push('spared ' + spared.join(', '));
-            if (bits.length) { assistantEntry.text = `⚡ ${bits.join(' · ')}\n\n`; this.render(); }
+            const preemptText = buildPreemptText(evt.lanes || []);
+            if (preemptText) { assistantEntry.text = preemptText; this.render(); }
           } else if (evt.type === 'chunk') {
             assistantEntry.text += evt.text;
             this.render();
