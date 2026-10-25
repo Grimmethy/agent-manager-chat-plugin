@@ -1650,3 +1650,33 @@ Remove the alias in `local_tool_client.py`. Either (a) have `local_tool_client.s
 
 Benefits:
 The error-handling path in `app.py` reflects the actual type relationships, making it straightforward to reason about which exceptions can be raised from which call site. Adding new error sub-types in `internal_api_client` no longer risks silently breaking the shim's contract, because the shim either re-raises the real type or wraps it in a properly derived class. The dependency graph becomes honest: `app.py` depends on `internal_api_client`'s error types directly rather than through an opaque alias, simplifying refactors and onboarding.
+
+### AC-123 · Centralize host token resolution to eliminate duplicated per-call logic
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+The logic to determine which token to send to a specific host is duplicated across `list_all` and `open_events` in `agent_client.py`. Both functions manually check whether a token exists for the resolved host and then construct the `Authorization: Bearer …` header by hand. This violates the DRY principle and creates a tight coupling where `agent_client.py` is simultaneously responsible for HTTP communication and token resolution. Any future change to the header format, token source, or authentication scheme must be applied in every client function independently, increasing the risk of drift.
+
+Solution:
+Refactor `agent_hosts.py` to expose a single function, such as `get_headers(host)`, that returns the fully constructed `headers` dictionary (including the `Authorization` header when a token is present, and omitting it otherwise). Update `agent_client.py` so that `list_all`, `open_events`, and any future client functions call this single helper instead of reading the token and building the header inline.
+
+Benefits:
+Token resolution logic is localized to the module that already owns host configuration. This reduces the risk of inconsistent header construction across different client functions, simplifies `agent_client.py` by removing its direct dependency on token-resolution details, and gives a single place to audit or extend authentication behavior (e.g., adding a new header or switching to a different scheme).
+
+### AC-124 · Unify host resolution logic between agent_client.py and agent_hosts.py
+Strength: Strong
+Files: agent_client.py, agent_hosts.py, agent_errors.py (new)
+
+Problem:
+`agent_client.py` implements its own `_resolve_host` function to find a host by name or fall back to a single configured host, while `agent_hosts.py` already provides a `get_host` function for name-based lookup. The "default to single host" and "unknown host" error-handling paths are therefore split across two modules. This duplication makes it harder to keep error messages and fallback behavior consistent, and means a change to resolution semantics (e.g., supporting wildcards or a different default strategy) must be made in two places.
+
+Solution:
+1. **Extract the shared exception.** Create a small `agent_errors.py` module containing `AgentError` (moved out of `agent_client.py`). Both `agent_client.py` and `agent_hosts.py` import from this new module, eliminating any risk of a circular import.
+
+2. **Centralize resolution in `agent_hosts.py`.** Add a `resolve_host(name=None)` function that encapsulates the full resolution contract: look up by name, fall back to the single configured host when `name` is `None`, and raise `AgentError` (imported from `agent_errors.py`) when no host can be determined.
+
+3. **Simplify `agent_client.py`.** Remove the local `_resolve_host` implementation. All client functions (`list_all`, `open_events`, etc.) call `agent_hosts.resolve_host(name)` instead.
+
+Benefits:
+Host resolution logic is centralized in the configuration module, ensuring consistent error handling and eliminating code duplication. Because `AgentError` now lives in a shared leaf module, `agent_hosts.py` can raise it without importing from `agent_client.py`, preserving the existing one-way dependency (`agent_client` → `agent_hosts`) and avoiding a circular import. `agent_client.py` becomes a thinner HTTP layer that delegates all host and token concerns to `agent_hosts.py`, improving separation of concerns.
