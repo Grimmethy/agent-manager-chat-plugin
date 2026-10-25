@@ -278,3 +278,12 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 .multi-chat-switcher .chat-switcher-btn { width: auto; font-weight: 400; }
 .multi-chat-switcher .chat-switcher-menu { left: auto; right: 0; width: 360px; max-width: calc(100vw - 16px); }
 @media (max-width: 759px) { .multi-chat-tabs { flex: 1 0 100%; order: -1; } }
+
+/* Narrow panes (the dashboard's chat sidebar is about 380px wide): the pane header must still fit on one line with the close button visible, so the
+   provider label that repeats the provider button is dropped and the buttons and gaps tighten. A pane is its own size container. */
+.multi-chat-pane { container-type: inline-size; }
+@container (max-width: 480px) {
+  .chat-header { gap: 4px; padding: 6px 6px; }
+  .chat-header .chat-provider-label { display: none; }
+  .chat-header button, .multi-chat-close { padding: 0 8px; }
+}
