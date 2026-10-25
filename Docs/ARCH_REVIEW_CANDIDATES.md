@@ -1279,3 +1279,16 @@ Rename one of the two exports to make the distinction self-evident at the import
 
 Benefits:
 The import in `chat.js` becomes unambiguous and self-documenting—no alias, no mental bookkeeping about which `providerLabel` is which. New contributors reading either file immediately see a name that encodes the context (swap vs. session row), reducing the chance that a label-format change intended for one view is accidentally applied to the other. The cross-referencing comments in the two files become less load-bearing, since the names themselves now carry the disambiguation.
+
+### AC-97 · Inconsistent error propagation in local-turn streaming path
+Strength: Strong
+Files: internal_api_client.py, app.py, routes/chat.py
+
+Problem:
+The internal API client establishes a clear error-handling contract: `get_roots`, `preempt`, and `reserve` all raise `InternalApiError` (aliased as `LocalToolClientError`) on transport failures, and the `_call_chat` wrapper in `app.py` is purpose-built to catch that exception and translate it into a clean HTTP 502 response. `stream_local_turn`, however, violates this contract by catching `requests.RequestException` and yielding a `{"type": "error", "error": ...}` dictionary into the stream instead of raising. Because the exception never propagates, `_call_chat` cannot intercept it, and the route handler in `routes/chat.py` is forced to manually inspect each yielded dictionary for an `"error"` type to detect transport failures. This conflates in-payload data errors (which are legitimate stream content) with transport-level failures (which should surface as HTTP errors), breaking the unified error-handling pattern the rest of the client relies on.
+
+Solution:
+Modify `stream_local_turn` in `internal_api_client.py` so that when a `requests.RequestException` is raised during the initial connection or stream setup, the function raises `InternalApiError` (or `LocalToolClientError`) rather than yielding an error dictionary. The existing `_call_chat` wrapper in `app.py` will then catch the exception and return the standard HTTP 502 response, exactly as it does for the other client methods. In-payload error events that arrive *after* the stream has successfully started can still be yielded as dictionaries, preserving the distinction between transport failures and application-level stream content.
+
+Benefits:
+The error-handling contract for the internal API client becomes uniform across all endpoints, eliminating the need for special-case dictionary inspection in `routes/chat.py`. Transport failures during the local-turn stream are reported with the correct HTTP status code (502) and consistent error body, making monitoring, logging, and client-side retry logic simpler and more predictable. The routing layer no longer needs to distinguish between "the stream contained an error object" and "the connection itself failed," reducing cognitive load and the surface area for missed error paths.
