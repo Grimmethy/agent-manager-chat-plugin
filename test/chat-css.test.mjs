@@ -131,3 +131,20 @@ test('the strip navigation: a hidden-aware inline row and 44px touch buttons', (
   assert.match(coarse, /min-width\s*:\s*44px/);
   assert.match(coarse, /min-height\s*:\s*44px/);
 });
+
+test('the page is one full-height column: #chat-panel fills the dynamic viewport and the strip host shrinks to fit', () => {
+  const panel = blocksFor('#chat-panel').join(' ');
+  assert.match(panel, /display:\s*flex/);
+  assert.match(panel, /flex-direction:\s*column/);
+  assert.match(panel, /height:\s*100dvh/);
+  assert.match(panel, /height:\s*100vh/, 'a 100vh fallback stays for browsers without dvh');
+  assert.match(blocksFor('.multi-chat-host').join(' '), /min-height:\s*0/);
+  assert.match(blocksFor('.multi-chat-toolbar').join(' '), /flex:\s*0 0 auto/);
+});
+
+test('under 760px only the layout presets and the templates menu are hidden; the toolbar itself stays', () => {
+  const hide = css.match(/@media \(max-width: 759px\)\s*\{\s*([^{}]*)\{\s*display:\s*none/);
+  assert.ok(hide, 'no phone rule hides anything');
+  assert.deepEqual(hide[1].split(',').map((x) => x.trim()).sort(), ['.multi-chat-preset-btn', '.multi-chat-templates']);
+  assert.equal(blocksFor('.multi-chat-toolbar').some((b) => /display:\s*none/.test(b)), false);
+});
