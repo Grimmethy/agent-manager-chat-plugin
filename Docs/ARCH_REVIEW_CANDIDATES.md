@@ -1214,3 +1214,29 @@ Remove the `as LocalToolClientError` alias in `local_tool_client.py` (or, if ext
 
 Benefits:
 Eliminates a redundant class name that forces readers to mentally resolve the alias to understand which errors are actually being caught. Clarifies the dependency graph so that `app.py`'s imports directly name the module that defines the error. Removes the risk of future divergence if `local_tool_client` were ever refactored to wrap or re-raise errors differently, at which point the alias would silently change semantics for `app.py`'s catch blocks.
+
+### AC-92 · Divergent providerLabel implementations produce contradictory labels for the same session
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `sessions-view.js` and `swap-view.js` export a function named `providerLabel` consumed by the same caller, but they encode different provider taxonomies. The sessions-view version is binary: `provider === 'claude'` yields "Claude" and *everything else* yields "Local". The swap-view version is ternary: `'claude'` → "Claude · …", `'local'` → "Local · …", and *anything else* → "Unknown". A session whose `provider` field is neither `'claude'` nor `'local'` (a new backend, a misconfigured row, a future provider) is therefore labelled "Local" in the session switcher but "Unknown" in the swap menu—two contradictory labels for the same session in the same UI. The name collision also means any future change to display rules (adding a third provider, renaming a label) must be made in two places with the risk of them drifting further apart.
+
+Solution:
+Extract a single `providerDisplay(session, { includeAccount })` helper into a small shared module (or into one of the two files with the other importing it) that owns the provider→label mapping, the model-append rule, and the optional account-append rule. Both `formatRow` in sessions-view and the swap-menu code in swap-view call this one helper. The account suffix is only relevant in the swap context, so the helper accepts an `includeAccount` flag (or the swap code post-processes). The "what is a valid provider and what do we call it" decision then lives in exactly one place.
+
+Benefits:
+A single source of truth for provider display eliminates the contradictory-label bug for any non-`claude`/non-`local` provider, and ensures that adding a new provider or changing label wording is a one-line change in one file rather than a two-file edit that can silently diverge.
+
+### AC-93 · Duplicate filter logic in sessions-view.js states matching semantics twice
+Strength: Worth exploring
+Files: static/sessions-view.js
+
+Problem:
+`filterRows` and `filterChats` in `sessions-view.js` are structurally identical six-line patterns—trim/lowercase the query, early-return on empty, build a `has` closure, filter—differing only in the list of fields they probe (`name`/`cwd`/`host` vs. `title`/`providerLabel(r)`/`model`). The "how do we match a type-to-filter query" logic (case-insensitivity, whitespace handling, null-safety) is stated twice in the same file. If the matching semantics ever change (adding a fuzzy-match option, changing how `providerLabel` is folded into the search), both copies must be updated in lockstep or the two filters will silently disagree.
+
+Solution:
+Introduce a single `filterByFields(rows, query, fields)` helper where `fields` is an array of accessor functions. `filterRows` becomes `filterByFields(rows, query, [r => r.name, r => r.cwd, r => r.host])` and `filterChats` becomes `filterByFields(rows, query, [r => r.title, r => providerLabel(r), r => r.model])`. The shared helper owns the trim/lowercase/empty/null logic exactly once.
+
+Benefits:
+Matching semantics (case-folding, whitespace trimming, null-safety) are defined in one place, eliminating the risk of the two filters drifting apart if the matching rules evolve. The code is slightly shorter and the intent of each filter is expressed purely by its field list, making the difference between the two filters immediately visible.
