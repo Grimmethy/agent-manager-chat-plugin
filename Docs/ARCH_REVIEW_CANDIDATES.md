@@ -1292,3 +1292,29 @@ Modify `stream_local_turn` in `internal_api_client.py` so that when a `requests.
 
 Benefits:
 The error-handling contract for the internal API client becomes uniform across all endpoints, eliminating the need for special-case dictionary inspection in `routes/chat.py`. Transport failures during the local-turn stream are reported with the correct HTTP status code (502) and consistent error body, making monitoring, logging, and client-side retry logic simpler and more predictable. The routing layer no longer needs to distinguish between "the stream contained an error object" and "the connection itself failed," reducing cognitive load and the surface area for missed error paths.
+
+### AC-98 · Duplicate provider-labeling logic across view modules
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js, static/chat.js
+
+Problem:
+Both `sessions-view.js` and `swap-view.js` export a function named `providerLabel` that performs nearly identical work: checking whether the provider is `'claude'`, checking for a model string, and concatenating them with a middle-dot separator. The only substantive difference is that the `swap-view.js` variant also appends an account string. Because both are exported and consumed by `chat.js`, the rendering layer must import two modules and manage two separate functions that do 90 % of the same job. This violates locality and creates a maintenance hazard: any UI-design change (a different separator, a new provider type, a formatting tweak) requires the developer to remember to update both files in lockstep, and a missed update silently produces inconsistent labels across panels.
+
+Solution:
+Extract the shared provider-labeling logic into a single utility module (e.g. `provider-format.js`) that exports one `providerLabel` function accepting the provider, model, and an optional account string. Both `sessions-view.js` and `swap-view.js` (and any future view module) import from that one location. The `chat.js` consumer no longer needs to import two modules just to get a label; it can call the shared function directly or receive already-formatted strings from the views.
+
+Benefits:
+A single source of truth for provider display formatting eliminates the risk of the two panels drifting apart after a UI change. Adding a new provider type or changing the separator is a one-line edit in one file. The import graph in `chat.js` simplifies, and future view modules can adopt the same label format without copy-pasting logic.
+
+### AC-99 · Copy-pasted case-insensitive substring filtering in sessions-view
+Strength: Strong
+Files: static/sessions-view.js
+
+Problem:
+`sessions-view.js` contains two functions—`filterRows` (for terminal sessions) and `filterChats` (for chat sessions)—that implement the exact same case-insensitive substring-matching algorithm. The only difference is the set of fields each checks: `filterRows` inspects `name`, `cwd`, and `host`, while `filterChats` inspects `title` and the result of `providerLabel(r)`. The core logic (trimming the query, lowercasing, empty-string short-circuit, substring test) is duplicated verbatim. A bug in the matching algorithm—Unicode normalization, special-character handling, or a future requirement like diacritic-insensitive search—must be discovered and fixed in two places, and a fix applied to only one will leave the other panel behaving inconsistently.
+
+Solution:
+Introduce a single `filterByFields(rows, query, fields)` helper inside `sessions-view.js` (or in a shared utility if other modules need it). The helper trims and lowercases the query, short-circuits on empty input, and returns the subset of rows where at least one of the caller-supplied field accessors produces a string containing the query. `filterRows` becomes `filterByFields(rows, q, [r => r.name, r => r.cwd, r => r.host])` and `filterChats` becomes `filterByFields(chats, q, [r => r.title, r => providerLabel(r)])`.
+
+Benefits:
+The matching algorithm lives in exactly one place, so any correctness fix or enhancement (Unicode normalization, fuzzy matching, etc.) is applied uniformly to both panels. Adding a new filterable field to either panel is a one-element change to the field list rather than a copy-paste of the entire loop. The two public functions become thin, readable one-liners that make the intent obvious.
