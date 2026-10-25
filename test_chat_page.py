@@ -35,6 +35,17 @@ class ChatPageHeadTests(unittest.TestCase):
         self.assertIsNotNone(icon, "chat.html has no icon link")
         self.assertTrue(icon.group(1).startswith("data:"), "the icon must be an inline data: URI")
 
+    def test_multi_panes_flag_script_comes_before_the_first_module_script(self):
+        html = self._page()
+        flag = html.find("window.__CHAT_MULTI_PANES__ = true")
+        module = html.find('type="module"')
+        self.assertNotEqual(flag, -1, "chat.html has no inline __CHAT_MULTI_PANES__ script")
+        self.assertNotEqual(module, -1)
+        self.assertLess(flag, module, "the flag must be set before the first module script runs")
+        script_open = html.rfind("<script", 0, flag)
+        self.assertNotIn("type=", html[script_open:flag], "the flag script must be a classic script, not a module")
+        self.assertEqual(html.count('id="chat-panel"'), 1, "#chat-panel stays the single id")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -536,9 +536,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     // --- one ChatPane inside a framed slot (close = DOM unmount, no API) ----
     let ChatPane = null;
+    let livePanes = []; // the ChatPane instances drawn by the current render, for the dashboard's refresh message
     let showToast = (msg) => console.error(msg);
     function mountPane(id, bodyEl, isNew) {
       const pane = new ChatPane(bodyEl, {});
+      livePanes.push(pane);
       const opener = isNew ? pane.startNew() : pane.loadSession(id);
       // After startNew the pane knows its fresh session id -- record it so the
       // saved layout stores a real id instead of a placeholder.
@@ -649,6 +651,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     function render() {
       host.innerHTML = ''; // unmounts every previous pane's DOM -- no network
+      livePanes = [];
       Promise.resolve().then(refreshSwitcher); // after this render has finished, whichever way it returns
       strip = null;
       updateStripNav();
@@ -658,7 +661,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // shows one whole pane per screen and a touch swipe moves to the next.
       // render never collapses `state` (and never saves).
       const view = state;
-      toolbar.hidden = isMobile(); // phone width: the chat's own switcher is the navigation
       const wide = view.preset === '1';
       const mounted = mountedSet(view, activeId);
 
@@ -722,6 +724,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // filled (2x2). The pane is created first; its fresh id is recorded in the
       // layout state once startNew() has resolved (see mountPane).
       host.innerHTML = '';
+      livePanes = [];
       Promise.resolve().then(refreshSwitcher);
       markPreset();
       const idx = state.panes.indexOf(null);
@@ -797,6 +800,27 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       render();
     }
 
+    // The dashboard's sendTextToChat() posts to api/chat/inject, then postMessages this iframe: re-fetch every pane that is not mid-reply.
+    window.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'agent-manager-chat-refresh') {
+        for (const p of livePanes) if (!p.isSending) p.load();
+      }
+    });
+
+    // The page is never empty: with no chat open, show the most recent one, or start a new chat when there are none.
+    async function ensureOnePane() {
+      if (openIds(state).length > 0) return;
+      let rows = null;
+      try {
+        const resp = await fetch('api/chat/sessions');
+        if (resp.ok) rows = await resp.json();
+      } catch (e) { /* the list could not be read */ }
+      if (!Array.isArray(rows)) return; // keep the '+ New chat' placeholder rather than start a stray chat on a failed read
+      const latest = rows.length && typeof rows[0].id === 'string' ? rows[0].id : null;
+      if (latest) selectChat(latest);
+      else openNewChat();
+    }
+
     import('./chat.js')
       .then((mod) => {
         ChatPane = mod.ChatPane;
@@ -810,6 +834,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           onClose: closeChat,
         });
         render();
+        ensureOnePane();
       })
       .catch((e) => {
         console.error('multi-chat: failed to start multi-pane view', e);
