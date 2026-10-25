@@ -28,6 +28,13 @@ body {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
 }
 .chat-switcher-slot { flex: 1 1 12rem; min-width: 0; position: relative; }
+.chat-switcher-slot:empty { display: none; }
+/* A pane's header is one line: the chat's title on the left (hidden when the pane carries its own switcher), then the action buttons, the close button last. */
+.chat-pane-title { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13px; }
+.chat-switcher-slot:not(:empty) ~ .chat-pane-title { display: none; }
+.chat-header { flex-wrap: nowrap; padding: 6px 8px; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.chat-header button, .multi-chat-close { height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap; }
+.chat-header .chat-provider-label { flex: 0 0 auto; }
 .chat-switcher-btn { width: 100%; text-align: left; font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-switcher-menu { position: absolute; top: calc(100% + 4px); left: 0; right: 0; min-width: 280px; max-height: 60vh; overflow-y: auto; background: var(--panel); border: 2px solid var(--border); border-radius: 6px; z-index: 100; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
 .chat-switcher-menu[hidden] { display: none; }
@@ -192,6 +199,12 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
   .chat-header button,
   .chat-send-row button,
   .chat-switcher-new,
+  .multi-chat-close,
+  .multi-chat-layout-btn,
+  .multi-chat-preset-btn,
+  .multi-chat-tab,
+  .multi-chat-new-btn,
+  .multi-chat-switcher .chat-switcher-btn,
   .multi-chat-strip-btn,
   .chat-chime-setting { min-height: 44px; min-width: 44px; }
   .chat-chime-setting input { width: 20px; height: 20px; }
@@ -203,6 +216,8 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
    and scrolls its own transcript; touch swipe works natively through scroll-snap. */
 .multi-chat-flex {
   --strip-visible: 2;
+  flex: 1 1 0;
+  min-height: 0;
   display: flex;
   flex-wrap: nowrap;
   gap: 8px;
@@ -212,10 +227,13 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
   scroll-snap-type: x mandatory;
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
   box-sizing: border-box;
 }
+/* The prev/next buttons, the arrow keys and touch swipe move the strip; no drag bar. */
+.multi-chat-flex::-webkit-scrollbar { display: none; }
 @media (max-width: 759px) { .multi-chat-flex { --strip-visible: 1; } }
-@media (max-width: 759px) { .multi-chat-preset-btn, .multi-chat-templates { display: none; } }
+@media (max-width: 759px) { .multi-chat-layout { display: none; } }
 @media (min-width: 1400px) { .multi-chat-flex { --strip-visible: 3; } }
 .multi-chat-pane, .multi-chat-placeholder {
   flex: 0 0 calc((100% - (var(--strip-visible, 2) - 1) * 8px) / var(--strip-visible, 2));
@@ -232,3 +250,31 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 .multi-chat-strip-nav[hidden] { display: none; }
 .multi-chat-strip-label { min-width: 4.5em; text-align: center; font-size: 12px; color: var(--muted); }
 .multi-chat-strip-btn:disabled { opacity: .4; cursor: default; }
+
+/* A pane fills the strip's height; its body is a column so the transcript takes whatever the one-line header leaves. */
+.multi-chat-pane-body { display: flex; flex-direction: column; }
+
+/* Layout control (end of the toolbar): one button; the presets and the templates live in its popover. */
+.multi-chat-layout { position: relative; flex: 0 0 auto; }
+.multi-chat-layout-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 100; min-width: 300px; display: flex; flex-direction: column; gap: 10px; padding: 10px; background: var(--panel); border: 2px solid var(--border); border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
+.multi-chat-layout-menu[hidden] { display: none; }
+.multi-chat-presets { display: flex; gap: 6px; }
+.multi-chat-presets .multi-chat-preset-btn { flex: 1 1 auto; padding: 0 8px; height: 30px; font-size: 12px; white-space: nowrap; }
+.multi-chat-layout-menu .multi-chat-templates { flex-direction: column; align-items: stretch; }
+.multi-chat-layout-menu .multi-chat-template-select, .multi-chat-layout-menu .multi-chat-template-save-btn { height: 30px; padding-top: 0; padding-bottom: 0; font-size: 12px; }
+.multi-chat-preset-btn[aria-pressed="true"] { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
+.multi-chat-layout-btn { height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap; }
+
+/* The top bar (owner 2026-10-24): the open chats as a row of buttons, "+" for a new chat, "All chats" for the rest, then the strip nav and Layout.
+   Every control in the bar is the same 30px-high button; the active chat and a pressed preset share one accent look. */
+.multi-chat-toolbar { gap: 6px; padding: 6px 8px; }
+.multi-chat-toolbar button, .multi-chat-toolbar select { height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap; border-radius: 6px; }
+.multi-chat-tabs { display: flex; flex: 0 1 auto; min-width: 0; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.multi-chat-tabs::-webkit-scrollbar { display: none; }
+.multi-chat-tab { flex: 0 0 auto; max-width: 16em; overflow: hidden; text-overflow: ellipsis; }
+.multi-chat-tab[aria-selected="true"] { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
+.multi-chat-new-btn { flex: 0 0 auto; min-width: 30px; margin-right: auto; }
+.multi-chat-switcher { position: relative; flex: 0 0 auto; }
+.multi-chat-switcher .chat-switcher-btn { width: auto; font-weight: 400; }
+.multi-chat-switcher .chat-switcher-menu { left: auto; right: 0; width: 360px; max-width: calc(100vw - 16px); }
+@media (max-width: 759px) { .multi-chat-tabs { flex: 1 0 100%; order: -1; } }

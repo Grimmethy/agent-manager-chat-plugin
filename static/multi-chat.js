@@ -187,6 +187,16 @@ export function shouldHandleArrowKey(tagName, isContentEditable = false) {
   return !(tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT');
 }
 
+// The chat buttons at the top of the bar: one per open pane, in pane order. `titles` maps a session id to its title; a chat whose title is not known (yet) is called 'Chat'.
+// Returns [{ id, title, active }]; `active` is true only for the pane that is `activeId`. Nothing is mutated.
+export function chatTabs(state, titles, activeId) {
+  const known = titles && typeof titles === 'object' ? titles : {};
+  return openIds(state).map((id) => {
+    const t = Object.prototype.hasOwnProperty.call(known, id) && typeof known[id] === 'string' ? known[id].trim() : '';
+    return { id, title: t || 'Chat', active: id === activeId };
+  });
+}
+
 // Layout templates (HUB0010 6/10): named {preset, count} recipes. Plain data in, plain data
 // out; nothing here touches storage or the DOM, and no input is ever mutated.
 function slotsFor(preset) {
@@ -319,11 +329,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     style.id = 'multi-chat-style';
     style.textContent =
       '.multi-chat-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:8px 12px; border-bottom:1px solid var(--border,#ddd); }' +
-      '.multi-chat-toolbar .multi-chat-switcher { flex:1; min-width:0; }' +
       // The strip layout (`.multi-chat-flex` / `.multi-chat-pane` / `.wide` sizing, scroll-snap)
       // lives in static/chat.css: one horizontal row, --strip-visible panes per screen.
       '.multi-chat-host { flex:1; min-height:0; overflow:hidden; position:relative; display:flex; flex-direction:column; }' +
-      '.multi-chat-pane-head { display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:4px 8px 0; }' +
       '.multi-chat-pane-body { flex:1; min-height:0; overflow-y:auto; }' +
       '.multi-chat-placeholder { border:2px dashed var(--border,#ccc); border-radius:8px; align-items:center; justify-content:center; background:transparent; }';
     document.head.appendChild(style);
@@ -346,14 +354,70 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     root.appendChild(toolbar);
     root.appendChild(host);
 
-    // --- toolbar: the one chat switcher (built once chat.js has loaded) -----
+    // --- toolbar: the open chats as a row of buttons (one per pane, the active one highlighted) and a "+" new-chat button ----------------
+    const tabsBox = document.createElement('div');
+    tabsBox.className = 'multi-chat-tabs';
+    tabsBox.setAttribute('role', 'tablist');
+    tabsBox.setAttribute('aria-label', 'Open chats');
+    toolbar.appendChild(tabsBox);
+    const newTabBtn = document.createElement('button');
+    newTabBtn.type = 'button';
+    newTabBtn.className = 'secondary multi-chat-new-btn';
+    newTabBtn.textContent = '+';
+    newTabBtn.title = 'New chat';
+    newTabBtn.setAttribute('aria-label', 'New chat');
+    newTabBtn.onclick = () => openNewChat();
+    toolbar.appendChild(newTabBtn);
+
+    // --- toolbar: the session switcher, now the "All chats" list (built once chat.js has loaded) -----
     const switcherSlot = document.createElement('div');
     switcherSlot.className = 'multi-chat-switcher';
     toolbar.appendChild(switcherSlot);
     let switcher = null;
-    const refreshSwitcher = () => { if (switcher) switcher.refresh(); };
+    const refreshSwitcher = () => { if (switcher) switcher.refresh().then(renderTabs, () => {}); renderTabs(); };
+    function renderTabs() {
+      const titles = {};
+      if (switcher && Array.isArray(switcher.rows)) for (const r of switcher.rows) if (r && typeof r.id === 'string') titles[r.id] = r.title;
+      tabsBox.innerHTML = '';
+      for (const tab of chatTabs(state, titles, activeId)) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'secondary multi-chat-tab';
+        btn.textContent = tab.title;
+        btn.title = tab.title;
+        btn.setAttribute('role', 'tab');
+        btn.setAttribute('aria-selected', String(tab.active));
+        if (tab.active) btn.setAttribute('aria-current', 'true');
+        btn.onclick = () => selectChat(tab.id);
+        tabsBox.appendChild(btn);
+      }
+    }
 
-    // --- toolbar: preset buttons (existing .secondary class) ----------------
+    // --- toolbar: one "Layout" control at the end of the bar; the presets and the templates live in its popover ----------------
+    const layoutBox = document.createElement('div');
+    layoutBox.className = 'multi-chat-layout';
+    const layoutBtn = document.createElement('button');
+    layoutBtn.type = 'button';
+    layoutBtn.className = 'secondary multi-chat-layout-btn';
+    layoutBtn.textContent = 'Layout \u25BE';
+    layoutBtn.setAttribute('aria-haspopup', 'true');
+    layoutBtn.setAttribute('aria-expanded', 'false');
+    const layoutMenu = document.createElement('div');
+    layoutMenu.className = 'multi-chat-layout-menu';
+    layoutMenu.hidden = true;
+    const presetRow = document.createElement('div');
+    presetRow.className = 'multi-chat-presets';
+    layoutMenu.appendChild(presetRow);
+    layoutBox.appendChild(layoutBtn);
+    layoutBox.appendChild(layoutMenu);
+    function setLayoutOpen(open) {
+      layoutMenu.hidden = !open;
+      layoutBtn.setAttribute('aria-expanded', String(open));
+    }
+    layoutBtn.onclick = (e) => { e.stopPropagation(); setLayoutOpen(layoutMenu.hidden); };
+    document.addEventListener('click', (e) => { if (!layoutMenu.hidden && !layoutBox.contains(e.target)) setLayoutOpen(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !layoutMenu.hidden) setLayoutOpen(false); });
+
     const presetButtons = {};
     const PRESET_LABELS = { '1': 'Single', '2col': 'Two columns', '2x2': 'Grid 2x2' };
     for (const preset of PRESETS) {
@@ -366,9 +430,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         state = applyPreset(state, preset);
         activeId = firstOpenPane(state) || activeId;
         saveLayout(state);
+        setLayoutOpen(false);
         render();
       };
-      toolbar.appendChild(btn);
+      presetRow.appendChild(btn);
       presetButtons[preset] = btn;
     }
     function markPreset() {
@@ -404,7 +469,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     tplBox.appendChild(tplSelect);
     tplBox.appendChild(tplSaveBtn);
     tplBox.appendChild(tplSaveRow);
-    toolbar.appendChild(tplBox);
+    layoutMenu.appendChild(tplBox);
 
     // --- toolbar: previous / next buttons and the position label for the pane strip ----------------
     // The strip (.multi-chat-flex, one snap row) scrolls natively by touch swipe or mouse; these buttons, the label and the arrow keys are the other ways to move.
@@ -430,6 +495,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     nav.appendChild(stripLabelEl);
     nav.appendChild(nextBtn);
     toolbar.appendChild(nav);
+    toolbar.appendChild(layoutBox); // last: the Layout control closes the bar
 
     let strip = null; // the current .multi-chat-flex element, or null (dockview, or nothing drawn)
     let stripIndex = 0;
@@ -458,6 +524,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!strip || next === stripIndex) return false;
       stripIndex = next;
       scrollStripTo(next, true);
+      const landed = state.panes[next];
+      if (typeof landed === 'string') activeId = landed; // the highlighted chat follows the strip
+      renderTabs();
       updateStripNav();
       return true;
     }
@@ -510,6 +579,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       state = applyTemplate(templates, name, state, openList);
       activeId = firstOpenPane(state) || activeId;
       saveLayout(state);
+      setLayoutOpen(false);
       render();
     };
     function closeTemplateSave() {
@@ -537,9 +607,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // --- one ChatPane inside a framed slot (close = DOM unmount, no API) ----
     let ChatPane = null;
     let livePanes = []; // the ChatPane instances drawn by the current render, for the dashboard's refresh message
+    let pendingNewAt = -1; // the slot index the next render() fills with a brand-new chat (set by openNewChat), else -1
     let showToast = (msg) => console.error(msg);
     function mountPane(id, bodyEl, isNew) {
-      const pane = new ChatPane(bodyEl, {});
+      const pane = new ChatPane(bodyEl, { onSessionChange: () => refreshSwitcher() }); // a new title or a busy flag shows up on the chat's button
       livePanes.push(pane);
       const opener = isNew ? pane.startNew() : pane.loadSession(id);
       // After startNew the pane knows its fresh session id -- record it so the
@@ -561,21 +632,21 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function paneSlot(wide, open) {
       const slot = document.createElement('div');
       slot.className = (wide ? 'multi-chat-pane wide' : 'multi-chat-pane') + ' multi-chat-pane-slot';
-      const head = document.createElement('div');
-      head.className = 'multi-chat-pane-head';
       const close = document.createElement('button');
       close.type = 'button';
       close.className = 'secondary multi-chat-close';
       close.textContent = '×';
       close.title = 'Close this pane (the chat stays open on the server)';
       close.onclick = () => closeSlot(open.id);
-      head.appendChild(close);
       const body = document.createElement('div');
       body.className = 'multi-chat-pane-body';
       body.append(open.nodes);
-      slot.appendChild(head);
+      // One header line per pane: the close button is the last button of the pane's own .chat-header (title left, buttons right).
+      const header = body.querySelector('.chat-header');
+      if (header) header.appendChild(close);
+      else body.prepend(close);
       slot.appendChild(body);
-      body.addEventListener('focusin', () => { activeId = open.id; });
+      body.addEventListener('focusin', () => { activeId = open.id; renderTabs(); });
       return slot;
     }
 
@@ -652,6 +723,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function render() {
       host.innerHTML = ''; // unmounts every previous pane's DOM -- no network
       livePanes = [];
+      renderTabs();
       Promise.resolve().then(refreshSwitcher); // after this render has finished, whichever way it returns
       strip = null;
       updateStripNav();
@@ -691,7 +763,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       const flex = document.createElement('div');
       flex.className = 'multi-chat-flex';
       let filled = 0;
-      for (const id of state.panes) {
+      for (let i = 0; i < state.panes.length; i++) {
+        const id = state.panes[i];
+        if (id === null && i === pendingNewAt) {
+          pendingNewAt = -1;
+          const body = document.createElement('div');
+          body.className = 'multi-chat-pane-body';
+          mountPane(null, body, true);
+          flex.appendChild(paneSlot(wide, { id: '__new__', nodes: body }));
+          filled++;
+          continue;
+        }
         if (id === null) {
           flex.appendChild(placeholder('+ New chat', openNewChat, wide));
           continue;
@@ -720,32 +802,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function openNewChat() {
-      // Claim a null slot (most recent first); append one when every slot is
-      // filled (2x2). The pane is created first; its fresh id is recorded in the
-      // layout state once startNew() has resolved (see mountPane).
-      host.innerHTML = '';
-      livePanes = [];
-      Promise.resolve().then(refreshSwitcher);
-      markPreset();
+      // Claim a null slot (most recent first); append one when every slot is filled (2x2). render() mounts a fresh chat in that slot
+      // next to every chat that is already open; its new id is recorded in the layout state once startNew() has resolved (see mountPane).
       const idx = state.panes.indexOf(null);
       if (idx === -1) state.panes.push(null);
-      const wide = state.preset === '1';
-      const flex = document.createElement('div');
-      flex.className = 'multi-chat-flex';
-      state.panes.forEach((id, i) => {
-        if (i === (idx === -1 ? state.panes.length - 1 : idx)) {
-          const body = document.createElement('div');
-          body.className = 'multi-chat-pane-body';
-          mountPane(null, body, true);
-          flex.appendChild(paneSlot(wide, { id: '__new__', nodes: body }));
-        } else if (id === null) {
-          flex.appendChild(placeholder('+ New chat', openNewChat, wide));
-        } else {
-          flex.appendChild(placeholder('Open chat…', () => { activeId = id; render(); }, wide));
-        }
-      });
-      host.appendChild(flex);
-      attachStrip(flex);
+      pendingNewAt = idx === -1 ? state.panes.length - 1 : idx;
+      render();
     }
 
     // Re-render only when crossing the 760px boundary (a plain resize must not
@@ -776,6 +838,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (wasOpen && strip) {
         scrollStripTo(clampStripIndex(stripIndex, stripPanes().length, stripVisibleCount(window.innerWidth || 1024)), true);
         updateStripNav();
+        renderTabs();
         refreshSwitcher();
         return;
       }
@@ -832,6 +895,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           onSelect: selectChat,
           onNew: openNewChat,
           onClose: closeChat,
+          buttonLabel: 'All chats',
         });
         render();
         ensureOnePane();

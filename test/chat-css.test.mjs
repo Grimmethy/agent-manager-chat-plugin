@@ -110,6 +110,14 @@ test('.multi-chat-flex is a horizontal snap strip, not a wrapping vertical grid'
   assert.match(block, /scroll-snap-type\s*:\s*x\s+mandatory/i, 'scroll-snap-type must be "x mandatory"');
 });
 
+test('.multi-chat-flex hides its scrollbar but still scrolls and snaps, so the buttons are the way to move', () => {
+  const block = blocksFor('.multi-chat-flex').join(' ');
+  assert.match(block, /scrollbar-width\s*:\s*none/i, 'Firefox-style scrollbar must be hidden');
+  assert.match(blocksFor('.multi-chat-flex::-webkit-scrollbar').join(' '), /display\s*:\s*none/i, 'WebKit/Blink scrollbar must be hidden');
+  assert.match(block, /overflow-x\s*:\s*auto/i, 'the strip must still scroll horizontally');
+  assert.match(block, /scroll-snap-type\s*:\s*x\s+mandatory/i, 'the strip must still snap');
+});
+
 test('.multi-chat-flex sets --strip-visible from the width with the stripVisibleCount breakpoints', () => {
   const block = blocksFor('.multi-chat-flex').join(' ');
   assert.match(block, /(^|[;\s])--strip-visible\s*:\s*2/i, 'default of two visible panes');
@@ -142,9 +150,74 @@ test('the page is one full-height column: #chat-panel fills the dynamic viewport
   assert.match(blocksFor('.multi-chat-toolbar').join(' '), /flex:\s*0 0 auto/);
 });
 
-test('under 760px only the layout presets and the templates menu are hidden; the toolbar itself stays', () => {
+test('under 760px only the Layout control (presets and templates) is hidden; the toolbar itself stays', () => {
   const hide = css.match(/@media \(max-width: 759px\)\s*\{\s*([^{}]*)\{\s*display:\s*none/);
   assert.ok(hide, 'no phone rule hides anything');
-  assert.deepEqual(hide[1].split(',').map((x) => x.trim()).sort(), ['.multi-chat-preset-btn', '.multi-chat-templates']);
+  assert.deepEqual(hide[1].split(',').map((x) => x.trim()).sort(), ['.multi-chat-layout']);
   assert.equal(blocksFor('.multi-chat-toolbar').some((b) => /display:\s*none/.test(b)), false);
+});
+
+test('a pane header is one non-wrapping line with the title on the left and compact buttons, and the empty switcher slot takes no room', () => {
+  const header = blocksFor('.chat-header').join(' ');
+  assert.match(header, /flex-wrap:\s*nowrap/);
+  assert.match(header, /overflow-x:\s*auto/, 'a very narrow pane scrolls its header instead of wrapping to a second row');
+  const title = blocksFor('.chat-pane-title').join(' ');
+  assert.match(title, /flex:\s*1 1 0/);
+  assert.match(title, /text-overflow:\s*ellipsis/);
+  assert.match(title, /white-space:\s*nowrap/);
+  assert.match(blocksFor('.chat-switcher-slot:empty').join(' '), /display:\s*none/);
+  assert.match(blocksFor('.chat-switcher-slot:not(:empty) ~ .chat-pane-title').join(' '), /display:\s*none/);
+  const buttons = blocksFor('.chat-header button').join(' ');
+  assert.match(buttons, /height:\s*30px/);
+  assert.ok(blocksFor('.multi-chat-close').length > 0, 'the close button shares the header button size');
+  assert.ok(mediaBlocksFor('(pointer: coarse)', '.multi-chat-close').join(' ').match(/min-height:\s*44px/), 'close keeps a 44px touch target');
+});
+
+test('the strip fills the host and a pane body is a column, so the transcript gets the height the old two header rows wasted', () => {
+  const strip = blocksFor('.multi-chat-flex').join(' ');
+  assert.match(strip, /flex:\s*1 1 0/);
+  assert.match(strip, /min-height:\s*0/);
+  const body = blocksFor('.multi-chat-pane-body').join(' ');
+  assert.match(body, /display:\s*flex/);
+  assert.match(body, /flex-direction:\s*column/);
+});
+
+test('the Layout control: one button at the end of the bar with a popover for the presets and the templates, 44px on touch', () => {
+  assert.match(blocksFor('.multi-chat-layout').join(' '), /position:\s*relative/);
+  const menu = blocksFor('.multi-chat-layout-menu').join(' ');
+  assert.match(menu, /position:\s*absolute/);
+  assert.match(menu, /z-index:\s*100/);
+  assert.match(blocksFor('.multi-chat-layout-menu[hidden]').join(' '), /display:\s*none/);
+  assert.match(blocksFor('.multi-chat-preset-btn[aria-pressed="true"]').join(' '), /background:\s*var\(--accent\)/);
+  for (const selector of ['.multi-chat-layout-btn', '.multi-chat-preset-btn']) {
+    assert.match(mediaBlocksFor('(pointer: coarse)', selector).join(' '), /min-height:\s*44px/, selector + ' needs a 44px touch target');
+  }
+});
+
+test('the top bar: open chats are a scrollable row of buttons with a highlighted active one, and every bar control shares one size', () => {
+  const tabs = blocksFor('.multi-chat-tabs').join(' ');
+  assert.match(tabs, /display:\s*flex/);
+  assert.match(tabs, /overflow-x:\s*auto/);
+  assert.match(tabs, /scrollbar-width:\s*none/);
+  assert.ok(blocksFor('.multi-chat-tabs::-webkit-scrollbar').join(' ').match(/display:\s*none/));
+  assert.match(blocksFor('.multi-chat-tab').join(' '), /text-overflow:\s*ellipsis/);
+  assert.match(blocksFor('.multi-chat-tab[aria-selected="true"]').join(' '), /background:\s*var\(--accent\)/);
+  const control = blocksFor('.multi-chat-toolbar button').join(' ');
+  assert.match(control, /height:\s*30px/);
+  assert.match(control, /border-radius:\s*6px/);
+  assert.ok(blocksFor('.multi-chat-toolbar select').length > 0, 'the templates select shares the bar control size');
+  for (const selector of ['.multi-chat-tab', '.multi-chat-new-btn', '.multi-chat-switcher .chat-switcher-btn']) {
+    assert.match(mediaBlocksFor('(pointer: coarse)', selector).join(' '), /min-height:\s*44px/, selector + ' needs a 44px touch target');
+  }
+});
+
+test('the All chats list anchors under its own button (position: relative), right-aligned, instead of opening below the window', () => {
+  assert.match(blocksFor('.multi-chat-switcher').join(' '), /position:\s*relative/);
+  const menu = blocksFor('.multi-chat-switcher .chat-switcher-menu').join(' ');
+  assert.match(menu, /right:\s*0/);
+  assert.match(menu, /left:\s*auto/);
+});
+
+test('on a phone the open-chat buttons take a row of their own above the other controls', () => {
+  assert.match(css, /@media \(max-width: 759px\)\s*\{\s*\.multi-chat-tabs\s*\{[^}]*flex:\s*1 0 100%[^}]*order:\s*-1/);
 });
