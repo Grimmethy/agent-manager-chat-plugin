@@ -460,6 +460,35 @@ def api_chat_swap(session_id):
     return jsonify(_public_session(updated))
 
 
+@chat_bp.route("/api/chat/<session_id>/command/<proposal_id>/<action>", methods=["POST"])
+def api_chat_command_decide(session_id, proposal_id, action):
+    """The Confirm / Deny buttons on a proposed command (owner-approved write commands, decisions 2026-10-25). The decision is persisted on the transcript
+    entry FIRST; only then, for Confirm, is core's restricted runner called with that decision's timestamp, and its scrubbed result is stored next to the
+    proposal. A proposal that is already decided answers 409, so a double click can never run a command twice. Returns {session, proposal}."""
+    from app import CHAT_STORAGE_DIR
+    from chat_sessions import get_session, _write_session
+    import command_runs
+    import internal_api_client
+    session = get_session(CHAT_STORAGE_DIR, session_id)
+    if not session or session.get("status") != "active":
+        abort(404)
+    try:
+        proposal = command_runs.decide(session, proposal_id, action)
+    except LookupError:
+        abort(404, description="no such command proposal")
+    except ValueError as e:
+        abort(409 if "already" in str(e) else 400, description=str(e))
+    _write_session(CHAT_STORAGE_DIR, session)  # the decision is on disk before anything runs
+    if action == "confirm":
+        try:
+            reply = internal_api_client.run_command(proposal["argv"], proposal["repo"], proposal_id, proposal["decidedAt"], session_id)
+        except internal_api_client.InternalApiError as e:
+            reply = {"ok": False, "refused": str(e)}
+        command_runs.record_execution(session, proposal_id, reply)
+        _write_session(CHAT_STORAGE_DIR, session)
+    return jsonify({"session": session, "proposal": proposal})
+
+
 @chat_bp.route("/api/chat/<session_id>/template/save", methods=["POST"])
 def api_chat_template_save(session_id):
     """The Save button on a template proposal card. Body: {entry, index, key?, text?} --
