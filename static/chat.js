@@ -23,7 +23,7 @@
 // markdown they're asking to be formatted, and rendering it would just be a bigger HTML
 // surface for no benefit.
 import * as smd from "./vendor/smd.js";
-import { truncateTitle, orderSessions, nextSelectionAfterClose, formatRow,
+import { fullTitle, orderSessions, nextSelectionAfterClose, formatRow,
   formatTerminalRow, orderTerminalSessions, applyTerminalEvent, hostsOf, filterByHost, skippedLabel, filterRows, filterChats, emptyLabel, jumpTarget } from "./sessions-view.js";
 // HUB0008 10/11: the model-swap UI's WHAT-to-show logic lives in swap-view.js
 // (piece 9) -- this file only does the DOM + fetches, mirroring the sessions-view
@@ -860,7 +860,7 @@ class SessionSwitcher {
 
   renderButton() {
     const row = this.rows.find((r) => r.id === this.getSelectedId());
-    this.btn.textContent = (row ? truncateTitle(row.title) : 'Chats') + ' ▾';
+    this.btn.textContent = (row ? fullTitle(row.title) : 'Chats') + ' ▾';
     const roots = this.getRoots();
     this.btn.title = roots.length
       ? 'Switch chat. Accessible repos (roots[0] is primary):\n' + roots.join('\n')
