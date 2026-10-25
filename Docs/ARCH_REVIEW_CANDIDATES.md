@@ -1758,3 +1758,16 @@ Give `reserve` a default of `model=None` and, when `None`, resolve it internally
 
 Benefits:
 The client is self-contained with respect to the local model's identity, matching its existing pattern for the dashboard URL. New callers no longer need to know the env-var name, and a single change to the variable name (or a move to a config file) is localized to `internal_api_client.py` rather than every call site.
+
+### AC-131 · `providerLabel` name collision between sessions-view and swap-view
+Strength: Worth exploring
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both modules export a function named `providerLabel` that is consumed by the same caller (`chat.js`), but they have different signatures and produce different output shapes. `sessions-view.js` takes a row and returns a two-segment string like `"Claude · model"` or `"Local"`, with no account token and no `"Unknown"` fallback. `swap-view.js` takes a session and returns up to three segments (`"Claude · model · live account"`, `"Local · model"`, or `"Unknown"`). Because the names are identical, the import site in `chat.js` must alias one of them, and any developer adding a new call must remember which alias maps to which formatting contract. A silent mix-up would produce a subtly wrong label in the UI—e.g., the swap view showing a two-segment string where the user expects the account, or the session list showing `"Unknown"` where it should show `"Local"`—and the error would be easy to miss in a quick visual pass.
+
+Solution:
+Rename the export in `static/swap-view.js` from `providerLabel` to `swapProviderLabel` (or `sessionProviderLabel`), updating the single import line in `chat.js` and any internal references within `swap-view.js` itself. The rename is a one-line change at the import site and a one-line change at the export site; no logic changes. Alternatively, rename the `sessions-view.js` export to `rowProviderLabel` to emphasise its row-level scope. Either direction removes the collision without altering behaviour.
+
+Benefits:
+Callers in `chat.js` can import both functions by their natural names without an alias, eliminating a class of copy-paste or mis-remembering bugs. New contributors reading the import block see two distinct, self-describing names rather than a name plus an `as` clause. The rename is zero-risk (no logic change, no API surface change beyond the identifier) and costs a single search-and-replace across two files.
