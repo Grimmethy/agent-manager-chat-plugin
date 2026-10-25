@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyPreset, closePane, serialize, deserialize, firstOpenPane, layoutForWidth,
-  stripVisibleCount, clampStripIndex, stepStrip, stripLabel, stripButtons, indexFromScroll, shouldHandleArrowKey, placeChatInStrip,
+  stripVisibleCount, clampStripIndex, stepStrip, stripLabel, stripButtons, indexFromScroll, shouldHandleArrowKey, placeChatInStrip, chatTabs,
   DEFAULT_TEMPLATES, saveTemplate, applyTemplate, serializeTemplates, deserializeTemplates,
 } from '../static/multi-chat.js';
 
@@ -305,4 +305,26 @@ test('placeChatInStrip: an open chat only becomes active; a new one takes the fi
   assert.deepEqual(placeChatInStrip({ preset: '1', panes: [] }, 'c', null), { state: { preset: '1', panes: ['c'] }, activeId: 'c' }, 'no panes at all');
   assert.equal(JSON.stringify(full), frozen, 'the input is never mutated');
   assert.deepEqual(placeChatInStrip(full, '', 'a'), { state: { preset: '2col', panes: ['a', 'b'] }, activeId: 'a' }, 'an empty id changes nothing');
+});
+
+test('chatTabs: one entry per open pane in pane order, null slots skipped, only the active pane marked', () => {
+  const state = { preset: '2x2', panes: ['a', null, 'b', 'c'] };
+  const tabs = chatTabs(state, { a: 'Alpha', b: ' Beta ', c: 'Gamma' }, 'b');
+  assert.deepEqual(tabs, [
+    { id: 'a', title: 'Alpha', active: false },
+    { id: 'b', title: 'Beta', active: true },
+    { id: 'c', title: 'Gamma', active: false },
+  ]);
+});
+
+test('chatTabs: an unknown, empty or non-string title reads "Chat"; a missing titles map or state is safe; the input is not mutated', () => {
+  const state = { preset: '2col', panes: ['a', 'b', 'c'] };
+  const copy = JSON.parse(JSON.stringify(state));
+  const tabs = chatTabs(state, { a: '', b: 7 }, null);
+  assert.deepEqual(tabs.map((t) => t.title), ['Chat', 'Chat', 'Chat']);
+  assert.ok(tabs.every((t) => t.active === false));
+  assert.deepEqual(state, copy);
+  assert.deepEqual(chatTabs(state, null, 'a').map((t) => t.title), ['Chat', 'Chat', 'Chat']);
+  assert.deepEqual(chatTabs(null, {}, 'a'), []);
+  assert.equal(chatTabs(state, { toString: 'x' }, 'a')[0].title, 'Chat', 'inherited keys are not titles');
 });

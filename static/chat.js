@@ -680,8 +680,9 @@ class ChatPane {
 // lives in sessions-view.js; this class only does DOM + fetches. The list re-fetches every
 // 5s while the dropdown is open and after any action.
 class SessionSwitcher {
-  constructor(slot, { getSelectedId, onSelect, onNew, onClose, getRoots }) {
+  constructor(slot, { getSelectedId, onSelect, onNew, onClose, getRoots, buttonLabel }) {
     this.slot = slot;
+    this.buttonLabel = buttonLabel || null; // a fixed button text (the multi-chat bar's 'All chats'); null shows the selected chat's title
     this.getSelectedId = getSelectedId;
     this.onSelect = onSelect;
     this.onNew = onNew;
@@ -863,7 +864,7 @@ class SessionSwitcher {
 
   renderButton() {
     const row = this.rows.find((r) => r.id === this.getSelectedId());
-    this.btn.textContent = (row ? fullTitle(row.title) : 'Chats') + ' ▾';
+    this.btn.textContent = (this.buttonLabel || (row ? fullTitle(row.title) : 'Chats')) + ' ▾';
     const roots = this.getRoots();
     this.btn.title = roots.length
       ? 'Switch chat. Accessible repos (roots[0] is primary):\n' + roots.join('\n')

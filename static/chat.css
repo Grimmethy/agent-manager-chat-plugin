@@ -202,6 +202,9 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
   .multi-chat-close,
   .multi-chat-layout-btn,
   .multi-chat-preset-btn,
+  .multi-chat-tab,
+  .multi-chat-new-btn,
+  .multi-chat-switcher .chat-switcher-btn,
   .multi-chat-strip-btn,
   .chat-chime-setting { min-height: 44px; min-width: 44px; }
   .chat-chime-setting input { width: 20px; height: 20px; }
@@ -261,3 +264,17 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
 .multi-chat-layout-menu .multi-chat-template-select, .multi-chat-layout-menu .multi-chat-template-save-btn { height: 30px; padding-top: 0; padding-bottom: 0; font-size: 12px; }
 .multi-chat-preset-btn[aria-pressed="true"] { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
 .multi-chat-layout-btn { height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap; }
+
+/* The top bar (owner 2026-10-24): the open chats as a row of buttons, "+" for a new chat, "All chats" for the rest, then the strip nav and Layout.
+   Every control in the bar is the same 30px-high button; the active chat and a pressed preset share one accent look. */
+.multi-chat-toolbar { gap: 6px; padding: 6px 8px; }
+.multi-chat-toolbar button, .multi-chat-toolbar select { height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap; border-radius: 6px; }
+.multi-chat-tabs { display: flex; flex: 0 1 auto; min-width: 0; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.multi-chat-tabs::-webkit-scrollbar { display: none; }
+.multi-chat-tab { flex: 0 0 auto; max-width: 16em; overflow: hidden; text-overflow: ellipsis; }
+.multi-chat-tab[aria-selected="true"] { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
+.multi-chat-new-btn { flex: 0 0 auto; min-width: 30px; margin-right: auto; }
+.multi-chat-switcher { position: relative; flex: 0 0 auto; }
+.multi-chat-switcher .chat-switcher-btn { width: auto; font-weight: 400; }
+.multi-chat-switcher .chat-switcher-menu { left: auto; right: 0; width: 360px; max-width: calc(100vw - 16px); }
+@media (max-width: 759px) { .multi-chat-tabs { flex: 1 0 100%; order: -1; } }

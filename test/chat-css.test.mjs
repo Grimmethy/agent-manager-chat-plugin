@@ -193,3 +193,31 @@ test('the Layout control: one button at the end of the bar with a popover for th
     assert.match(mediaBlocksFor('(pointer: coarse)', selector).join(' '), /min-height:\s*44px/, selector + ' needs a 44px touch target');
   }
 });
+
+test('the top bar: open chats are a scrollable row of buttons with a highlighted active one, and every bar control shares one size', () => {
+  const tabs = blocksFor('.multi-chat-tabs').join(' ');
+  assert.match(tabs, /display:\s*flex/);
+  assert.match(tabs, /overflow-x:\s*auto/);
+  assert.match(tabs, /scrollbar-width:\s*none/);
+  assert.ok(blocksFor('.multi-chat-tabs::-webkit-scrollbar').join(' ').match(/display:\s*none/));
+  assert.match(blocksFor('.multi-chat-tab').join(' '), /text-overflow:\s*ellipsis/);
+  assert.match(blocksFor('.multi-chat-tab[aria-selected="true"]').join(' '), /background:\s*var\(--accent\)/);
+  const control = blocksFor('.multi-chat-toolbar button').join(' ');
+  assert.match(control, /height:\s*30px/);
+  assert.match(control, /border-radius:\s*6px/);
+  assert.ok(blocksFor('.multi-chat-toolbar select').length > 0, 'the templates select shares the bar control size');
+  for (const selector of ['.multi-chat-tab', '.multi-chat-new-btn', '.multi-chat-switcher .chat-switcher-btn']) {
+    assert.match(mediaBlocksFor('(pointer: coarse)', selector).join(' '), /min-height:\s*44px/, selector + ' needs a 44px touch target');
+  }
+});
+
+test('the All chats list anchors under its own button (position: relative), right-aligned, instead of opening below the window', () => {
+  assert.match(blocksFor('.multi-chat-switcher').join(' '), /position:\s*relative/);
+  const menu = blocksFor('.multi-chat-switcher .chat-switcher-menu').join(' ');
+  assert.match(menu, /right:\s*0/);
+  assert.match(menu, /left:\s*auto/);
+});
+
+test('on a phone the open-chat buttons take a row of their own above the other controls', () => {
+  assert.match(css, /@media \(max-width: 759px\)\s*\{\s*\.multi-chat-tabs\s*\{[^}]*flex:\s*1 0 100%[^}]*order:\s*-1/);
+});
