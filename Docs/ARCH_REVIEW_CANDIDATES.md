@@ -1609,3 +1609,31 @@ Extract the common provider/model formatting logic into a shared utility module 
 
 Benefits:
 A single formatting function guarantees consistent provider/model display across all views, removes the manual synchronization burden between two modules, and frees `chat.js` from having to select between two subtly different implementations. Future changes to the display format (e.g., adding a new provider or changing the separator) require editing exactly one file rather than hunting for every copy of the logic.
+
+### AC-120 · Routing layer hard-coupled to a specific provider module
+Strength: Strong
+Files: test_chat_routes_swap.py, ollama_client.py, internal_api_client.py
+
+Problem:
+`test_chat_routes_swap.py` imports `ollama_client` directly and passes `ollama_client.MODEL` into `internal_api_client.reserve()`. This forces the generic chat-swap routing and its tests to know about a specific provider implementation (Ollama) and its environment variable `LOCAL_MODEL`. The routing layer is no longer provider-agnostic: any future swap of the local-model backend requires editing route handlers and their tests to point at a different client module and attribute.
+
+Solution:
+Move the model-name resolution into `internal_api_client.reserve()` itself. The function can read `os.environ.get("LOCAL_MODEL")` internally (or accept `model=None` and resolve it there), so callers no longer need to import a provider module just to supply a model string. Remove the `import ollama_client` and the explicit `ollama_client.MODEL` argument from the route handlers and from `test_chat_routes_swap.py`.
+
+Benefits:
+The routing and test layers become provider-agnostic. Adding or swapping the local-model provider later requires no changes to route files or their tests. The environment-variable read is co-located with the HTTP call that actually consumes the model name, making the data flow easier to follow.
+
+### AC-121 · Context-window size contradicts between handoff logic and the Ollama call
+Strength: Strong
+Files: handoff.py, ollama_client.py
+
+Problem:
+`handoff.py` defines `window_tokens()` with a default of **16 384** tokens for the "local" provider (read from `AGENT_MANAGER_CHAT_LOCAL_WINDOW_TOKENS`), and `estimate_tokens()` uses that value to decide whether a summary is needed and to size the handoff text. Meanwhile, `ollama_client.py` hardcodes `"num_ctx": 8192` in its generate options. These are not merely independent assumptions that *might* drift apart — they **actively disagree right now**: the handoff logic sizes text for a 16 384-token window while the actual Ollama call is constrained to 8 192 tokens. Any handoff text that fits within the 16 384 budget but exceeds 8 192 tokens will be silently truncated or rejected by the model, producing a correctness bug in production. There is no shared source of truth tying the two values together.
+
+Solution:
+Extract the context-window constant and the token-estimation helpers into a small shared module (e.g. `model_context.py`) that both `handoff.py` and `ollama_client.py` import. `ollama_client.generate()` should read the window size from this shared helper instead of hardcoding `8192`. `handoff.py`'s `estimate_tokens()` and `window_tokens()` should likewise delegate to the shared helper so the value lives in one place. This resolves the active 16 384-vs-8 192 contradiction and prevents future drift.
+
+Benefits:
+Fixes an active correctness bug: the handoff logic and the provider call now agree on the context window, so handoff text is no longer sized for a window the model will not honour. A single source of truth means changing the local model's window size or the estimation heuristic requires editing one file rather than hunting for hardcoded values across modules, eliminating the entire class of silent-mismatch bugs where the two modules disagree about available tokens.
+
+NOTE: Flag 3 (AC-001) was not applied because the critique's own re-evaluation confirmed that `test_chat_routes_swap.py` does import `ollama_client` and that the draft's description and solution are accurate; no correction was warranted.
