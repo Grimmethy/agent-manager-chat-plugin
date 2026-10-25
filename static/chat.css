@@ -288,3 +288,12 @@ button.secondary { background: var(--panel); color: var(--text); border: 2px sol
   .chat-header .chat-provider-label { display: none; }
   .chat-header button, .multi-chat-close { padding: 0 8px; }
 }
+
+/* The tools an assistant turn ran: one collapsed line under the reply, a row per tool when opened. */
+.chat-tools { margin-top: 6px; font-size: 12px; color: var(--muted); }
+.chat-tools summary { cursor: pointer; }
+.chat-tool-row { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; padding: 3px 0; border-top: 1px solid var(--border); }
+.chat-tool-name { color: var(--accent); white-space: nowrap; }
+.chat-tool-args { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.chat-tool-outcome { grid-column: 2; }
+.chat-tool-bad .chat-tool-outcome { color: var(--bad); }

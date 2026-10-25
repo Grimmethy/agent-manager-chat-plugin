@@ -45,6 +45,7 @@ import local_tool_client
 import model_stats_client
 import ollama_client
 import template_store
+import tool_log
 
 PROVIDER_LOCAL = "local"
 PROVIDER_CLAUDE = "claude"
@@ -455,6 +456,7 @@ def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
                 "You are rooted at the agent-manager repo and also have full read/write "
                 "access to these additional repos:\n" + _roots_blurb(session)
             )
+        preamble_parts.append(_FRESHNESS_RULES)
         agents_md = _read_agents_md(session)
         if agents_md:
             preamble_parts.append(_agents_md_blurb(agents_md))
@@ -518,6 +520,19 @@ def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
                                     stage="chat", result=result, source="chat")
     return result["response"].strip()
 
+
+# 2026-10-25 (sale-lookup test): the chat could not run the named ingest command, read the database file instead, called months-old rows
+# "the most recent" (it ordered by row id) and ended "nothing to do" without saying the newest record was older than the asked window.
+# One constant so the local prompt and the Claude first-turn preamble cannot drift apart.
+_FRESHNESS_RULES = (
+    "Freshness and honesty rules for questions about recent data:\n"
+    "- When asked for recent, latest, new or last-N-days records, order by the record's own date (never by row id), quote the "
+    "newest date you found next to today's date, and if the newest record is older than the window asked about, say so "
+    "('the data has nothing newer than <date>; it may need refreshing with <command>') -- never report old records as recent.\n"
+    "- If a command the user named could not run (read-only mount, missing path or repo, missing credentials), say exactly which "
+    "command could not run and why BEFORE using any substitute source, and label what the substitute shows as possibly stale.\n"
+    "- Never answer 'nothing to do' without listing what you checked and the date of the newest thing you saw."
+)
 
 _LOCAL_SYSTEM_PROMPT = (
     "You are a coding assistant embedded in the agent-manager system's own dashboard, "
@@ -626,7 +641,8 @@ _LOCAL_SYSTEM_PROMPT = (
     "END-TEMPLATE\n"
     "The chat shows it as a card with a Save button -- you cannot and must not write the "
     "file yourself. Never claim a template is saved; the user saves it. Do not wrap the "
-    "block in a code fence."
+    "block in a code fence.\n\n"
+    + _FRESHNESS_RULES
 )
 
 
@@ -874,6 +890,7 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
         yield footer
     if result_box is not None:
         result_box["final_text"] = final_text
+        result_box["tools"] = tool_log.summarize_tool_calls((result or {}).get("toolCallLog"))
 
 
 def stream_message(storage_dir: Path, session_id: str, message: str):
@@ -946,6 +963,8 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     # SAVE-TEMPLATE blocks become Save-button proposals (template_store.py); never auto-saved.
     reply, proposals = template_store.extract_proposals(reply)
     session["transcript"][-1]["text"] = reply.strip()
+    if result_box.get("tools"):
+        session["transcript"][-1]["tools"] = result_box["tools"]
     if proposals:
         session["transcript"][-1]["templates"] = proposals
     _write_session(storage_dir, session)
