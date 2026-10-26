@@ -75,7 +75,10 @@ def preempt() -> list:
         raise InternalApiError(f"POST /api/internal/chat/preempt failed: {e}") from e
 
 
-def reserve(reservation_id: str, model: str = None, on: bool = True) -> dict:
+RESERVE_TIMEOUT_S = 300  # the default: a CLAIM genuinely blocks on the core side behind a busy worker lane
+
+
+def reserve(reservation_id: str, model: str = None, on: bool = True, timeout: float = RESERVE_TIMEOUT_S) -> dict:
     if model is None:
         model = os.environ.get("LOCAL_MODEL")
     if model is None and on:
@@ -91,11 +94,12 @@ def reserve(reservation_id: str, model: str = None, on: bool = True) -> dict:
         body["model"] = model
     try:
         # Genuinely blocking on the server side (single_flight_lock.acquire() can wait
-        # for a worker lane's current call) -- no short client timeout here, mirroring
-        # the same reasoning the in-tree feature's own comment gives for why acquire()
-        # must never run under a shorter-lived lock.
+        # for a worker lane's current call) -- so the DEFAULT stays long: the user's reserve toggle
+        # must not give up and return 502 while the core request keeps waiting and then records a
+        # reservation the UI says does not exist. Only a best-effort caller (the per-message refresh
+        # of an already-reserved session) passes a short `timeout`.
         r = requests.post(f"{CORE_DASHBOARD_URL}/api/internal/chat/reserve", headers=_headers(),
-                           json=body, timeout=300)
+                           json=body, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:
