@@ -1897,3 +1897,29 @@ Remove the `os.environ.get("LOCAL_MODEL")` fallback from `internal_api_client.re
 
 Benefits:
 A single source of truth for model-name resolution eliminates the risk of divergent fallbacks across files. `internal_api_client` becomes a thin, provider-agnostic transport layer that is trivially testable with any model string. Future changes to how the model is configured (env var, config file, per-request header) require edits in exactly one place rather than hunting for every copy of the fallback.
+
+### AC-142 · Duplicated row-filtering logic between handoff.py and chat_sessions.py
+Strength: Strong
+Files: handoff.py, chat_sessions.py
+
+Problem:
+`handoff.py` documents that its `_is_plain_row` helper mirrors the skip logic in `chat_sessions._build_local_messages` (both exclude rows with a truthy `error` field and rows flagged `marker: True`). However, `handoff.py` re-implements those boolean checks locally rather than importing or calling the shared logic from `chat_sessions`. This creates a tight, undocumented coupling: the two modules must be manually kept in sync. If a developer adds a new non-conversational row type (e.g., a system-prompt row or a tool-call marker) and updates `_build_local_messages` but forgets `_is_plain_row`, the handoff summary will silently include or exclude data that the chat view handles differently, producing inconsistent context without any test or type-system signal to catch the drift.
+
+Solution:
+Extract the row-filtering predicate into a single shared function (e.g., `is_plain_row(row) -> bool`) in a small utility module or directly in `chat_sessions.py`, and have `handoff.py` import and call it. If the two modules must remain independently importable (e.g., `handoff.py` is used in a context where `chat_sessions` is not loaded), place the predicate in a lightweight shared module that both import. Add a unit test that asserts both call sites produce identical results for a representative set of row shapes, so any future divergence is caught at test time.
+
+Benefits:
+A single source of truth for "which rows are conversational" eliminates the class of silent drift bugs where one module's filter is updated and the other's is not. Onboarding developers no longer need to discover the mirror relationship by reading comments; the import makes the dependency explicit. The shared predicate is independently testable, and any new row type only needs to be handled in one place.
+
+### AC-143 · model_stats_client.py imports CORE_REPO_ROOT from app.py
+Strength: Strong
+Files: model_stats_client.py, app.py
+
+Problem:
+`model_stats_client.py` resolves the path to `model-stats-db.js` by importing `CORE_REPO_ROOT` directly from `app.py` (`from app import CORE_REPO_ROOT`). This forces the stats client to load the entire Flask application module—pulling in Flask, route registrations, and any side-effects at module import time—just to obtain a filesystem path constant. In contexts where `app.py` cannot or should not be imported (a standalone CLI script, a test harness, a different service that reuses the stats client), the import will either fail outright or drag in unnecessary dependencies and initialization code.
+
+Solution:
+Move the `CORE_REPO_ROOT` constant (and any related path-resolution helpers) into a small, dependency-free configuration module (e.g., `paths.py` or `config.py`) that contains no Flask imports. Both `app.py` and `model_stats_client.py` then import from that shared module. This decouples the stats client from the application layer and makes it usable in any context where only the path is needed.
+
+Benefits:
+`model_stats_client.py` becomes independently importable and testable without bootstrapping the Flask app. The dependency graph becomes shallower: the stats client depends on a leaf config module rather than on the top-level application module. Future refactors of `app.py` (renaming, splitting routes, changing the WSGI entry point) no longer risk breaking an unrelated subsystem that only needed a path constant.
