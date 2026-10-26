@@ -2037,3 +2037,42 @@ Update `handoff._is_plain_row` to be a thin wrapper that calls `row_utils.is_pla
 
 Benefits:
 A new skip key or role is added in exactly one location (`row_utils.is_plain_row`). The docstring cross-reference is no longer the sole synchronization mechanism; the shared function is. The unit test gives a regression net that the current two-copy arrangement lacks, and it is trivial to extend when the predicate grows. Placing the helper in a new `row_utils` module preserves `handoff`'s "pure, no I/O" contract by avoiding an import of the storage layer.
+
+### AC-151 · `local_tool_client.py` is a zero-value pass-through shim over `internal_api_client.py`
+Strength: Strong
+Files: local_tool_client.py, internal_api_client.py, app.py, chat_sessions.py
+
+Problem:
+Every line of `stream_plan_with_tools` in `local_tool_client.py` is a verbatim keyword-forward to `internal_api_client.stream_local_turn`—same parameter names, same defaults, same order, no transformation, no added behavior. The module's own header states it exists only to "keep the SAME public name/signature chat_sessions.py already calls." This is a textbook indirection layer with no value: it forces a reader to open a second file to discover the call is just an HTTP POST, and it creates a second place to update whenever the signature changes (the two files must be kept in sync by hand). The `LocalToolClientError` alias is the one thing that adds value (it lets `app.py`'s `_call_chat` catch a stable name), but a single alias does not justify a whole module of duplicated signature.
+
+Solution:
+Delete `local_tool_client.py` and have callers import `stream_local_turn` (aliased to `stream_plan_with_tools`) and `InternalApiError` (aliased to `LocalToolClientError`) directly from `internal_api_client`. Keep the two public names as one-line aliases in `internal_api_client` so `app.py`'s `_call_chat` and `chat_sessions.py` keep working unchanged. Update any `from local_tool_client import …` statements to point at `internal_api_client`.
+
+Benefits:
+Removes a zero-value indirection layer and a duplicated signature that must be kept in sync by hand. A future signature change is made in exactly one place. The only thing the shim contributed (a stable error name) is preserved as a one-line alias, so no caller breaks.
+
+### AC-152 · `app.py` carries core-repo filesystem helpers that the Phase-3 migration was supposed to remove
+Strength: Strong
+Files: app.py, internal_api_client.py
+
+Problem:
+The module docstring and the `_chat_roots` docstring both assert that as of 2026-09-15 "this repo no longer reads/writes `instances//queue/`" and that roots resolution "now go through internal_api_client.py." Yet the file still defines and exports `get_active_repo_root`, `get_pipeline_dir`, `queue_dir`, `instances_dir`, `get_second_brain_dir`, `read_env_file`, `read_dashboard_settings`, `claude_defaults`, and `_active_project_setting`—all of which read the core repo's `agent-manager.env` and `dashboard-settings.json` directly. `queue_dir()` and `instances_dir()` are the exact accessors the docstring claims are gone, and `get_second_brain_dir` reads a core-repo setting the internal API is supposed to own. The stated architecture (HTTP-only, no direct filesystem coupling) and the actual code disagree: the file carries a parallel, now-likely-dead path to the core repo's state, which will mislead a maintainer into believing the filesystem coupling is already eliminated.
+
+Solution:
+Audit every call site of the nine helpers listed above within this repo. If none remain (as the docstring implies), delete them. If any are still live, move the underlying reads behind `internal_api_client` so core-repo state is fetched in exactly one place over HTTP, and update the docstring to reflect the true dependency graph. Either way, the public surface of `app.py` should no longer expose `queue_dir`, `instances_dir`, or direct `agent-manager.env` / `dashboard-settings.json` readers.
+
+Benefits:
+The file's advertised architecture and its actual behavior align, eliminating a trap for a maintainer who trusts the docstring. Core-repo settings have a single source of truth (the internal API) rather than a duplicated, possibly stale, local read path. Dead code is removed, reducing the surface area that must be reviewed on every change.
+
+### AC-153 · `internal_api_client.py` repeats the same try/except error contract in four non-streaming functions
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+`get_roots`, `run_command`, `preempt`, and `reserve` each independently perform `requests.<verb>(…)` → `raise_for_status()` → `r.json()` wrapped in `except requests.RequestException as e: raise InternalApiError(f"… failed: {e}") from e`. The only differences are the HTTP verb, the URL, the timeout, and the payload. This is the same connection-level error contract repeated four times (identical message format, exception type, and `from e` chaining), so a change to the contract—adding a status code, a retry, structured logging—must be made in four places. `stream_local_turn` handles the same failure a fifth way (yielding an error event rather than raising), which is legitimate for streaming but means the four non-streaming functions are the ones that can and should share a helper.
+
+Solution:
+Introduce a single `_request(verb, url, *, timeout, json_body=None, params=None)` helper in `internal_api_client.py` that performs the verb+URL+headers+timeout+`raise_for_status`+`r.json()` sequence and wraps `requests.RequestException` into `InternalApiError` with the shared message format. Rewrite `get_roots`, `run_command`, `preempt`, and `reserve` to call it, leaving only their unique payload, timeout, and response-shaping in the public functions. Keep `stream_local_turn` explicit, since it must yield an error event rather than raise and its streaming iteration is inherently different.
+
+Benefits:
+The connection-level error contract lives in one auditable place. New endpoints inherit correct error behavior for free. A future change (retry, structured logging, status-code surfacing) is a one-line edit in `_request` rather than a four-place search-and-replace. The four public functions become shorter and their unique logic is more visible.
