@@ -2076,3 +2076,29 @@ Introduce a single `_request(verb, url, *, timeout, json_body=None, params=None)
 
 Benefits:
 The connection-level error contract lives in one auditable place. New endpoints inherit correct error behavior for free. A future change (retry, structured logging, status-code surfacing) is a one-line edit in `_request` rather than a four-place search-and-replace. The four public functions become shorter and their unique logic is more visible.
+
+### AC-154 · Dead Code: Unused `_headers()` in agent_client
+Strength: Moderate
+Files: agent_client.py
+
+Problem:
+`agent_client.py` defines a `_headers()` helper that reads the `AGENT_MANAGER_SESSION_AGENT_TOKEN` environment variable directly to build the Authorization header. However, the active code paths in this module (such as `list_all` and `open_events`) do not call `_headers()`. Instead, they explicitly call `agent_hosts.read_token(host)` to determine the Authorization header, which correctly respects the token-file-overrides-static-variable precedence rule defined in `agent_hosts.py`. Consequently, `_headers()` is currently unused dead code. Its presence creates a maintenance hazard: a future developer might mistakenly assume it is the standard way to build headers and use it in new code paths, thereby bypassing the canonical token resolution mechanism and reintroducing the bug where token files are ignored.
+
+Solution:
+Remove the `_headers()` function from `agent_client.py` entirely. Since it is not called by any existing functions, this deletion has no behavioral impact on current functionality. This ensures that `agent_hosts.read_token()` remains the sole, undisputed method for resolving credentials, preventing accidental misuse of the non-canonical helper.
+
+Benefits:
+Eliminates dead code that contradicts the established architectural pattern for token resolution. Reduces the risk of future developers inadvertently using a helper that bypasses the correct precedence rules, thereby preserving the single source of truth for credential handling in `agent_hosts.py`.
+
+### AC-155 · Duplicated Host-Lookup Logic Between agent_client and agent_hosts
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_client.py` defines `_resolve_host()` to find a host by name or default to the single configured host, raising an `AgentError` if the name is missing and multiple hosts are configured. `agent_hosts.py` provides `get_host(name)` which performs a similar name-based lookup but returns `None` if the host is not found, without raising an `AgentError` or handling the "default to single host" logic. This duplication means the lookup semantics are split: `agent_client` handles the "default to single" case and specific error raising, while `agent_hosts` handles the basic name lookup. This split makes it difficult to maintain consistent behavior; for example, if the "default to single host" logic needs to be updated or if the error type needs to change, it must be done in `agent_client`, but the underlying lookup logic resides in `agent_hosts`.
+
+Solution:
+Refactor `agent_hosts.py` to include the "default to single host" logic. Modify `get_host(name)` (or introduce a new method like `resolve_host(name)`) so that if `name` is `None` and exactly one host is configured, it returns that host. If `name` is `None` and multiple hosts are configured, it should raise a generic `ValueError` or return `None` (depending on the preferred API contract for the hosts module). In `agent_client.py`, remove `_resolve_host()` and replace its usages with calls to the new/updated `agent_hosts` method. If `agent_hosts` returns `None` for the ambiguous multi-host case, `agent_client` should catch this and raise the specific `AgentError` to maintain its existing error contract for callers. This centralizes the lookup and defaulting logic in `agent_hosts`, while `agent_client` remains responsible only for translating the result into its specific error type if necessary.
+
+Benefits:
+Centralizes host resolution logic in `agent_hosts.py`, making it the single source of truth for how hosts are identified and defaulted. Reduces code duplication and ensures that any changes to host lookup semantics (e.g., alias support, case-insensitivity) are implemented in one place. Clarifies the responsibility split: `agent_hosts` manages the configuration and lookup, while `agent_client` manages HTTP communication and client-specific error reporting.
