@@ -1942,3 +1942,29 @@ Removes a dead code path that contradicts the module's own convention (resolve c
 *AC-002 removed.* The critique correctly identifies that `list_sessions()` already returns partial data when only some hosts fail: the guard `len(result["skipped"]) == len(hosts)` is `False` in a 1-of-3-failure scenario, so the function returns the sessions from the two healthy hosts. The docstring ("Raises AgentError when … every configured host failed") accurately describes this behaviour. The problem statement in the original draft was a misreading of the condition, and the proposed "fix" would have added a redundant API surface for behaviour that already exists.
 
 NOTE: Flag 2 was applied (AC-002 removed) because the critique is correct — the draft's claim that `list_sessions()` raises on partial failure is factually wrong given the actual `==` comparison, so there is no defect to report.
+
+### AC-145 · Unify per-host token retrieval into a single helper
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+Token retrieval and host-resolution logic is scattered across the public methods in `agent_client.py` in inconsistent ways. `open_events()` already delegates to the existing `_resolve_host()` helper, but `list_all()` and `filter_events()` each contain their own inline loops over `agent_hosts.hosts()` with separate calls to `agent_hosts.read_token()`. `filter_events()` additionally embeds a single-host check solely to decide whether to apply a default host tag (gracefully skipping the tag in the multi-host case), while `list_all()` iterates all hosts unconditionally. The result is that the "how do I get the token for a given host" contract is expressed in two or three slightly different shapes, so any change to token resolution (new environment variables, fallback chains, caching) or to the error-raising behaviour for unknown host names must be replicated across multiple call sites, increasing the risk of subtle inconsistencies.
+
+Solution:
+Introduce a private helper in `agent_client.py`, e.g. `_get_host_and_token(name=None)`, that encapsulates the single-host resolution path: if `name` is `None` it validates that exactly one host exists (raising `AgentError` on ambiguity or absence), otherwise it looks up the named host and raises `AgentError` if not found. The helper returns a `(Host, token_or_None)` tuple. A separate sibling, `_iter_hosts_with_tokens()`, yields a list of such tuples for the multi-host iteration case used by `list_all()`. Refactor `open_events()` to delegate to `_get_host_and_token()` (replacing the current `_resolve_host()` call and its inline token fetch), and refactor `list_all()` and `filter_events()` to use `_iter_hosts_with_tokens()` for their iteration loops, removing the per-method inline host-iteration and token-retrieval code. The single-host tag decision in `filter_events()` can then be expressed as a simple `len(hosts) == 1` check on the returned list.
+
+Benefits:
+The host-resolution and token-retrieval contract lives in exactly one place per access pattern (single-host vs. multi-host), so future changes (additional env-var fallbacks, logging, caching) require editing one or two functions rather than three methods. Error messages and `AgentError` semantics are guaranteed consistent across all endpoints. Unit tests can exercise each helper in isolation with mock `agent_hosts` objects, covering the single-host, multi-host, unknown-name, and ambiguous cases without exercising the full streaming or listing logic.
+
+### AC-146 · Extract SSE block parsing and filtering into a dedicated generator
+Strength: Worth exploring
+Files: agent_client.py
+
+Problem:
+`filter_events()` in `agent_client.py` interleaves several distinct responsibilities: reassembling Server-Sent Events blocks from raw byte chunks, parsing the `event:` and `data:` fields, filtering against an allowed-event set, re-serialising JSON payloads to inject a host tag, and re-emitting the modified SSE stream. The `_tag_host_block()` helper is tightly coupled to this inline parsing. The resulting function is long, mixes low-level protocol parsing with high-level business filtering, and is difficult to unit-test in isolation because the SSE reassembly logic is entangled with the streaming I/O loop.
+
+Solution:
+Extract the chunk-to-block reassembly and field parsing into a standalone generator, e.g. `_parse_sse_blocks(chunks)`, that yields `(event_name, data_payload)` tuples. `filter_events()` then iterates over these tuples, applies the allowed-event filter, calls `_tag_host_block()` (or its successor) when a host tag is required, and re-serialises the SSE frame. The generator can be a pure function of its input iterable, making it trivially testable with canned chunk lists.
+
+Benefits:
+`filter_events()` shrinks to a short filter-and-re-emit loop, making its intent immediately readable. `_parse_sse_blocks` can be tested independently with edge-case chunk boundaries (split mid-line, multi-line `data:`, missing `event:` field) without standing up a streaming response. Adding new filtering rules or modifying the tagging logic no longer requires navigating the parsing code, reducing the chance of regressions in either concern.
