@@ -423,7 +423,9 @@ def api_chat_message(session_id):
     if existing.get("reserved"):
         try:
             from internal_api_client import reserve as internal_reserve
-            internal_reserve(session_id, on=True)
+            # 20 s like preempt(): an already-reserved session normally returns at once on the core side (it only re-touches lastActivity); it blocks
+            # only if core lost its in-memory record. The user-facing toggle in api_chat_reserve keeps the long default.
+            internal_reserve(session_id, on=True, timeout=20)
         except InternalApiError as e:  # noqa: BLE001 -- best-effort refresh, never block the turn
             print(f"[chat-reserve] refresh failed (non-fatal): {e}", file=sys.stderr, flush=True)
 
