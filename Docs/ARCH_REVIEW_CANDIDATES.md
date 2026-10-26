@@ -1923,3 +1923,22 @@ Move the `CORE_REPO_ROOT` constant (and any related path-resolution helpers) int
 
 Benefits:
 `model_stats_client.py` becomes independently importable and testable without bootstrapping the Flask app. The dependency graph becomes shallower: the stats client depends on a leaf config module rather than on the top-level application module. Future refactors of `app.py` (renaming, splitting routes, changing the WSGI entry point) no longer risk breaking an unrelated subsystem that only needed a path constant.
+
+### AC-144 · Dead `_headers()` helper bypasses host abstraction layer
+Strength: Worth exploring
+Files: agent_client.py
+
+Problem:
+`agent_client.py` defines a `_headers()` helper that reads `AGENT_MANAGER_SESSION_AGENT_TOKEN` directly from `os.environ`, ignoring the `Host` object and the `token_file` fallback that `agent_hosts.read_token(host)` supports. However, `_headers()` is **never called** anywhere in the module: both `list_all()` and `open_events()` construct their `Authorization` header inline via `agent_hosts.read_token(host)`. The function is therefore dead code. Its presence is still a maintenance hazard: a future developer adding a new endpoint may see `_headers()` and assume it is the canonical way to build auth headers, inadvertently introducing a code path that silently drops `token_file` support and hard-couples the client to a single environment-variable name.
+
+Solution:
+Delete the `_headers()` function from `agent_client.py`. No call-site updates are needed because no code currently invokes it. Optionally, if the team wants a single shared helper for convenience, add `build_auth_header(host) -> dict` to `agent_hosts.py` and use it in `list_all()` / `open_events()` in place of the current inline construction — but this is a stylistic improvement, not a bug fix.
+
+Benefits:
+Removes a dead code path that contradicts the module's own convention (resolve credentials through the host object). Eliminates the risk that a future contributor picks up `_headers()` as the "standard" helper and introduces a real `token_file` regression. Keeps the credential-resolution surface to the one function that is actually exercised.
+
+---
+
+*AC-002 removed.* The critique correctly identifies that `list_sessions()` already returns partial data when only some hosts fail: the guard `len(result["skipped"]) == len(hosts)` is `False` in a 1-of-3-failure scenario, so the function returns the sessions from the two healthy hosts. The docstring ("Raises AgentError when … every configured host failed") accurately describes this behaviour. The problem statement in the original draft was a misreading of the condition, and the proposed "fix" would have added a redundant API surface for behaviour that already exists.
+
+NOTE: Flag 2 was applied (AC-002 removed) because the critique is correct — the draft's claim that `list_sessions()` raises on partial failure is factually wrong given the actual `==` comparison, so there is no defect to report.
