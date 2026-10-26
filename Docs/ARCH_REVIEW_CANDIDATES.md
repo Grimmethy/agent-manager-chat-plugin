@@ -1871,3 +1871,29 @@ Benefits:
 The test's intent—verifying the route passed the correct model name to `reserve`—is expressed against the same source of truth the test itself sets up, making the assertion self-contained and robust to refactors in how the route resolves the model name. Swapping or adding providers does not require touching test files that happen to import a specific provider module.
 
 NOTE: All three critique flags were applied. AC-43 was removed entirely because its premise (that `ollama_client.py` duplicates a provider vocabulary) is factually incorrect—`ollama_client.py` merely reads a single env var and contains no provider list, set, or validation logic that parallels `handoff.py`'s `_DEFAULT_WINDOWS`. The proposed `providers.py` registry would also introduce an unjustified dependency from a low-level HTTP client to a high-level domain concept. AC-44 was retained but reframed as a standalone test-hygiene improvement rather than a consequence of the (now-removed) AC-43.
+
+### AC-140 · Inconsistent exception handling between streaming and non-streaming internal API calls
+Strength: Strong
+Files: internal_api_client.py, local_tool_client.py
+
+Problem:
+The non-streaming functions in `internal_api_client.py` (`get_roots`, `run_command`, `preempt`, `reserve`) catch `requests.RequestException` and re-raise it as `InternalApiError`, giving callers a uniform exception-based contract for transport and API failures. The streaming function `stream_local_turn`, however, catches the same `requests.RequestException` but instead yields a dictionary of the form `{"type": "error", "error": ...}` into the generator stream. Callers such as `local_tool_client.stream_plan_with_tools` must therefore inspect every yielded item for an `"error"` type to detect connection failures, while all other internal-API calls are handled with a simple `try/except InternalApiError`. This forces consumers to maintain two distinct error-handling paths for what is logically the same class of failure (transport/API error), increasing the chance that a caller handles one path correctly and misses the other.
+
+Solution:
+Modify `stream_local_turn` so that on `requests.RequestException` it raises `InternalApiError` (or a thin streaming-specific subclass) rather than yielding an error dictionary. Because the exception is raised before the generator is consumed by the caller's `for` loop, the standard `try/except` idiom works identically for streaming and non-streaming calls. Any caller that previously checked for `{"type": "error"}` can be simplified to a single `except InternalApiError` block.
+
+Benefits:
+All internal-API consumers gain a single, predictable exception contract regardless of whether the call is streaming or not. Dual error-handling paths collapse into one, reducing the surface area for missed-failure bugs. The `InternalApiError` type fulfills its design intent as the sole signal of transport/API failure, making the module's public API easier to reason about and test.
+
+### AC-141 · Duplicated LOCAL_MODEL environment-variable resolution across layers
+Strength: Worth exploring
+Files: internal_api_client.py, ollama_client.py, routes/chat.py
+
+Problem:
+The `reserve` function in `internal_api_client.py` contains a fallback that reads `os.environ.get("LOCAL_MODEL")` when no model name is supplied by the caller. The same environment variable is already resolved at module level in `ollama_client.py` (`MODEL = os.environ.get("LOCAL_MODEL")`), and the routing layer in `routes/chat.py` currently passes `ollama_client.MODEL` explicitly. This means the model-name resolution logic is spread across at least three files. If the resolution strategy changes—supporting a config file, a different environment variable, or a per-request override—every copy must be found and updated in lockstep, and a missed copy silently falls back to the old behaviour.
+
+Solution:
+Remove the `os.environ.get("LOCAL_MODEL")` fallback from `internal_api_client.reserve`. The function should accept the model name as an explicit parameter (or `None` to omit it from the request body) and contain no provider-specific configuration logic. The routing layer (`routes/chat.py`) remains responsible for resolving the model name from the appropriate source (e.g., `ollama_client.MODEL` or a future config object) and passing the concrete value to `reserve`. This keeps `internal_api_client` provider-agnostic and centralises configuration resolution in the layer that already knows which provider is in use.
+
+Benefits:
+A single source of truth for model-name resolution eliminates the risk of divergent fallbacks across files. `internal_api_client` becomes a thin, provider-agnostic transport layer that is trivially testable with any model string. Future changes to how the model is configured (env var, config file, per-request header) require edits in exactly one place rather than hunting for every copy of the fallback.
