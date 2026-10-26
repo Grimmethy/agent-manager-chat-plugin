@@ -1981,3 +1981,59 @@ Delete `_headers()`. Extract the four-line pattern already duplicated in `list_a
 
 Benefits:
 Eliminates a stale, misleading helper that contradicts the module's own docstring about per-host token semantics. Reduces the duplicated auth-header construction to a single call-site, so a future change to the token resolution logic (e.g. adding mTLS or a different header scheme) only needs to be made in one place. Removes the trap for a new contributor who would naturally reach for the module's only "headers" function and unknowingly bypass the per-host token file.
+
+### AC-148 · `ollama_client.MODEL()` env-var accessor leaks into the routing layer
+Strength: Strong
+Files: ollama_client.py, test_chat_routes_swap.py
+
+Problem:
+`ollama_client.MODEL()` is a one-line `os.environ.get("LOCAL_MODEL")` accessor that carries no Ollama-specific logic, yet the swap route and the reserve/close/message handlers must `import ollama_client` solely to read that environment variable and pass the result into `internal_api_client.reserve(...)`. This forces the routing layer to depend on a provider-specific module for a value that is just an env var, and it makes the model-name source a hidden, per-call dependency of every reservation call. The test file `test_chat_routes_swap.py` compounds the smell: it must import `ollama_client` and reference `ollama_client.MODEL()` just to assert the arguments of the reserve call, confirming that the routing layer's dependency on the provider module is incidental rather than structural. The AC-41/AC-42 pair already resolves this same friction for the other handlers; the swap route is a third, unaddressed instance.
+
+Solution:
+Create a new module `config.py` (or add to an existing shared config module) containing a single function:
+```python
+def get_local_model() -> str:
+    """Read LOCAL_MODEL from the environment. Returns empty string if unset."""
+    return os.environ.get("LOCAL_MODEL", "")
+```
+Update the swap route and the reserve/close/message handlers to import `get_local_model` from `config` and call it directly, removing their `import ollama_client` statements. Update `test_chat_routes_swap.py` to import `get_local_model` from `config` and use it in assertions instead of `ollama_client.MODEL()`. Do **not** modify `ollama_client.MODEL()`; it remains as-is for any external callers that depend on it, but the routing layer and its tests no longer reference it.
+
+Benefits:
+The routing layer's import graph no longer includes a provider-specific module for a generic configuration read. Adding or swapping a local-model provider no longer requires touching route handlers or their tests. The test file's dependency surface now matches the production code's actual dependency surface, both pointing to the shared config module rather than a provider module.
+
+### AC-149 · `model_stats_client` and `ollama_client` resolve the local model name by two different mechanisms
+Strength: Worth exploring
+Files: model_stats_client.py, ollama_client.py
+
+Problem:
+`ollama_client.MODEL()` reads `LOCAL_MODEL` per call (documented as mirroring `handoff.window_tokens`' per-call env reads so a value set after import is seen immediately). `model_stats_client` has no such accessor; it takes `model` as a parameter and relies on the caller to resolve it, and its module docstring notes it deliberately points at `CORE_REPO_ROOT` rather than a `__file__`-relative path because the two repos live at different directory depths. The result is two modules in the same community resolving "which local model is this" by two different mechanisms—one per-call env read, one caller-supplied—with no shared helper. A caller that wants to record a call for the local model must know to call `ollama_client.MODEL()` and pass it in, coupling the stats-recording call site to the provider module for a value that is just an env var.
+
+Solution:
+Modify `model_stats_client`'s public API to accept an optional `model` parameter that defaults to calling `config.get_local_model()` when omitted. Specifically, change the signature from `def record_call(model, ...)` to `def record_call(model=None, ...)`, and at the top of the function body add:
+```python
+if model is None:
+    model = config.get_local_model()
+```
+This preserves backward compatibility for any existing caller that passes `model` explicitly, while eliminating the need for callers to resolve the model name themselves when they want the default local model. `ollama_client.MODEL()` remains unchanged for external consumers, but internal callers within the same codebase should migrate to `config.get_local_model()` or rely on the new default in `model_stats_client`.
+
+Benefits:
+A single source of truth for "which local model is active" eliminates the risk of the two modules disagreeing (e.g., one seeing a stale value if the env var changes between calls). Call sites that record stats for the local model no longer need to import `ollama_client`, reducing cross-module coupling. The per-call env-read semantics are preserved and documented in one place (`config.get_local_model()`), and existing callers that pass an explicit model continue to work unchanged.
+
+### AC-150 · `handoff._is_plain_row` and `chat_sessions._build_local_messages` duplicate the same skip predicate
+Strength: Strong
+Files: handoff.py, chat_sessions.py
+
+Problem:
+`handoff._is_plain_row` is documented as "the exact two skips `chat_sessions._build_local_messages` uses"—the same `error`/`marker`-is-True exclusion logic is implemented independently in two modules. `handoff` is declared "pure, no I/O" and `chat_sessions` is the storage layer, so the predicate is the kind of shared invariant that should live in one place. As written, a future row type (a third skip key, a `system` role, etc.) must be added in both files in lockstep, and the docstring cross-reference is the only thing keeping them in sync. There is no test that asserts the two implementations agree; a divergence would be silent until a row type is added to one but not the other.
+
+Solution:
+Create a new module `row_utils.py` containing:
+```python
+def is_plain_row(row: dict) -> bool:
+    """Return True if the row is a plain message row (not an error or marker)."""
+    return not row.get("error") and not row.get("marker")
+```
+Update `handoff._is_plain_row` to be a thin wrapper that calls `row_utils.is_plain_row`, or replace all internal uses of `_is_plain_row` with direct calls to `row_utils.is_plain_row`. Update `chat_sessions._build_local_messages` to call `row_utils.is_plain_row` instead of its inline logic. Add a unit test in `test_row_utils.py` (using the repository's `unittest` convention) that feeds a representative set of row dicts—including the `error`-set, `marker`-set, and plain cases—and asserts `is_plain_row`'s output, pinning the predicate's contract in one place.
+
+Benefits:
+A new skip key or role is added in exactly one location (`row_utils.is_plain_row`). The docstring cross-reference is no longer the sole synchronization mechanism; the shared function is. The unit test gives a regression net that the current two-copy arrangement lacks, and it is trivial to extend when the predicate grows. Placing the helper in a new `row_utils` module preserves `handoff`'s "pure, no I/O" contract by avoiding an import of the storage layer.
