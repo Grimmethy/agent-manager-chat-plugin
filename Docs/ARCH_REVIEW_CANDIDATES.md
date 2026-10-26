@@ -2102,3 +2102,42 @@ Refactor `agent_hosts.py` to include the "default to single host" logic. Modify 
 
 Benefits:
 Centralizes host resolution logic in `agent_hosts.py`, making it the single source of truth for how hosts are identified and defaulted. Reduces code duplication and ensures that any changes to host lookup semantics (e.g., alias support, case-insensitivity) are implemented in one place. Clarifies the responsibility split: `agent_hosts` manages the configuration and lookup, while `agent_client` manages HTTP communication and client-specific error reporting.
+
+### AC-156 · Dual error-handling contract leaves `_call_chat`'s exception handler dead for the primary streaming path
+Strength: Strong
+Files: app.py, internal_api_client.py
+
+Problem:
+In `app.py`, the `_call_chat` function catches `LocalToolClientError` (aliased from `internal_api_client.InternalApiError`) and converts it to a 502 Bad Gateway response. However, the primary local-provider execution path—`stream_local_turn` in `internal_api_client.py`—is a generator that yields an error object (`{"type": "error", "error": ...}`) as a data payload rather than raising `InternalApiError` when the underlying HTTP request fails. Because the error is yielded as stream data instead of raised as an exception, the `except LocalToolClientError` block in `_call_chat` is never triggered for the main streaming flow. This creates a confusing dual error-handling contract: the same underlying transport failure is handled via exception in some code paths (e.g., `reserve`) but via a data-payload in others (e.g., `stream_local_turn`), forcing the frontend to parse error objects in the stream while the backend's exception handler sits unused for the primary path.
+
+Solution:
+Standardize the error contract for `stream_local_turn`. Either change `stream_local_turn` to raise `InternalApiError` on transport failures before yielding any data (allowing `_call_chat` to catch it uniformly with its existing handler), or remove the `LocalToolClientError` catch from `_call_chat` and document that all local-provider failures are delivered as `{"type": "error"}` payloads in the stream, ensuring the frontend handles them consistently. Whichever direction is chosen, the two modules should agree on a single error-propagation mechanism.
+
+Benefits:
+Eliminates the misleading, never-executed exception handler in `app.py`, reduces cognitive load for developers tracing the error flow, and ensures a single, predictable error-propagation contract across the local-provider interface. Future contributors will no longer need to reason about which failure mode uses exceptions versus data payloads.
+
+### AC-157 · Roots fallback logic is coupled to `app.py` rather than living in the client that resolves roots
+Strength: Worth exploring
+Files: app.py, internal_api_client.py
+
+Problem:
+In `app.py`, the `_chat_roots` function calls `internal_api_client.get_roots()` and, if that call fails (e.g., the dashboard is down), falls back to `[os.path.realpath(str(CORE_REPO_ROOT))]`. The `CORE_REPO_ROOT` constant is defined in `app.py` from the `AGENT_MANAGER_CORE_REPO_ROOT` environment variable. The `internal_api_client` module itself has no knowledge of this fallback; it only knows the dashboard URL. The fail-open behavior is therefore implemented entirely in `app.py`, tightly coupled to that file's local constant. If `internal_api_client.get_roots()` were used by other modules that also need a fallback, they would have to re-implement the same logic. The roots-resolution contract is split across two modules rather than being self-contained in the one responsible for communicating with the core dashboard.
+
+Solution:
+Move the fallback logic into `internal_api_client.get_roots()`. The function should accept an optional `fallback_roots` parameter or read the same `AGENT_MANAGER_CORE_REPO_ROOT` environment variable internally, so that `get_roots()` is self-contained and provides a fail-open guarantee by default. `app.py`'s `_chat_roots` would then simply call `get_roots()` without needing to know the fallback value.
+
+Benefits:
+Centralizes roots-resolution logic in the module responsible for dashboard communication. Any future caller of `get_roots()` inherits the fail-open behavior without duplicating the fallback. The `internal_api_client` API becomes more robust and self-documenting regarding its degradation behavior.
+
+### AC-158 · `local_tool_client.py` is a valueless shim over `internal_api_client.stream_local_turn`
+Strength: Worth exploring
+Files: local_tool_client.py, internal_api_client.py
+
+Problem:
+`local_tool_client.py` is a thin wrapper around `internal_api_client.stream_local_turn` that adds no validation, transformation, or new functionality. Its sole purpose is to preserve the legacy name `stream_plan_with_tools` for backward compatibility. The function signature is duplicated and must be kept in sync with `internal_api_client` manually. The only caller referenced in this codebase (`chat_sessions.py`) could import `stream_local_turn` directly from `internal_api_client` without any loss of clarity. The shim introduces an unnecessary indirection layer that makes it harder to trace the actual streaming implementation and creates a risk of signature drift between the shim and the real function.
+
+Solution:
+Remove `local_tool_client.py` and update all callers to import `stream_local_turn` directly from `internal_api_client`. If external consumers still depend on the old name, emit a deprecation warning in a transitional release and schedule removal, rather than maintaining a silent pass-through module indefinitely.
+
+Benefits:
+Reduces the number of modules to maintain. Eliminates the risk of signature drift between the shim and the actual implementation. Makes the codebase more transparent by removing an abstraction layer that adds no behavioral value, so a reader can trace the streaming logic in one step rather than through a no-op intermediary.
