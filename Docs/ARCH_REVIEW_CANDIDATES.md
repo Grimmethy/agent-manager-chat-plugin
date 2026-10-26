@@ -1968,3 +1968,16 @@ Extract the chunk-to-block reassembly and field parsing into a standalone genera
 
 Benefits:
 `filter_events()` shrinks to a short filter-and-re-emit loop, making its intent immediately readable. `_parse_sse_blocks` can be tested independently with edge-case chunk boundaries (split mid-line, multi-line `data:`, missing `event:` field) without standing up a streaming response. Adding new filtering rules or modifying the tagging logic no longer requires navigating the parsing code, reducing the chance of regressions in either concern.
+
+### AC-147 · Dead `_headers()` helper contradicts the multi-host token model
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_client._headers()` is a module-level helper that builds a Bearer Authorization header from a single static token source. It is never called anywhere in this community — `list_all`, `open_events`, the test suite, and `agent_hosts` all bypass it. The two functions that actually issue HTTP requests each inline the correct multi-host pattern: they call `agent_hosts.read_token(host)`, which checks the per-host `token_file` first (re-read from disk each call) and falls back to a static token. `_headers()` does neither: it ignores token files entirely and has no notion of a per-host token. The test `test_token_file_wins_and_is_read_per_call` in `test_agent_client.py` explicitly verifies that the token-file path takes precedence, confirming the multi-host resolution is the intended contract. A maintainer adding a new endpoint would see `_headers()` as the obvious "get the auth header" helper, call it, and silently send the wrong (or no) token to hosts that rely on a token file.
+
+Solution:
+Delete `_headers()`. Extract the four-line pattern already duplicated in `list_all` and `open_events` into a single private helper (e.g. `_auth_headers(host)`) that calls `agent_hosts.read_token(host)`. Both call-sites then use the helper, the dead function is gone, and there is exactly one place that knows how to build the Authorization header for a given host.
+
+Benefits:
+Eliminates a stale, misleading helper that contradicts the module's own docstring about per-host token semantics. Reduces the duplicated auth-header construction to a single call-site, so a future change to the token resolution logic (e.g. adding mTLS or a different header scheme) only needs to be made in one place. Removes the trap for a new contributor who would naturally reach for the module's only "headers" function and unknowingly bypass the per-host token file.
