@@ -894,7 +894,7 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
             yield event["text"]
         elif event.get("type") == "final":
             result = event
-    model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
+    model_stats_client.record_call("chat-session", ollama_client.MODEL(), int((time.time() - started) * 1000),
                                     stage="chat", result=result or {}, source="chat")
     final_text = (result or {}).get("response")
     if final_text is None:
@@ -1067,6 +1067,13 @@ def record_turn_error(storage_dir: Path, session_id: str, error_text: str):
     _touch(session)
     _write_session(storage_dir, session)
     return session
+
+
+def save_template(storage_dir: Path, session: dict, entry: int, index: int, key=None, text=None):
+    'Persists a template proposal for the given session and flushes the session to storage. Raises LookupError if the proposal does not exist.'
+    proposal = template_store.save_proposal(session, entry, index, key, text)
+    _write_session(storage_dir, session)
+    return proposal
 
 
 def set_reserved(storage_dir: Path, session_id: str, reserved: bool):

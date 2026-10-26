@@ -469,7 +469,7 @@ def api_chat_reserve(session_id):
         import ollama_client
         logger.error("AC4_DIVERGENCE session=%s model=%s want_on=%s error=%s: %s -- Server-side reservation is LIVE but local chat_sessions "
                      "state was NOT updated. Manual reconciliation required.",
-                     session_id, ollama_client.MODEL, want_on, type(e).__name__, e)
+                     session_id, ollama_client.MODEL(), want_on, type(e).__name__, e)
         raise
     return jsonify(session)
 
@@ -541,7 +541,7 @@ def api_chat_swap(session_id):
         from internal_api_client import InternalApiError, reserve as internal_reserve
         import ollama_client
         try:
-            internal_reserve(session_id, ollama_client.MODEL, False)
+            internal_reserve(session_id, ollama_client.MODEL(), False)
         except InternalApiError as e:  # noqa: BLE001 -- never block the swap on the release
             logger.warning("[chat-swap] reservation release failed (non-fatal): %s", e)
         set_reserved(CHAT_STORAGE_DIR, session_id, False)
@@ -603,8 +603,7 @@ def api_chat_template_save(session_id):
     outcome (saved, or why not) is persisted on the proposal so it survives a reload, and
     the updated session comes back so the UI renders it."""
     from app import CHAT_STORAGE_DIR
-    from chat_sessions import get_session, _write_session
-    import template_store
+    from chat_sessions import get_session, save_template
     body = request.get_json(silent=True) or {}
     try:
         entry, index = int(body["entry"]), int(body["index"])
@@ -614,8 +613,7 @@ def api_chat_template_save(session_id):
     if not session or session.get("status") != "active":
         abort(404)
     try:
-        prop = template_store.save_proposal(session, entry, index, body.get("key"), body.get("text"))
+        prop = save_template(CHAT_STORAGE_DIR, session, entry, index, body.get("key"), body.get("text"))
     except LookupError:
         abort(404, description="no such template proposal")
-    _write_session(CHAT_STORAGE_DIR, session)
     return jsonify({"session": session, "proposal": prop})

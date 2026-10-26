@@ -12,13 +12,17 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 # (2026-08-22, Grimmethy: "models should be fully interchangeable and their names should
 # not be hardcoded anywhere"). An unset LOCAL_MODEL surfaces as a real Ollama "model not
 # found" error instead of a guessed name.
-MODEL = os.environ.get("LOCAL_MODEL")
+def MODEL():
+    """Return the current LOCAL_MODEL value, read from the environment on every call
+    (mirroring handoff.window_tokens' per-call env reads), so a LOCAL_MODEL set after
+    this module was imported is seen immediately instead of being frozen at import."""
+    return os.environ.get("LOCAL_MODEL")
 
 
 def generate(prompt: str, think: bool = False, temperature: float = 0.4, num_predict: int = 900) -> dict:
     """POSTs to Ollama's /api/generate. Returns {"response": str, "thinking": str}."""
     body = {
-        "model": MODEL,
+        "model": MODEL(),
         "prompt": prompt,
         "think": think,
         "stream": False,
