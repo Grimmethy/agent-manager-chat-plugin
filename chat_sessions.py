@@ -296,6 +296,17 @@ def _last_used(session: dict) -> str:
     return max(session.get("lastActivityAt") or "", session.get("startedAt") or "")
 
 
+def _find_existing_empty_session(storage_dir: Path) -> dict | None:
+    """Find an existing active session that has never been touched (lastActivityAt is
+    None). Used to deduplicate rapid "New Chat" clicks: if a freshly created session
+    hasn't received its first message yet, return it instead of creating another one.
+    Returns the session dict or None if no empty active session exists."""
+    for session in _read_sessions(storage_dir).values():
+        if session.get("status") == "active" and session.get("lastActivityAt") is None:
+            return session
+    return None
+
+
 def get_active_session(storage_dir: Path, roots: list, instances_dir=None,
                         provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
     """The conversation the single-pane sidebar shows (Brain Dump #153: "hideable panel
@@ -305,7 +316,15 @@ def get_active_session(storage_dir: Path, roots: list, instances_dir=None,
     provider/model/effort for an existing active session -- same "fixed for the
     session's lifetime" reasoning discuss_sessions.py already documents (a
     mid-conversation provider switch would hand the new provider/model a transcript or
-    --resume history it didn't generate)."""
+    --resume history it didn't generate).
+
+    Deduplication: if an active session exists with lastActivityAt=None (a freshly
+    created session that never received a message), return it instead of creating a
+    duplicate. This prevents double-creating empty sessions when the New Chat button
+    is clicked rapidly."""
+    existing_empty = _find_existing_empty_session(storage_dir)
+    if existing_empty:
+        return existing_empty
     active = [s for s in _read_sessions(storage_dir).values() if s.get("status") == "active"]
     if active:
         return max(active, key=_last_used)
@@ -318,7 +337,15 @@ def start_new_conversation(storage_dir: Path, roots: list, instances_dir=None,
                             provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
     """Starts a fresh conversation ALONGSIDE the existing ones (2026-10-18: it used to end
     every active session first, so "New" destroyed the chat you were in). Use
-    end_session() to close one."""
+    end_session() to close one.
+
+    Deduplication: if an active session exists with lastActivityAt=None (a freshly
+    created session that never received a message), return it instead of creating a
+    duplicate. This prevents double-creating empty sessions when the New Chat button
+    is clicked rapidly."""
+    existing_empty = _find_existing_empty_session(storage_dir)
+    if existing_empty:
+        return existing_empty
     session = _new_session(roots, instances_dir, provider, model, effort)
     _write_session(storage_dir, session)
     return session
