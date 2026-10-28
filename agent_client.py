@@ -98,33 +98,24 @@ def list_sessions() -> list:
 
 
 def _dedup_empty_sessions(sessions: list) -> list:
-    """Drop empty duplicate sessions (lastActivityAt=None) when a non-empty row
-    with the same id exists. Active rows always win over empty ones for the
-    same id; for identical-type duplicates, first occurrence is canonical.
+    """Drop sessions with no lastActivityAt (zero-turn) and deduplicate by id.
+    Active rows always win over empty ones for the same id; for identical-type
+    duplicates, first occurrence is canonical.
 
-    Two-pass: first identify ids that have at least one active (non-empty)
-    row, then emit rows in order, skipping empty rows whose id also has an
-    active row and skipping later occurrences of any id already emitted.
+    Single-pass: skip rows without a truthy lastActivityAt, then emit each id
+    only once (first occurrence wins).
     """
-    active_ids = {
-        row["id"] for row in sessions
-        if isinstance(row, dict) and row.get("id") is not None
-        and row.get("lastActivityAt") is not None
-    }
     out = []
     seen = set()
     for row in sessions:
         if not isinstance(row, dict):
             continue
+        if not row.get("lastActivityAt"):
+            continue
         sid = row.get("id")
         if sid is None:
             out.append(row)
             continue
-        is_empty = row.get("lastActivityAt") is None
-        # Drop empty rows when an active version exists for this id
-        if is_empty and sid in active_ids:
-            continue
-        # Keep first occurrence of each id
         if sid in seen:
             continue
         seen.add(sid)

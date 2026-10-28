@@ -135,6 +135,19 @@ class AgentRouteTests(unittest.TestCase):
                 with self.assertRaises(agent_client.AgentError):
                     agent_client.list_sessions()
 
+    def test_list_sessions_excludes_zero_turn_sessions(self):
+        """list_sessions() excludes sessions with falsy lastActivityAt."""
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_SESSION_AGENT_URL": self.url}):
+            with mock.patch("agent_client.requests.get") as get:
+                get.return_value.json.return_value = [
+                    {"id": "sess-1", "lastActivityAt": "2026-01-01T00:00:00Z", "status": "active"},
+                    {"id": "sess-2", "lastActivityAt": None, "status": "active"},
+                    {"id": "sess-3", "lastActivityAt": "", "status": "active"},
+                ]
+                result = agent_client.list_sessions()
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0]["id"], "sess-1")
+
 
 class DeduplicationTests(unittest.TestCase):
     """Unit tests for the deduplication helpers in chat_sessions.py and agent_client.py."""
@@ -164,10 +177,10 @@ class DeduplicationTests(unittest.TestCase):
             {"id": "sess-2", "lastActivityAt": None, "status": "active"},  # duplicate empty
         ]
         result = agent_client._dedup_empty_sessions(sessions)
-        # Should have 2 sessions: sess-1 (active version) and sess-2 (first empty)
-        self.assertEqual(len(result), 2)
+        # Should have 1 session: sess-1 (active version); all zero-turn dropped
+        self.assertEqual(len(result), 1)
         ids = {s['id'] for s in result}
-        self.assertEqual(ids, {"sess-1", "sess-2"})
+        self.assertEqual(ids, {"sess-1"})
         # sess-1 should be the active version (with lastActivityAt)
         sess1 = next(s for s in result if s['id'] == 'sess-1')
         self.assertIsNotNone(sess1.get('lastActivityAt'))
