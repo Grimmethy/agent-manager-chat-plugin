@@ -81,14 +81,55 @@ def list_all() -> dict:
 def list_sessions() -> list:
     """All configured hosts' session rows. Raises AgentError when no host is
     configured or every configured host failed -- so a single configured host
-    failing behaves exactly as it did before multi-host support."""
+    failing behaves exactly as it did before multi-host support.
+
+    Duplicate empty sessions are collapsed: when the same id appears with both
+    an empty row (lastActivityAt=None, i.e. never received a message) and a
+    non-empty row, the empty one is dropped in favour of the non-empty one.
+    First occurrence is canonical when rows are otherwise equivalent.
+    """
     hosts = agent_hosts.hosts()
     if not hosts:
         raise AgentError("session agent is not configured")
     result = list_all()
     if result["skipped"] and len(result["skipped"]) == len(hosts):
         raise AgentError("session agent /sessions failed")
-    return result["sessions"]
+    return _dedup_empty_sessions(result["sessions"])
+
+
+def _dedup_empty_sessions(sessions: list) -> list:
+    """Drop empty duplicate sessions (lastActivityAt=None) when a non-empty row
+    with the same id exists. Active rows always win over empty ones for the
+    same id; for identical-type duplicates, first occurrence is canonical.
+
+    Two-pass: first identify ids that have at least one active (non-empty)
+    row, then emit rows in order, skipping empty rows whose id also has an
+    active row and skipping later occurrences of any id already emitted.
+    """
+    active_ids = {
+        row["id"] for row in sessions
+        if isinstance(row, dict) and row.get("id") is not None
+        and row.get("lastActivityAt") is not None
+    }
+    out = []
+    seen = set()
+    for row in sessions:
+        if not isinstance(row, dict):
+            continue
+        sid = row.get("id")
+        if sid is None:
+            out.append(row)
+            continue
+        is_empty = row.get("lastActivityAt") is None
+        # Drop empty rows when an active version exists for this id
+        if is_empty and sid in active_ids:
+            continue
+        # Keep first occurrence of each id
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append(row)
+    return out
 
 
 def _resolve_host(name=None):
