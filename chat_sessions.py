@@ -967,11 +967,12 @@ def enforce_footer(answer: str) -> str:
     Returns:
         Answer with footer (appended if missing).
     """
-    # Extract any existing footer
-    text_without_footer, existing_footer = _extract_footer(answer)
+    # Handle empty string case
+    if not answer:
+        return "TASK-REF: N/A"
     
-    if existing_footer:
-        # Footer exists - return unchanged
+    # Check if footer already exists
+    if _has_footer(answer):
         return answer
     
     # No footer found - append TASK-REF: N/A
