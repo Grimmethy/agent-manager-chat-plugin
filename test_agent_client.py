@@ -136,5 +136,42 @@ class AgentRouteTests(unittest.TestCase):
                     agent_client.list_sessions()
 
 
+class DeduplicationTests(unittest.TestCase):
+    """Unit tests for the deduplication helpers in chat_sessions.py and agent_client.py."""
+
+    def test_start_new_conversation_deduplicates_rapid_calls(self):
+        """Multiple rapid calls to start_new_conversation() produce only one empty session."""
+        import chat_sessions
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        roots = []
+        # Call start_new_conversation() 5 times rapidly
+        sessions = [chat_sessions.start_new_conversation(tmp, roots) for _ in range(5)]
+        # All calls should return the SAME session (the first one created)
+        self.assertEqual(len(sessions), 5)
+        self.assertEqual(len({s['id'] for s in sessions}), 1)
+        # The session should have lastActivityAt=None (never received a message)
+        self.assertIsNone(sessions[0].get('lastActivityAt'))
+
+    def test_list_sessions_deduplicates_empty_sessions(self):
+        """list_sessions() doesn't return duplicate empty sessions."""
+        import agent_client
+        # Create mock sessions with duplicate ids, one empty and one active
+        sessions = [
+            {"id": "sess-1", "lastActivityAt": None, "status": "active"},  # empty
+            {"id": "sess-1", "lastActivityAt": "2026-01-01T00:00:00Z", "status": "active"},  # active
+            {"id": "sess-2", "lastActivityAt": None, "status": "active"},  # empty
+            {"id": "sess-2", "lastActivityAt": None, "status": "active"},  # duplicate empty
+        ]
+        result = agent_client._dedup_empty_sessions(sessions)
+        # Should have 2 sessions: sess-1 (active version) and sess-2 (first empty)
+        self.assertEqual(len(result), 2)
+        ids = {s['id'] for s in result}
+        self.assertEqual(ids, {"sess-1", "sess-2"})
+        # sess-1 should be the active version (with lastActivityAt)
+        sess1 = next(s for s in result if s['id'] == 'sess-1')
+        self.assertIsNotNone(sess1.get('lastActivityAt'))
+
+
 if __name__ == "__main__":
     unittest.main()
