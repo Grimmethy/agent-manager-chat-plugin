@@ -1013,6 +1013,19 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
         if event.get("type") == "chunk":
             raw_chunks.append(event["text"])
             yield event["text"]
+        elif event.get("type") == "tool_start":
+            # Extract tool name and summarize args (first 120 chars)
+            tool_name = event.get("name", "unknown")
+            args = event.get("args", "")
+            summary = args[:120] if args else ""
+            yield {"type": "tool_start", "name": tool_name, "summary": summary}
+        elif event.get("type") == "tool_end":
+            # Extract tool name, success status, and summarize result (first 120 chars)
+            tool_name = event.get("name", "unknown")
+            ok = event.get("ok", False)
+            result_text = event.get("result", "")
+            summary = result_text[:120] if result_text else ""
+            yield {"type": "tool_end", "name": tool_name, "ok": ok, "summary": summary}
         elif event.get("type") == "final":
             result = event
     model_stats_client.record_call("chat-session", ollama_client.MODEL(), int((time.time() - started) * 1000),
@@ -1126,11 +1139,48 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
         _write_session(storage_dir, session)
         yield {"type": "chunk", "text": reply}
     else:
-        for chunk in _stream_local(session, message, result_box):
-            reply_parts.append(chunk)
-            session["transcript"][-1]["text"] = "".join(reply_parts)
-            _write_session(storage_dir, session)
-            yield {"type": "chunk", "text": chunk}
+        # 2026-10-30 (HUB0033): chunk coalescing + tool event emission
+        # Coalesce consecutive text chunks into one frame per 100ms or 200 chars
+        # (whichever comes first), flushing before tool events and at end.
+        coalesce_buffer = []
+        coalesce_chars = 0
+        coalesce_last_time = time.time()
+        COALESCE_MS = 100
+        COALESCE_CHARS = 200
+        
+        def _flush_coalesced():
+            """Flush the current coalescing buffer as a single chunk event."""
+            nonlocal coalesce_buffer, coalesce_chars, coalesce_last_time
+            if coalesce_buffer:
+                combined = "".join(coalesce_buffer)
+                reply_parts.append(combined)
+                session["transcript"][-1]["text"] = "".join(reply_parts)
+                _write_session(storage_dir, session)
+                yield {"type": "chunk", "text": combined}
+                coalesce_buffer = []
+                coalesce_chars = 0
+                coalesce_last_time = time.time()
+        
+        for item in _stream_local(session, message, result_box):
+            if isinstance(item, dict):
+                # Tool event (tool_start or tool_end) - flush chunks first
+                yield from _flush_coalesced()
+                yield item
+            else:
+                # Text chunk - accumulate for coalescing
+                coalesce_buffer.append(item)
+                coalesce_chars += len(item)
+                reply_parts.append(item)
+                session["transcript"][-1]["text"] = "".join(reply_parts)
+                _write_session(storage_dir, session)
+                
+                # Check if we should flush based on time or character count
+                elapsed_ms = (time.time() - coalesce_last_time) * 1000
+                if elapsed_ms >= COALESCE_MS or coalesce_chars >= COALESCE_CHARS:
+                    yield from _flush_coalesced()
+        
+        # Final flush at end of streaming
+        yield from _flush_coalesced()
 
     # 2026-09-15: prefer _stream_local's own authoritative final_text (the model's
     # response with every SIDE-FINDING:/AMPLIFY:/CONCEPT-BUILD:/CONTEXT-LOG: marker
