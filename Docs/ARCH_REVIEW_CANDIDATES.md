@@ -2141,3 +2141,48 @@ Remove `local_tool_client.py` and update all callers to import `stream_local_tur
 
 Benefits:
 Reduces the number of modules to maintain. Eliminates the risk of signature drift between the shim and the actual implementation. Makes the codebase more transparent by removing an abstraction layer that adds no behavioral value, so a reader can trace the streaming logic in one step rather than through a no-op intermediary.
+
+### AC-163 · Dead filesystem helpers in `app.py` create false expectations about plugin behavior
+Strength: Strong
+Files: app.py
+
+Problem:
+Four functions — `get_active_repo_root()`, `get_pipeline_dir()`, `queue_dir()`, and `instances_dir()` — read `AGENT_MANAGER_REPO_ROOT` / `AGENT_MANAGER_PIPELINE_DIR` environment variables and construct filesystem paths under those roots. The module header explicitly states the repo no longer reads/writes instances/queue/ or holds any GPU lock of its own. These functions are never called by any file in this community. They are dead code from the Phase 1/2 era that survived the migration to the internal API. A developer reading this module will assume the plugin still uses these paths for something — session storage, queue management, instance tracking — and will be confused if they later add a feature that "should" use the queue or instances directory, only to find nothing happens because the core dashboard now owns that state via HTTP.
+
+Solution:
+Remove `get_active_repo_root()`, `get_pipeline_dir()`, `queue_dir()`, and `instances_dir()` from `app.py`. Before deleting, verify no external caller (outside this community) still references them; if one does, update that caller first.
+
+Benefits:
+Eliminates dead code that misleads developers about where the plugin's state lives. Reduces the surface area for future bugs where a developer reaches for these helpers expecting them to work, and removes the maintenance burden of keeping environment-variable-dependent path construction in sync with a migration that already happened.
+
+---
+
+### AC-164 · Silent fallback in `_chat_roots()` masks API failures
+Strength: Strong
+Files: app.py
+
+Problem:
+`_chat_roots()` calls `internal_api_client.get_roots()` and falls back to `[CORE_REPO_ROOT]` on `InternalApiError`. This error is raised for connection refused, bad tokens, network timeouts, or any non-2xx response. When the fallback triggers, Chat proceeds to root itself at the core repo instead of the user's actual project — but the user sees no error, no warning, and no indication that something went wrong. A user with a broken core dashboard (crashed, expired token, network down) will think their chat is working normally while their messages are processed against the wrong repository context. This is a silent correctness failure: the plugin functions, but incorrectly, and the user cannot detect it.
+
+Solution:
+Either (a) log a warning when the fallback triggers so the operator notices, or (b) raise a clear error to the user with a message like "core dashboard unreachable — chat will use fallback roots" so they know the state is degraded. Option (b) is preferred because it gives the user actionable information; option (a) is acceptable if the fallback is intentional and the operator is expected to monitor logs.
+
+Benefits:
+Makes degradation observable instead of silent. Users and operators can detect when the core dashboard is unreachable and take corrective action (restart, re-auth, check network). Prevents the scenario where a user's chat appears to work but is silently operating on the wrong repository context.
+
+---
+
+### AC-165 · Trivial pass-through in `local_tool_client.py` adds maintenance burden for no value
+Strength: Strong
+Files: local_tool_client.py
+
+Problem:
+`local_tool_client.stream_plan_with_tools()` is a one-line wrapper that calls `internal_api_client.stream_local_turn()` with identical arguments. The module header claims it "keeps the SAME public name/signature" for backward compatibility, but the only function it exports IS the same function renamed. There is no adaptive logic, no compatibility translation, and no future-proofing — just a direct pass-through. If the internal API's `stream_local_turn()` signature changes (e.g., a new required parameter, a renamed argument), this shim breaks silently for any caller that goes through `local_tool_client.stream_plan_with_tools()`. The shim provides no value: it doesn't adapt to API changes, doesn't add logging, doesn't translate between formats. Every future change to the internal API requires touching this file for no benefit.
+
+Solution:
+Remove `local_tool_client.py` entirely. Update `chat_sessions.py` (or whatever caller uses it) to import `internal_api_client.stream_local_turn()` directly. If the public name `stream_plan_with_tools` is needed for backward compatibility with external callers, add a deprecation warning and redirect to the internal API directly.
+
+Benefits:
+Eliminates an unnecessary indirection layer that provides no adaptive value. Reduces the chance of silent breakage when the internal API evolves, since callers will now depend directly on the canonical function signature. Simplifies the codebase by removing a file whose sole purpose was to duplicate a function name.
+
+NOTE: The CRITIQUE section did not flag any specific problems — it concluded "NO ISSUES FOUND" — so no changes to the original draft were applied.
