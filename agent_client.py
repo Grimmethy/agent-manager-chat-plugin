@@ -35,8 +35,9 @@ def enabled() -> bool:
     return bool(agent_hosts.hosts())
 
 
-def _headers() -> dict:
-    token = os.environ.get("AGENT_MANAGER_SESSION_AGENT_TOKEN")
+def _auth_headers(host):
+    """Return an Authorization header dict for the given host, if it has a token."""
+    token = agent_hosts.read_token(host)
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
@@ -52,10 +53,7 @@ def list_all() -> dict:
     sessions = []
     skipped = []
     for host in agent_hosts.hosts():
-        headers = {}
-        token = agent_hosts.read_token(host)
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        headers = _auth_headers(host)
         try:
             r = requests.get(host.url + "/sessions", headers=headers, timeout=REQUEST_TIMEOUT)
             r.raise_for_status()
@@ -253,10 +251,7 @@ def open_events(host=None):
     token only (same rule as list_all). Read timeout 60s: the agent sends a
     keepalive comment every 15s."""
     target = _resolve_host(host)
-    headers = {}
-    token = agent_hosts.read_token(target)
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = _auth_headers(target)
     try:
         r = requests.get(target.url + "/events", headers=headers, params={"types": "session"},
                          stream=True, timeout=(3, 60))
