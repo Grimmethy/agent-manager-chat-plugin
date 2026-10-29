@@ -2186,3 +2186,100 @@ Benefits:
 Eliminates an unnecessary indirection layer that provides no adaptive value. Reduces the chance of silent breakage when the internal API evolves, since callers will now depend directly on the canonical function signature. Simplifies the codebase by removing a file whose sole purpose was to duplicate a function name.
 
 NOTE: The CRITIQUE section did not flag any specific problems — it concluded "NO ISSUES FOUND" — so no changes to the original draft were applied.
+
+### AC-166 · Remove `local_tool_client.py` — pointless pass-through wrapper
+Strength: Strong
+
+**Strength:** Strong
+**Files:** `local_tool_client.py`, `app.py`, `chat_sessions.py` (if it exists)
+
+**Problem:**
+`local_tool_client.py` is a meaningless layer of indirection. It re-exports `InternalApiError` as `LocalToolClientError` (an alias to the same class object), and wraps `internal_api_client.stream_local_turn()` with an identical signature. Callers get the same behavior from `internal_api_client.stream_local_turn()` but with a different error type name that's actually the same class. This makes the code harder to follow without providing any abstraction, compatibility, or value.
+
+**Solution:**
+Delete `local_tool_client.py` entirely. Update all callers explicitly:
+
+1. **`app.py`** — Update import and exception handling:
+   ```python
+   # Before:
+   from local_tool_client import LocalToolClientError
+   try:
+       ...
+   except LocalToolClientError as e:
+       ...
+
+   # After:
+   from internal_api_client import InternalApiError
+   try:
+       ...
+   except InternalApiError as e:
+       ...
+   ```
+
+2. **`app.py`** — Update the call site in `_call_chat()`:
+   ```python
+   # Before:
+   from local_tool_client import LocalToolClientError
+   # ...
+   result = await local_tool_client.stream_local_turn(...)
+
+   # After:
+   from internal_api_client import InternalApiError
+   # ...
+   result = await internal_api_client.stream_local_turn(...)
+   ```
+
+3. **`chat_sessions.py`** (if it exists and imports `LocalToolClientError`):
+   - Update import: `from internal_api_client import InternalApiError`
+   - Update exception handling: `except InternalApiError as e:`
+   - Update any call sites to use `internal_api_client.stream_local_turn()` directly
+
+**Verification:**
+- Run `grep -r "LocalToolClientError" .` to confirm no remaining references
+- Run `grep -r "local_tool_client" .` to confirm no remaining imports or references
+- Test that all call sites work with the unified error type
+
+**Benefits:**
+One less file to maintain, callers don't need to know about a meaningless indirection layer, and error handling becomes clearer with only one error type to reason about.
+
+---
+
+### AC-167 · Remove hardcoded `/media/model-cache/github/agent-manager` fallback path
+Strength: Strong
+
+**Strength:** Strong
+**Files:** `app.py`
+
+**Problem:**
+In `app.py`, the fallback path `/media/model-cache/github/agent-manager` is clearly a development/scratch path. It should not be in production code as a default. If `AGENT_MANAGER_CORE_REPO_ROOT` is unset, the plugin will try to use this path, which likely doesn't exist on most systems, causing confusing errors or silent failures.
+
+**Solution:**
+Replace the fallback with a clear error message that explains what's needed:
+
+```python
+# Before:
+CORE_REPO_ROOT = Path(os.environ.get(
+    "AGENT_MANAGER_CORE_REPO_ROOT",
+    "/media/model-cache/github/agent-manager"
+)).resolve()
+
+# After:
+core_repo_env = os.environ.get("AGENT_MANAGER_CORE_REPO_ROOT")
+if not core_repo_env:
+    raise RuntimeError(
+        "AGENT_MANAGER_CORE_REPO_ROOT environment variable is required "
+        "but not set. Please point it to the core repository root."
+    )
+CORE_REPO_ROOT = Path(core_repo_env).resolve()
+```
+
+**Failure Mode:**
+- **Before:** Plugin attempts to use a non-existent dev path, leading to confusing `FileNotFoundError` or silent failures downstream
+- **After:** Plugin fails fast at import time with a clear, actionable error message explaining exactly what's missing and what to do
+
+**Benefits:**
+No more confusion when the env var is unset, and a clearer failure mode — the plugin fails fast with a helpful error instead of trying a non-existent path.
+
+---
+
+NOTE: Flag 1 (AC-001) was addressed by explicitly identifying all callers (`app.py` and `chat_sessions.py`) and specifying the exact import and exception handling changes needed for each. Flag 2 (AC-002) was addressed by replacing the fallback with a clear `RuntimeError` that explains what's needed, rather than leaving a `KeyError` at module import time.
