@@ -858,6 +858,127 @@ def summarize_older(storage_dir: Path, session_id: str, summarizer=None):
     return session
 
 
+def _strip_chatter(text: str) -> str:
+    """Remove leading apology/hedge text from responses.
+    
+    Models sometimes start with apologies like 'You're right, my apologies' or
+    'Sorry, let me correct that'. This strips those to get to the real answer.
+    """
+    if not text:
+        return text
+    
+    # Patterns to strip from the beginning of the text
+    chatter_patterns = [
+        r"^(?:You're right, my apologies|I apologize|Sorry, let me correct|You are correct,|Actually,|Wait,|Hold on,)\s*\n?\s*",
+        r"^(?:Sorry|Apologies|My apologies)\s*,?\s*\n?\s*",
+        r"^(?:You're absolutely right|That's a good point|You make a valid point)\s*,?\s*\n?\s*",
+    ]
+    
+    for pattern in chatter_patterns:
+        # Strip the pattern if it's at the beginning
+        import re
+        new_text = re.sub(pattern, "", text, count=1)
+        if new_text != text:
+            text = new_text
+            # Strip any leading whitespace/newlines after the chatter
+            text = text.lstrip()
+            break
+    
+    return text
+
+
+def _extract_footer(text: str) -> tuple:
+    """Extract footer from text, returning (text_without_footer, footer_text).
+    
+    Returns ('text', None) if no footer found.
+    """
+    if not text:
+        return text, None
+    
+    import re
+    
+    # Look for TASK-REF: pattern
+    task_ref_match = re.search(r'\n\s*TASK-REF:\s*(\S+)', text)
+    if task_ref_match:
+        footer_text = task_ref_match.group(0).strip()
+        text_without = text[:task_ref_match.start()].rstrip()
+        return text_without, footer_text
+    
+    # Look for CONTEXT-LOG: pattern
+    context_log_match = re.search(r'\n\s*CONTEXT-LOG:\s*\S+', text)
+    if context_log_match:
+        footer_text = context_log_match.group(0).strip()
+        text_without = text[:context_log_match.start()].rstrip()
+        return text_without, footer_text
+    
+    return text, None
+
+
+def _normalize_footer(footer_text: str) -> str:
+    """Normalize footer to TASK-REF: <value> format.
+    
+    Converts CONTEXT-LOG: to TASK-REF: if needed.
+    """
+    if not footer_text:
+        return footer_text
+    
+    import re
+    
+    # If it's already TASK-REF, return as-is
+    if footer_text.startswith("TASK-REF:"):
+        return footer_text
+    
+    # Convert CONTEXT-LOG to TASK-REF
+    if footer_text.startswith("CONTEXT-LOG:"):
+        value = footer_text[len("CONTEXT-LOG:"):].strip()
+        return f"TASK-REF: {value}"
+    
+    return footer_text
+
+
+def _has_footer(text: str) -> bool:
+    """Check if text has a TASK-REF or CONTEXT-LOG footer."""
+    if not text:
+        return False
+    # Look for TASK-REF: pattern
+    if re.search(r'TASK-REF:\s*\S+', text):
+        return True
+    # Look for CONTEXT-LOG: pattern
+    if re.search(r'CONTEXT-LOG:\s*\S+', text):
+        return True
+    return False
+
+
+def _strip_footer(text: str) -> str:
+    """Strip footer from text, returning text without footer."""
+    text_without, _ = _extract_footer(text)
+    return text_without
+
+
+def enforce_footer(answer: str) -> str:
+    """Ensure the answer has a proper footer (TASK-REF or CONTEXT-LOG).
+
+    If the answer already has a footer, return it unchanged. If not, append
+    TASK-REF: N/A. The original answer is NEVER discarded -- footer is only appended.
+
+    Args:
+        answer: The original answer text
+
+    Returns:
+        Answer with footer (appended if missing).
+    """
+    # Handle empty string case
+    if not answer:
+        return "TASK-REF: N/A"
+    
+    # Check if footer already exists
+    if _has_footer(answer):
+        return answer
+    
+    # No footer found - append TASK-REF: N/A
+    return answer + "\n\nTASK-REF: N/A"
+
+
 def _stream_local(session: dict, message: str, result_box: dict = None):
     """Yields plain text chunks as the local model generates them (Open WebUI-style live
     streaming, see this module's own recent header note) -- the caller accumulates them
@@ -936,6 +1057,16 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
     if footer:
         final_text += footer
         yield footer
+    # 2026-10-28 (HUB0027): if we added a footer above OR if forcedSummary is True for
+    # context/turns (not voluntary-stop), ensure the answer has TASK-REF or CONTEXT-LOG.
+    # The enforce_footer() function APPENDS to the original (never replaces), and synthesizes
+    # TASK-REF: N/A if retry fails. This is the core bug fix.
+    should_enforce = (
+        (result and result.get("forcedSummary") and 
+         result.get("forcedSummaryReason") in ("context", "turns"))
+    )
+    if should_enforce:
+        final_text = enforce_footer(final_text)
     if result_box is not None:
         result_box["final_text"] = final_text
         result_box["tools"] = tool_log.summarize_tool_calls((result or {}).get("toolCallLog"))
@@ -1011,7 +1142,18 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     reply = (final_text if final_text is not None else "".join(reply_parts)).strip()
     # SAVE-TEMPLATE blocks become Save-button proposals (template_store.py); never auto-saved.
     reply, proposals = template_store.extract_proposals(reply)
+    
+    # 2026-10-28 (HUB0027): strip chatter (apology text) from the stored answer,
+    # and add display_text with footers stripped for UI consumption.
+    reply = _strip_chatter(reply)
+    
+    # Store the full text (with footers) in the transcript for persistence
     session["transcript"][-1]["text"] = reply.strip()
+    
+    # Add display_text with footers stripped for user-visible display
+    display_text = _strip_footer(reply)
+    session["transcript"][-1]["display_text"] = display_text.strip()
+    
     if result_box.get("tools"):
         session["transcript"][-1]["tools"] = result_box["tools"]
     if result_box.get("proposals"):
