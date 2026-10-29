@@ -300,6 +300,77 @@ class ProjectRulesPromptTest(unittest.TestCase):
         self.assertIn(chat_sessions._PROJECT_RULES, chat_sessions._local_system_prompt({"repoRoot": "/x", "roots": ["/x"]}))
 
 
+class BehavioralRulesPromptTest(unittest.TestCase):
+    """2026-10-29 (walkthrough): the chat invented user reactions, narrated protocol,
+    and looped on filler. These tests confirm the behavioral guidance rule is in the
+    system prompt and the audit module exists."""
+
+    def test_rules_exist_and_contain_key_phrases(self):
+        rules = chat_sessions._BEHAVIORAL_RULES
+        for phrase in ("Do NOT address the user", "Do NOT apologize", "Do NOT mention internal protocol", "CONTEXT-LOG"):
+            self.assertIn(phrase, rules, f"Behavioral rules should contain '{phrase}'")
+
+    def test_local_system_prompt_includes_behavioral_rules_after_project_rules(self):
+        prompt = chat_sessions._LOCAL_SYSTEM_PROMPT
+        self.assertIn(chat_sessions._BEHAVIORAL_RULES, prompt)
+        self.assertLess(prompt.index(chat_sessions._PROJECT_RULES), prompt.index(chat_sessions._BEHAVIORAL_RULES))
+
+    def test_claude_first_turn_preamble_includes_behavioral_rules(self):
+        import inspect
+        src = inspect.getsource(chat_sessions._send_claude)
+        self.assertIn("preamble_parts.append(_BEHAVIORAL_RULES)", src,
+                      "the Claude first-turn preamble carries the same rules")
+
+
+class ChatAuditTest(unittest.TestCase):
+    """Tests for chat_audit.py's deterministic audit function.
+
+    This is a model-behavior audit: it counts what the model said, not whether the
+    answer was correct. The behavioral guidance rule in chat_sessions.py prevents
+    these violations; this module measures compliance.
+    """
+
+    def test_counts_youre_right_only_when_no_user_message_follows(self):
+        import chat_audit
+        # With has_user_message_after_first=False, should count the phrases
+        text = "You're right, let me check.\n\nYou're absolutely right to be frustrated."
+        result = chat_audit.audit_turn(text, has_user_message_after_first=False)
+        self.assertEqual(result['youre_right_count'], 2)
+        self.assertTrue(result['has_violations'])
+
+    def test_skips_youre_right_when_user_message_follows(self):
+        import chat_audit
+        # With has_user_message_after_first=True, should NOT count (user might have said it)
+        text = "You're right, let me check.\n\nYou're absolutely right to be frustrated."
+        result = chat_audit.audit_turn(text, has_user_message_after_first=True)
+        self.assertEqual(result['youre_right_count'], 0)
+        self.assertFalse(result['has_violations'])
+
+    def test_flags_context_log_narration(self):
+        import chat_audit
+        # CONTEXT-LOG mention outside the footer block
+        text = "You're right -- I forgot the mandatory CONTEXT-LOG block. Let me add it now.\n\nCONTEXT-LOG: actual footer"
+        result = chat_audit.audit_turn(text, has_user_message_after_first=False)
+        self.assertEqual(result['context_log_mentions'], 1)  # One outside the footer
+        self.assertTrue(result['has_violations'])
+
+    def test_does_not_count_footer_as_mention(self):
+        import chat_audit
+        # The actual CONTEXT-LOG footer should not be counted
+        text = "Here's my answer.\n\nCONTEXT-LOG: distilled summary"
+        result = chat_audit.audit_turn(text, has_user_message_after_first=False)
+        self.assertEqual(result['context_log_mentions'], 0)
+        self.assertFalse(result['has_violations'])
+
+    def test_clean_text_has_no_violations(self):
+        import chat_audit
+        text = "I checked the branches and found 12 approved, 3 needs-work."
+        result = chat_audit.audit_turn(text, has_user_message_after_first=False)
+        self.assertEqual(result['youre_right_count'], 0)
+        self.assertEqual(result['context_log_mentions'], 0)
+        self.assertFalse(result['has_violations'])
+
+
 class RecordTurnErrorTest(unittest.TestCase):
     """record_turn_error() -- a failed turn's error lands IN the stored transcript (it used
     to exist only as a 3-second toast)."""

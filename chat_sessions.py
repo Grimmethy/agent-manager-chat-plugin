@@ -484,6 +484,7 @@ def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
                 "access to these additional repos:\n" + _roots_blurb(session)
             )
         preamble_parts.append(_FRESHNESS_RULES)
+        preamble_parts.append(_BEHAVIORAL_RULES)
         agents_md = _read_agents_md(session)
         if agents_md:
             preamble_parts.append(_agents_md_blurb(agents_md))
@@ -568,6 +569,23 @@ _PROJECT_RULES = (
     "File a task about another repo with queue_reviewed_task(project=<label>) and read, search or unstick tasks of that project with the same `project` argument "
     "(search_tasks accepts project \"all\"). If you are unsure which project a change belongs to, ask the user. "
     "Never file a task about repo X into another project's queue: the tool refuses a task whose file paths clearly belong to another project, and tells you which one."
+)
+
+# 2026-10-29 (walkthrough): the chat invented user reactions ("You're right" 14 times),
+# narrated its own protocol (4 times), and looped on filler ("continue verifying..." 16 times)
+# between tool calls. This rule is added to the system prompt to prevent the model from
+# addressing the user as if they had replied between tool calls, apologizing unless the user
+# pointed at a specific mistake, or mentioning internal protocol blocks in streamed text.
+# The deterministic audit (chat_audit.py) counts these violations per turn and stores the
+# counts in the turn record for tracking.
+_BEHAVIORAL_RULES = (
+    "Behavioral rules for stream integrity (mandatory, not optional):\n"
+    "- Do NOT address the user as if they had replied between your tool calls. The user sends one message per turn; do not invent their reactions, agreement, or frustration.\n"
+    "- Do NOT apologize unless the user explicitly pointed at a specific mistake in their message. Do not preemptively apologize for potential errors.\n"
+    "- Do NOT mention internal protocol blocks (CONTEXT-LOG, TASK-REF, SIDE-FINDING, AMPLIFY) in your streamed text. These are internal markers, not user-facing content.\n"
+    "- Do NOT repeat filler phrases between tool calls. Each tool call should be followed by a direct, concise response related to that tool's output.\n"
+    "- Keep your responses focused on the user's actual question. Do not narrate your thought process or protocol to the user.\n"
+    "These rules prevent the chat from appearing confused about who said what and reduce noise in the conversation history."
 )
 
 _LOCAL_SYSTEM_PROMPT = (
@@ -680,6 +698,7 @@ _LOCAL_SYSTEM_PROMPT = (
     "block in a code fence.\n\n"
     + _FRESHNESS_RULES
     + "\n\n" + _PROJECT_RULES
+    + "\\n\\n" + _BEHAVIORAL_RULES
 )
 
 
@@ -1146,6 +1165,22 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     # 2026-10-28 (HUB0027): strip chatter (apology text) from the stored answer,
     # and add display_text with footers stripped for UI consumption.
     reply = _strip_chatter(reply)
+    
+    # 2026-10-29 (walkthrough): run deterministic audit on the turn's text to count
+    # behavioral violations (invented user reactions, protocol narration, filler loops).
+    # The audit result is stored in the turn record for tracking and alerting.
+    try:
+        import chat_audit
+        # Determine if this turn has a user message after the first (multi-turn exchange)
+        # by checking if the transcript has more than one user message before this assistant turn
+        transcript = session["transcript"]
+        user_message_count = sum(1 for t in transcript if t.get("role") == "user")
+        has_user_after_first = user_message_count > 1
+        audit_result = chat_audit.audit_turn(reply, has_user_message_after_first=has_user_after_first)
+        session["transcript"][-1]["audit"] = audit_result
+    except ImportError:
+        # chat_audit not available (e.g., in tests); skip audit silently
+        pass
     
     # Store the full text (with footers) in the transcript for persistence
     session["transcript"][-1]["text"] = reply.strip()
