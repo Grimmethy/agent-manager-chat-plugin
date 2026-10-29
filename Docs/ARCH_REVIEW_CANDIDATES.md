@@ -2283,3 +2283,18 @@ No more confusion when the env var is unset, and a clearer failure mode — the 
 ---
 
 NOTE: Flag 1 (AC-001) was addressed by explicitly identifying all callers (`app.py` and `chat_sessions.py`) and specifying the exact import and exception handling changes needed for each. Flag 2 (AC-002) was addressed by replacing the fallback with a clear `RuntimeError` that explains what's needed, rather than leaving a `KeyError` at module import time.
+
+### AC-168 · Decouple handoff.py from chat_sessions.py's internal row structure
+Strength: Strong
+Files: handoff.py, chat_sessions.py
+
+Problem:
+handoff.py's `_is_plain_row` function hardcodes knowledge of chat_sessions.py's internal row representation by checking for `error` and `marker` keys, claiming these are "the exact two skips chat_sessions._build_local_messages uses." This creates an implicit coupling where if chat_sessions.py changes what it marks as errors or markers, handoff.py silently breaks without any test in this community verifying the contract.
+
+Solution:
+Extract the row-filtering logic into a shared utility or define an explicit interface. Either (a) move `_is_plain_row` into chat_sessions.py and export it as a public helper, or (b) pass a filter function as a parameter to `build_handoff`. This makes the contract explicit and testable.
+
+Benefits:
+Eliminates silent desynchronization between modules. The coupling becomes explicit and can be tested. Future changes to chat_sessions.py's internal representation won't break handoff.py without detection.
+
+NOTE: No flags were applied because the critique found no issues with the draft.
