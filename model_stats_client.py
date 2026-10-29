@@ -35,14 +35,15 @@ def _run_event(event: str, payload: dict):
 
 
 def record_call(task_id: str, model: str, latency_ms: int, stage: str = "discuss",
-                 result: dict = None, started_at: str = None, source: str = None) -> str:
+                 result: dict = None, started_at: str = None, source: str = None,
+                 instance_id: str = None) -> str:
     """Call once per interactive-session model call. Returns a callId for a later
     record_outcome() (there usually isn't one for free-form chat -- discuss/grill
     sessions have no approve/reject verdict -- so most callers just keep the callId
     unused; it's still useful as a stable row identifier if a caller wants it)."""
     call_id = str(uuid.uuid4())
     result = result or {}
-    _run_event("record-call", {
+    payload = {
         "callId": call_id,
         "taskId": task_id,
         "stage": stage,
@@ -56,7 +57,10 @@ def record_call(task_id: str, model: str, latency_ms: int, stage: str = "discuss
         "degenerate": result.get("degenerate"),
         "turnsUsed": result.get("turnsUsed"),
         "source": source,
-    })
+    }
+    if instance_id is not None:
+        payload["instanceId"] = instance_id
+    _run_event("record-call", payload)
     return call_id
 
 
