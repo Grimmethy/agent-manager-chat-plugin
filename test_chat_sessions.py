@@ -537,5 +537,74 @@ class EnforceFooterTest(unittest.TestCase):
         self.assertFalse(chat_sessions._has_footer("no footer here"))
 
 
+class ChatRecordCallTest(unittest.TestCase):
+    """Chat turns must record with the live session id and a 'chat' instance id."""
+
+    def test_stream_local_passes_session_id_and_chat_instance(self):
+        """_stream_local must call record_call with the session id and instance_id='chat'."""
+        with mock.patch.object(chat_sessions.model_stats_client, "record_call") as patched:
+            session = _session()
+            # _stream_local is a generator; must iterate it to reach record_call
+            with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools",
+                                   lambda **kw: iter([{
+                                       "type": "chunk", "text": "x",
+                                   }, {
+                                       "type": "final", "response": "x", "turnsUsed": 1,
+                                       "forcedSummary": False,
+                                   }])):
+                "".join(chat_sessions._stream_local(session, "hi"))
+        patched.assert_called_once()
+        call_kwargs = patched.call_args
+        # Positional: task_id, model, latency_ms
+        task_id = call_kwargs[0][0]
+        # Keyword: stage, source, instance_id
+        self.assertEqual(task_id, session["id"])
+        self.assertEqual(call_kwargs[1].get("instance_id"), "chat")
+        self.assertEqual(call_kwargs[1].get("source"), "chat")
+        self.assertEqual(call_kwargs[1].get("stage"), "chat")
+
+    def test_record_call_accepts_instance_id(self):
+        """model_stats_client.record_call should accept instance_id and forward it."""
+        with mock.patch("chat_sessions.model_stats_client._run_event") as patched_run:
+            chat_sessions.model_stats_client.record_call(
+                "chat-abc", "test-model", 100, instance_id="chat",
+            )
+        payload = patched_run.call_args[0][1]
+        self.assertEqual(payload["taskId"], "chat-abc")
+        self.assertEqual(payload["instanceId"], "chat")
+
+    def test_record_call_legacy_call_without_instance_id_still_records(self):
+        """A call with no instance_id (legacy path) should still produce a row -- no crash."""
+        with mock.patch("chat_sessions.model_stats_client._run_event") as patched_run:
+            chat_sessions.model_stats_client.record_call(
+                "some-task", "test-model", 100,
+            )
+        payload = patched_run.call_args[0][1]
+        self.assertEqual(payload["taskId"], "some-task")
+        # instanceId should be absent (not None) when caller didn't pass one
+        self.assertNotIn("instanceId", payload)
+
+    def test_record_call_mutation_safety(self):
+        """Mutating the session id source after record_call must not change the recorded task_id."""
+        # Hold the session id in a mutable container so we can mutate it after the call.
+        session_id_holder = ["chat-test-session"]
+        with mock.patch("chat_sessions.model_stats_client._run_event") as patched_run:
+            # f-string is evaluated at call time, capturing the string
+            chat_sessions.model_stats_client.record_call(
+                session_id_holder[0], "test-model", 100, instance_id="chat",
+            )
+        recorded_task_id = patched_run.call_args[0][1]["taskId"]
+        # Now mutate the holder
+        session_id_holder[0] = "chat-MUTATED"
+        # The recorded value should still be the original captured string
+        self.assertEqual(recorded_task_id, "chat-test-session")
+        # A fresh call would pick up the mutated value
+        with mock.patch("chat_sessions.model_stats_client._run_event") as patched_run2:
+            chat_sessions.model_stats_client.record_call(
+                session_id_holder[0], "test-model", 100, instance_id="chat",
+            )
+        self.assertEqual(patched_run2.call_args[0][1]["taskId"], "chat-MUTATED")
+
+
 if __name__ == "__main__":
     unittest.main()
