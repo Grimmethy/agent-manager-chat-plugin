@@ -482,6 +482,52 @@ def api_chat_reserve(session_id):
     return jsonify(session)
 
 
+@chat_bp.route("/api/chat/<session_id>/reserve/reconcile", methods=["POST"])
+def api_chat_reserve_reconcile(session_id):
+    """Operator-only reconciliation endpoint (AC-19): force the local 'reserved' flag
+    to agree with either the core server's reservation state or the local state.
+
+    Body: { "action": "trust-server" } or { "action": "trust-local" }.
+
+    - `trust-server`: set local reserved=True to match the server (the server is the
+      source of truth for the GPU lock).
+    - `trust-local`: set local reserved=False to match the local state, then best-effort
+      release the server-side reservation. If the release fails (InternalApiError), log
+      a warning and continue -- the local state is now consistent, the server release
+      is a nice-to-have.
+
+    Errors:
+    - 400 if the body is missing or the action is not one of the two valid strings.
+    - 404 if the session does not exist or is not active.
+
+    Returns the updated session JSON on success so the operator can confirm the change.
+    """
+    from app import CHAT_STORAGE_DIR
+    import ollama_client
+    from chat_sessions import get_session, set_reserved
+    from internal_api_client import InternalApiError, reserve as internal_reserve
+
+    data = request.get_json(silent=True) or {}
+    action = data.get("action")
+    if action not in ("trust-server", "trust-local"):
+        return jsonify({"ok": False, "error": "Missing or invalid 'action' (expected 'trust-server' or 'trust-local')"}), 400
+
+    session = get_session(CHAT_STORAGE_DIR, session_id)
+    if session is None or session.get("status") != "active":
+        return jsonify({"ok": False, "error": "Session not found or no longer active"}), 404
+
+    if action == "trust-server":
+        set_reserved(CHAT_STORAGE_DIR, session_id, True)
+    else:  # trust-local
+        set_reserved(CHAT_STORAGE_DIR, session_id, False)
+        try:
+            internal_reserve(session_id, ollama_client.MODEL(), False)
+        except InternalApiError as e:
+            logger.warning("[chat-reconcile] best-effort reservation release failed (non-fatal): %s", e)
+
+    return jsonify(session)
+
+
 def _public_session(session):
     """The session dict with any token / tokenFile key stripped -- HUB0008 7/11: no
     token or tokenFile ever leaves the server in a swap response. A session should

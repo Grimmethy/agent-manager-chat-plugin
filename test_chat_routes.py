@@ -472,5 +472,62 @@ class TerminalSessionsMultiHostRouteTest(unittest.TestCase):
         resp.close()
 
 
+class ReconcileRouteTest(RouteTestBase):
+    """AC-19: POST /api/chat/<session_id>/reserve/reconcile admin endpoint.
+
+    Tests the two reconciliation actions (trust-server, trust-local), the 404 paths
+    (missing session, inactive session), and the 400 paths (missing/unknown action).
+    """
+
+    def _post_reconcile(self, body, sid=SID):
+        return self.client.post(f"/api/chat/{sid}/reserve/reconcile", json=body)
+
+    def test_trust_server_action(self):
+        """trust-server: set_reserved should be called with True."""
+        self._store([])
+        with mock.patch.object(chat_sessions, "set_reserved") as mock_set:
+            resp = self._post_reconcile({"action": "trust-server"})
+        self.assertEqual(resp.status_code, 200)
+        mock_set.assert_called_once_with(self.storage, SID, True)
+
+    def test_trust_local_action(self):
+        """trust-local: set_reserved should be called with False, and internal_api_client.reserve
+        should be called best-effort with False."""
+        self._store([])
+        with mock.patch.object(chat_sessions, "set_reserved") as mock_set, \
+                mock.patch.object(__import__("internal_api_client"), "reserve") as mock_reserve:
+            resp = self._post_reconcile({"action": "trust-local"})
+        self.assertEqual(resp.status_code, 200)
+        mock_set.assert_called_once_with(self.storage, SID, False)
+        mock_reserve.assert_called_once()
+        # Verify the call args: session_id, model, on=False (all positional)
+        call_args = mock_reserve.call_args
+        self.assertEqual(call_args[0][0], SID)  # reservation_id
+        self.assertEqual(call_args[0][2], False)  # on=False
+
+    def test_missing_session_returns_404(self):
+        """404 when session does not exist."""
+        with mock.patch.object(chat_sessions, "get_session", return_value=None):
+            resp = self._post_reconcile({"action": "trust-server"})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_inactive_session_returns_404(self):
+        """404 when session is not active."""
+        inactive_session = {"status": "ended", "reserved": False}
+        with mock.patch.object(chat_sessions, "get_session", return_value=inactive_session):
+            resp = self._post_reconcile({"action": "trust-server"})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_missing_action_returns_400(self):
+        """400 for missing action key."""
+        resp = self._post_reconcile({})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_unknown_action_returns_400(self):
+        """400 for unknown action value."""
+        resp = self._post_reconcile({"action": "bogus"})
+        self.assertEqual(resp.status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()
