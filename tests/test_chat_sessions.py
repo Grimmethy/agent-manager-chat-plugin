@@ -325,5 +325,45 @@ class TestStreamingEdgeCases(unittest.TestCase):
         self.assertEqual(start_names, end_names)
 
 
+class StreamMessageTurnTranscriptTest(unittest.TestCase):
+    """What _stream_message_turn SAVES after coalescing chunks, not just what it yields."""
+
+    def _run(self, items, tmp):
+        def fake_local(session, message, result_box=None):
+            yield from items
+        with mock.patch.object(chat_sessions, "_stream_local", fake_local):
+            return list(chat_sessions._stream_message_turn(Path(tmp), _session(), "hi"))
+
+    def test_saved_reply_is_the_text_once_when_the_model_sets_no_final_text(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._run(["Hello ", "world", "!"], tmp)
+        chunks = "".join(e["text"] for e in out if e.get("type") == "chunk")
+        self.assertEqual(chunks, "Hello world!")
+        final = out[-1]["session"]
+        self.assertEqual(final["transcript"][-1]["text"], "Hello world!")
+
+    def test_text_around_a_tool_event_is_saved_once_and_in_order(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._run(["Before ", {"type": "tool_start", "name": "Read", "summary": "x"}, {"type": "tool_end", "name": "Read", "ok": True, "summary": "y"}, "after"], tmp)
+        self.assertEqual(out[-1]["session"]["transcript"][-1]["text"], "Before after")
+        kinds = [e["type"] for e in out]
+        self.assertEqual(kinds, ["chunk", "tool_start", "tool_end", "chunk", "final"])
+
+    def test_the_placeholder_is_rewritten_with_the_running_text_each_chunk(self):
+        import tempfile
+        seen = []
+        real = chat_sessions._write_session
+        def spy(storage_dir, session):
+            seen.append(session["transcript"][-1]["text"])
+            return real(storage_dir, session)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(chat_sessions, "_write_session", spy):
+            self._run(["ab", "cd"], tmp)
+        self.assertIn("ab", seen)
+        self.assertIn("abcd", seen)
+        self.assertNotIn("ababcd", seen)
+
+
 if __name__ == "__main__":
     unittest.main()

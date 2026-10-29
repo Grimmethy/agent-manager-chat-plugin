@@ -1154,10 +1154,8 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
             """Flush the current coalescing buffer as a single chunk event."""
             nonlocal coalesce_buffer, coalesce_chars, coalesce_last_time
             if coalesce_buffer:
+                # reply_parts and the persisted placeholder already took each item on arrival (below); this only frames them for the stream.
                 combined = "".join(coalesce_buffer)
-                reply_parts.append(combined)
-                session["transcript"][-1]["text"] = "".join(reply_parts)
-                _write_session(storage_dir, session)
                 yield {"type": "chunk", "text": combined}
                 coalesce_buffer = []
                 coalesce_chars = 0
