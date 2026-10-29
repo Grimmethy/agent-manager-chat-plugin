@@ -2376,3 +2376,42 @@ Benefits:
 - No behavior change for callers that don't need exit-code validation
 
 NOTE: AC-501 corrected to remove the unsupported assumption about test runner configuration and retain the sys.path.insert workaround in the canonical location.
+
+### AC-502 · Centralize HTML-escaping helper across view files
+Strength: Strong
+Files: static/commands-view.js, static/tools-view.js
+
+Problem:
+Both commands-view.js and tools-view.js define an identical `esc` function that HTML-escapes five characters (`&`, `<`, `>`, `"`, `'`). The escaping contract lives in two places, so any change to the escaping rules — adding a character, switching to a library, or tightening the behavior — requires updating both files in lockstep. Missing one creates an XSS gap in one view but not the other, which is a real correctness hazard.
+
+Solution:
+Create a new shared utility module (e.g., `utils.js` in the same directory) containing the `esc` function, and import it in both view files. This centralizes the escaping contract so that future changes require editing only one location.
+
+Benefits:
+Eliminates the duplication, ensures consistent escaping behavior across views, and removes the risk of an XSS gap caused by forgetting to update one file when the escaping rules change.
+
+### AC-503 · Unify session key format across attention-view.js and sessions-view.js
+Strength: Strong
+Files: static/attention-view.js, static/sessions-view.js
+
+Problem:
+`attention-view.js` defines `keyOf(row)` which returns `host/id` only when a host exists, falling back to bare `id`. `sessions-view.js` defines `rowKey(row)` which always returns `host/id`, even when host is empty (producing `'/123` for a row with no host). Within sessions-view.js there are already two key formats, and across the two files there are three. The attention system and terminal switcher coordinate on "which session needs you" — using different key formats for the same concept is a real source of bugs when the two systems are compared or merged.
+
+Solution:
+Pick one canonical key format (either always `host/id` or conditional `host/id` with fallback to `id`) and align both files to use it. Update `keyOf` in attention-view.js and `rowKey` in sessions-view.js to match, and ensure `jumpTarget` in sessions-view.js uses the same format.
+
+Benefits:
+Eliminates the inconsistency, reduces the risk of bugs when comparing or merging session identifiers across the two systems, and simplifies the mental model for developers working on session coordination.
+
+### AC-504 · Deduplicate filter logic in sessions-view.js
+Strength: Strong
+Files: static/sessions-view.js
+
+Problem:
+`filterRows` and `filterChats` in sessions-view.js are structurally identical: both take `(rows, query)`, both trim/lowercase the query, both return `rows` unchanged for empty input, and both do a case-insensitive substring match — they just search different fields. The duplication is ~15 lines of identical control flow per function. Adding a new field to search (e.g., model name for terminal rows) requires editing both functions, and keeping them in sync is a maintenance burden.
+
+Solution:
+Extract the common filtering logic into a single helper function that accepts a field name or accessor function as a parameter. Both `filterRows` and `filterChats` can then delegate to this helper with the appropriate field configuration.
+
+Benefits:
+Reduces code duplication, ensures consistent filtering behavior across both functions, and makes it easier to add new searchable fields without risking inconsistencies between the two filter functions.
