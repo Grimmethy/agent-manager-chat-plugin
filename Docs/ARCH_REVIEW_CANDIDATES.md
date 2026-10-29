@@ -560,3 +560,1858 @@ In each of the three handlers, delete the `import ollama_client` line and change
 
 Benefits:
 The routing layer is now provider-agnostic: it depends only on internal_api_client and the shared app helpers, not on a specific model-client module. Adding or swapping the local model provider later requires no changes to route files.
+
+### AC-43 · Centralize the Node CLI subprocess wrapper into a shared helper
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` independently implement the identical subprocess execution pattern for invoking Node.js CLI scripts: generating a UUID, serializing a JSON payload to a temporary file, constructing and executing a `node` command with a timeout, and cleaning up the temporary file in a `finally` block. This duplication means any change to the execution protocol—such as adding a retry mechanism, altering the payload schema, adjusting timeout defaults, or switching the cleanup strategy—must be made in two places, and a miss in either file silently diverges behavior between the two clients.
+
+Solution:
+Extract the mechanical subprocess-execution steps into a single shared utility function (for example, `_run_node_cli(script_path, args, json_payload, timeout)`) placed in a common module that both clients already depend on. Each client then calls this helper, passing only its own script path, argument list, and payload, while the helper owns UUID generation, temp-file I/O, the `subprocess.run` call with timeout, and guaranteed cleanup in a `finally` block.
+
+Benefits:
+Eliminates the duplicated logic entirely, so there is exactly one code path for Node CLI invocation. Cross-cutting concerns—structured logging, metrics emission, error-classification, or future migration to a different transport—can be added in a single location. The two client modules become thinner, more readable, and easier to unit-test by mocking one helper rather than two near-identical blocks.
+
+### AC-44 · Decouple client modules from `app.py`'s module-level state
+Strength: Strong
+Files: claude_client.py, model_stats_client.py, app.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` import `CORE_REPO_ROOT` directly from `app.py`, which is the Flask application entry point. This forces any consumer of the client modules to import the entire Flask app—its routes, its extensions, its configuration side-effects—just to obtain a filesystem path. It makes the clients untestable in isolation (a unit test must boot or at least import the Flask app), and it inverts the natural dependency direction: low-level utility modules should not depend on the web-application layer.
+
+Solution:
+Move the `CORE_REPO_ROOT` resolution logic (the `os.path` / `pathlib` computation that determines the repository root) into a small, dependency-free module such as `paths.py` or `config.py`. Both `app.py` and the two client modules then import `CORE_REPO_ROOT` from that shared module instead of from `app.py`. The Flask app retains its role as the HTTP entry point, while the path constant lives in a layer that has no web-framework dependency.
+
+Benefits:
+The client modules become importable and testable without pulling in Flask, its extensions, or any route registration. The dependency graph becomes acyclic and directionally correct (clients → shared config; app → shared config), which simplifies refactoring, static analysis, and future extraction of the clients into a standalone package. It also removes a hidden coupling that would break if `app.py` were ever renamed, split, or replaced by a different web framework.
+
+### AC-45 · Duplicated atomic-write protocol between `write_snapshot` and `_atomic_write`
+Strength: Strong
+Files: (module containing `write_snapshot` and `_atomic_write`; test file exercising `_write_raw_sample_once`)
+
+Problem:
+`write_snapshot` and `_atomic_write` implement the identical atomic-write protocol line-for-line: `os.makedirs` → `os.open(tmp, …O_EXCL, 0o600)` → `json.dump` → `os.replace` → `unlink`-on-failure. The only difference in the *write* portion is the object handed to `json.dump`—`write_snapshot` builds it inline (`{**rec, "observedAt": int(time.time())}`) while `_atomic_write` receives a pre-built `obj`. This means any protocol-level change (adding `os.fsync(fd)` before `os.replace` for crash-durability, switching the tmp suffix from `.{pid}` to a UUID for multi-process safety, adjusting the `O_EXCL` flag, or adding a `"schema_version"` key) must be made in two places in the same file, and a missed copy silently leaves one path with the old, weaker guarantee.
+
+Solution:
+Keep `write_snapshot`'s pre-write idempotency check (read the existing file, compare `contextWindowSize` and `model`, return `False` early if unchanged) in place. Replace only the duplicated *write* portion—the `os.makedirs` → `os.open` → `json.dump` → `os.replace` → `unlink`-on-failure block—with a single call to `_atomic_write`. Concretely, the tail of `write_snapshot` (after the diff-check and the `return False` early-exit) becomes:
+
+```python
+return _atomic_write(directory, rec["sessionId"] + ".json",
+                     {**rec, "observedAt": int(time.time())})
+```
+
+This eliminates the ~12 lines of duplicated protocol code while preserving `write_snapshot`'s full observable contract: it still returns `False` (without touching the filesystem) when the window size and model are unchanged, and it still performs the atomic write and returns `True` (or the path, matching `_atomic_write`'s return) when a change is detected. `_atomic_write` becomes the single owner of the write protocol; `write_snapshot` remains a thin adapter that adds the snapshot-specific diff-check and payload construction.
+
+Benefits:
+A single implementation of the atomic-write protocol means any future durability, concurrency, or schema change is made in exactly one place. The subtle divergence risk (one path gets a new key or flag, the other doesn't) is eliminated. The module's public surface and test coverage remain unchanged—`write_snapshot` still accepts the same arguments, still returns `False` on a no-op (as asserted by `test_writes_only_when_window_or_model_changed`), and still produces the same on-disk result on a real write—so no caller or test needs modification.
+
+### AC-46 · Centralize the Node subprocess invocation pattern in a shared helper
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` independently implement the identical "write JSON payload to a temp file, execute `node <script> <file>`, and clean up the temp file" pattern. Each module duplicates the `tempfile` creation, `json.dumps` serialization, `subprocess.run` configuration (including timeout and argument assembly), and the `finally`-block cleanup of the temporary file. This duplication means any change to the invocation contract—adding a timeout, switching to stdin instead of a file, adjusting environment variables—must be made in two places, and the two copies can silently drift apart.
+
+Solution:
+Introduce a single shared utility function (e.g., `run_node_cli(script_path, args, payload)`) in a new `node_bridge.py` module (or within `app.py` if a separate module is undesirable). This function owns the full temp-file lifecycle: it serializes the payload, writes it to a temp file, invokes the Node script via `subprocess.run` with a configurable timeout, captures and parses stdout, and guarantees temp-file cleanup in a `finally` block. Both `claude_client.py` and `model_stats_client.py` are refactored to call this helper instead of inlining the pattern.
+
+Benefits:
+Eliminates duplicated boilerplate across the two modules, ensures consistent timeout, environment, and cleanup behavior for every Node bridge call, and provides a single choke point where cross-cutting concerns—structured logging, metrics emission, or future transport changes—can be added once and apply everywhere.
+
+### AC-47 · Unify the error-handling contract for Node subprocess failures
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+`claude_client.py` raises a custom `ClaudeClientError` with distinct messages for timeouts and non-zero exits, while `model_stats_client.py` silently swallows all errors (logging only a warning) so that stats recording never breaks the main feature. The two modules thus present fundamentally different failure semantics for the same underlying operation. The deliberate "swallow" choice in `model_stats_client.py` is implicit—there is no shared location documenting why it differs from `claude_client.py`—making it easy for a future contributor to "fix" the inconsistency by propagating the error and inadvertently breaking the stats path, or to miss a real subprocess failure because the logging level is insufficient.
+
+Solution:
+Define a standardized `NodeBridgeError` in the shared `node_bridge.py` helper (from AC-001) that is raised for every failure mode: timeout, non-zero exit, and JSON parse error on stdout. `claude_client.py` catches `NodeBridgeError` and re-raises it as `ClaudeClientError`, preserving its current caller-facing contract. `model_stats_client.py` catches `NodeBridgeError`, logs a warning with the original message, and returns a safe default. The intentional divergence is now explicit, localized to the two call-sites, and the shared helper guarantees that no failure mode can slip through unhandled.
+
+Benefits:
+Provides a single, auditable point for Node subprocess error handling. Makes the deliberate choice to swallow errors in `model_stats_client.py` explicit rather than implicit, reducing the risk of accidental error propagation or inconsistent logging. Any new consumer of the Node bridge inherits a well-defined error type and must consciously choose its propagation strategy, preventing future silent-failure regressions.
+
+### AC-48 · Decouple save_proposal from the session object
+Strength: Worth exploring
+Files: template_store.py
+
+Problem:
+The `save_proposal` function in `template_store.py` accepts `session`, `entry_index`, and `tpl_index` to locate and mutate a specific proposal within the nested session structure. This requires `template_store` to understand the internal layout of the session object (specifically the path `session["transcript"][entry_index]["templates"][tpl_index]`). While the function does not persist the session (the caller handles that), it is tightly coupled to the session's structure for the mutation step. If the session layout changes (e.g., `transcript` is renamed or `templates` is moved), `save_proposal` will break. The multi-index access pattern is also prone to `IndexError` or `KeyError` if indices are stale or incorrect, and the function’s responsibility is mixed: it both navigates the session structure and updates the proposal.
+
+Solution:
+Change `save_proposal` to accept the `proposal` dictionary directly instead of the `session` and indices. The caller (the route handler) should extract the proposal from the session using the indices it already has from the UI context, then pass the proposal object to `save_proposal`. The function updates the proposal's status and message fields in place and returns the updated proposal. This decouples `template_store` from the session's internal structure and shifts the index-lookup responsibility to the caller, which already has the indices and is responsible for session persistence.
+
+Benefits:
+The `template_store` module becomes more modular and easier to unit-test in isolation, since a test can construct a minimal proposal dict without fabricating an entire session tree. The routing layer retains sole responsibility for session structure navigation and persistence, which is its domain. The function signature is cleaner, and the index-lookup logic is centralized in the caller, reducing the risk of `template_store` breaking due to session layout changes.
+
+### AC-49 · Replace check-then-add with an atomic save in save_template
+Strength: Worth exploring
+Files: template_store.py
+
+Problem:
+The `save_template` function performs a two-step process: it first issues a `GET`-like request (`action: "get"`) to check whether the key already exists, then issues a `POST` request (`action: "add"`) to create it. Between these two round-trips there is a race window in which another process could insert the same key, causing the subsequent `add` to fail or silently overwrite. The pattern also doubles the network overhead for what is logically a single operation. The "already exists" handling is in the first interaction (the `get` call), but the overall flow is not atomic.
+
+Solution:
+If the target `/api/entry` endpoint supports an atomic upsert or `add_if_not_exists` action, replace the two-step sequence with that single call. If the API does not offer such an action, the current two-step flow should be explicitly documented as a known limitation with a TODO referencing the API gap. The draft’s proposed alternative of relying on a 409 Conflict error from the `add` call is not recommended because the `add` endpoint may not return a 409 for "already exists"—it may return a different error or succeed with an overwrite (which the current code explicitly prevents).
+
+Benefits:
+Eliminates the race condition window, reducing the chance of a spurious failure under concurrent writes. Cuts one network round-trip from the happy path, lowering latency. Consolidates the "already exists" decision into a single atomic operation, making the function easier to reason about and test.
+
+### AC-50 · Extract duplicated SSE event parsing into a shared test helper
+Strength: Worth exploring
+Files: test_chat_routes.py
+
+Problem:
+Multiple test methods in `test_chat_routes.py` (e.g. `test_a_crashed_turn_streams_an_error_event_and_persists_an_error_entry`, `test_classified_claude_error_gets_swapoffer_and_a_0600_sample`) each manually split the response body, strip the `data: ` SSE prefix, and `json.loads` each line to extract events. This parsing logic is copy-pasted across several tests. While the logic is trivial and identical in all copies, a change to the SSE wire format (e.g. adding an `event:` field or changing the delimiter) would require touching every test individually. Centralizing the parsing logic reduces the risk of divergence and makes the tests easier to maintain.
+
+Solution:
+Introduce a small helper function (e.g. `parse_sse_events(response) -> list[dict]`) at the top of `test_chat_routes.py`. The helper accepts the raw response object, splits on the SSE line delimiter, strips the `data: ` prefix, deserialises each payload, and returns a list of event dictionaries. Every test that currently inlines this logic is refactored to call the helper. Since the tests are in a single file, a shared test-utility module is not necessary.
+
+Benefits:
+Removes the duplicated parsing code, making each test body shorter and focused on its actual assertion. A future change to the SSE format requires updating exactly one function rather than N test methods. Reduces the risk of a test passing while inadvertently skipping or mis-parsing an event due to a subtle copy-paste divergence in the inline logic.
+
+### AC-51 · Duplicated Node.js subprocess and temp-file lifecycle logic
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` independently implement the same low-level pattern for invoking Node.js scripts: generating a UUID-based temporary file, serializing a JSON payload into it, calling `subprocess.run` with a timeout, and attempting to unlink the file in a `finally` block. Because the mechanics are copy-pasted rather than shared, any change to the timeout strategy, the temp-file naming scheme, the cleanup path, or the subprocess arguments must be manually replicated in both modules. This duplication increases the surface area for subtle divergence—for example, one module might tighten its timeout or add a retry while the other is left behind—making the two integration points harder to audit and more likely to drift out of sync over time.
+
+Solution:
+Extract the shared subprocess-and-temp-file mechanics into a single utility function (e.g., `run_node_script(script_path, payload, timeout)`) that encapsulates UUID temp-file creation, JSON serialization, `subprocess.run` invocation with the given timeout, and guaranteed cleanup in a `finally` block. The utility should return the raw subprocess result (return code, stdout, stderr) without performing any error handling or exception raising. Both `claude_client.py` and `model_stats_client.py` would then delegate to this one utility for the execution mechanics, while retaining their own distinct logic for interpreting the result: `claude_client.py` would raise `ClaudeClientError` with specific stderr text on failure, and `model_stats_client.py` would log and return `None` on failure. This preserves the distinct operational contracts of each module while eliminating the duplicated low-level code.
+
+Benefits:
+Eliminates the duplicated file-lifecycle and process-execution code, ensuring that timeout handling, temp-file cleanup, and subprocess invocation behave identically across all Node.js integrations. Future changes to the execution strategy (e.g., switching to `asyncio.create_subprocess_exec`, adding a retry loop, or changing the temp-file directory) require editing a single function rather than hunting for every copy, reducing the risk of one integration silently diverging from the others. The distinct error-handling contracts of each module remain intact and explicit, as the utility does not impose a unified error policy.
+
+### AC-52 · Inconsistent exception contracts for Node.js subprocess failures
+Strength: Strong
+Files: claude_client.py, model_stats_client.py
+
+Problem:
+The two modules treat subprocess failures in fundamentally different ways. `claude_client.py` raises a custom `ClaudeClientError` with descriptive messages for timeouts, non-zero exits, and non-JSON output, surfacing the failure to the caller. `model_stats_client.py`, by contrast, catches the same class of failure, logs a warning, and returns `None`, deliberately hiding the error so that a stats-collection hiccup never breaks the surrounding feature. A caller that has interacted with one client and then encounters the other must maintain two separate mental models of what "the Node script failed" means, and a developer debugging a silent `None` return in the stats path has no exception to inspect—only a log line that may have been lost in volume.
+
+Solution:
+Refactor the error-handling logic in both modules to be explicit and localized, without introducing a new shared exception type. In `claude_client.py`, ensure that all failure paths (timeout, non-zero exit, unparseable output) consistently raise `ClaudeClientError` with the specific stderr text from the Node script, preserving the module's stated intent to surface the Node script's own error messages directly. In `model_stats_client.py`, ensure that all failure paths consistently log a structured warning and return `None`, preserving its "never break the real feature" contract. This makes the distinct error contracts of each module explicit and easy to audit, without forcing them into a unified exception hierarchy that would contradict their design rationale.
+
+Benefits:
+Makes the distinct error-handling contracts of each module explicit and intentional, rather than implicit side-effects of duplicated code. Developers can easily understand and audit why `claude_client.py` fails loudly with specific error messages while `model_stats_client.py` swallows errors and returns `None`. This clarity reduces the risk of accidental divergence or misunderstanding of the modules' behavior, and it preserves the design rationale of each module without introducing unnecessary indirection.
+
+NOTE: Flag 1 was addressed by removing the proposal to introduce `NodeScriptError` and instead preserving `claude_client.py`'s direct use of `ClaudeClientError` with specific stderr text. Flag 2 was addressed by ensuring the `run_node_script` utility does not impose a unified error policy, allowing each module to retain its distinct operational contract.
+
+### AC-53 · Duplicated SSE event-parsing comprehension across test methods
+Strength: Worth exploring
+Files: test_chat_routes.py
+
+Problem:
+The extraction of SSE `data:` lines from a raw HTTP response body is copy-pasted verbatim in two separate test methods (`MessageRouteErrorTest.test_a_crashed_turn_streams_an_error_event_and_persists_an_error_entry` and `SwapOfferErrorTest._post_message`). Both use the identical list comprehension `[json.loads(line[len("data: "):]) for line in body.splitlines() if line.startswith("data: ")]`. Because the logic is not isolated in a shared helper, any future change to the SSE framing convention (e.g., a different prefix, multi-line data payloads, or a `event:` header) would require locating and updating every copy by hand, and a missed copy would silently produce wrong assertions rather than a clear failure.
+
+Solution:
+Introduce a small module-level helper in `test_chat_routes.py` (e.g., `def _parse_sse_events(body: str) -> list[dict]:`) that encapsulates the line-splitting, prefix-stripping, and JSON-decoding steps. Replace both inline comprehensions with calls to this helper. If the SSE contract is already defined elsewhere in the project, the helper can also be the single place where framing assumptions are documented.
+
+Benefits:
+A single source of truth for SSE parsing in the test suite means a framing change is a one-line edit. New tests that need to decode a streamed response can reuse the helper instead of re-deriving the logic, reducing the chance of a subtle mismatch (e.g., off-by-one in the prefix length) going unnoticed.
+
+### AC-54 · `save_proposal` reaches into a hard-coded session sub-path
+Strength: Strong
+Files: template_store.py
+
+Problem:
+`save_proposal` in `template_store.py` navigates directly into `session["transcript"][entry_index]["templates"][tpl_index]` with no intermediate accessor. The function therefore assumes a very specific nested shape of the chat-session object. If the transcript becomes a different container type, templates are relocated to a sibling key, or the index is out of range, the call raises an unhandled `KeyError` or `IndexError` that propagates to the caller with no context about which structural assumption was violated. The template store is thus tightly coupled to one particular session layout, making it fragile to any refactoring of the session model.
+
+Solution:
+Introduce a thin accessor (or a small dataclass / protocol) that the template store depends on instead of the raw session dict. For example, define a `TemplateSlot` protocol with `get_template(entry_index, tpl_index)` and `set_template(entry_index, tpl_index, value)` methods, and have the chat-session object implement it. `save_proposal` then calls through the protocol, and the session object is responsible for validating indices. On failure the accessor should raise `LookupError` (or a subclass thereof) with a descriptive message naming the missing key or out-of-range index—this preserves the existing contract that `test_bad_index_raises` in `test_template_store.py` asserts (`pytest.raises(LookupError)`). The current implementation already catches `IndexError`, `KeyError`, and `TypeError` and re-raises them as `LookupError`; the protocol simply moves that responsibility to the session object so the template store no longer needs to know which sub-path to walk.
+
+Benefits:
+The template store no longer breaks when the session's internal representation changes; only the session object's accessor implementation needs updating. Errors remain `LookupError` (satisfying the existing test suite) but become self-describing (naming the missing key or out-of-range index) rather than bare `KeyError`/`IndexError` traces. The protocol also makes the contract explicit and testable in isolation, and it opens the door to alternative session backends (e.g., a database-backed transcript) without touching template-store code.
+
+### AC-55 · Inconsistent timestamp comparison in session ordering
+Strength: Strong
+Files: (single file containing `secondsSince`, `orderSessions`, `nextSelectionAfterClose`)
+
+Problem:
+The file defines two different interpretations of "which timestamp is later." `secondsSince` correctly normalizes timestamps through `Date.parse`, handling ISO strings with arbitrary UTC offsets, `Date` objects, and raw millisecond values. However, `orderSessions`—which `nextSelectionAfterClose` delegates to for selecting the most recent remaining chat after a session close—sorts using raw lexicographic string comparison on the timestamp key. When two ISO strings carry different UTC offsets (e.g. `…T10:00:00+02:00` vs `…T09:00:00Z`), the string comparator and `Date.parse` disagree on ordering, causing `nextSelectionAfterClose` to potentially select the wrong row.
+
+Solution:
+Route the sort key in `orderSessions` through the same `Date.parse`-based numeric comparison that `secondsSince` already establishes. Concretely, replace the lexicographic `key(a) < key(b)` comparison with a numeric comparison of `Date.parse(key(a))` versus `Date.parse(key(b))`, falling back to the existing behavior for unparseable values. This gives the file a single, consistent interpretation of timestamp ordering.
+
+Benefits:
+`nextSelectionAfterClose` and any other consumer of `orderSessions` will always agree with `secondsSince` on which timestamp is more recent, eliminating a class of wrong-row-selection bugs that surface whenever session timestamps carry mixed UTC offsets. The fix is localized to the sort comparator and introduces no new API surface.
+
+### AC-56 · Centralize the Node CLI temp-file JSON invocation contract
+Strength: Strong
+Files: claude_client.py, model_stats_client.py, node_utils.py (new)
+
+Problem:
+`claude_client.py` and `model_stats_client.py` each independently implement the identical subprocess pattern: generate a UUID, serialize a JSON payload to a temporary file, invoke a `node` script located under `CORE_REPO_ROOT`, and unlink the file in a `finally` block. This duplication means any change to the temp-file lifecycle—adding a `0600` permission to prevent a local user from reading the payload before deletion, switching from a file-path argument to a stdin pipe, or adding structured logging—must be made in two places with no compiler or test to catch a missed update. The two implementations can silently drift, producing inconsistent behavior or a security gap in one path while the other is patched.
+
+Solution:
+Extract the shared pattern into a single utility function (e.g. `_run_node_cli(script_path, args, payload)`) placed in a new `node_utils.py` module. The function owns temp-file creation, the `subprocess.run` call, and the `unlink` cleanup. `claude_client.py` and `model_stats_client.py` then call this utility, passing only their specific script path and payload. The security hardening (file permissions, timeout enforcement) and any future protocol change (stdin pipe, structured logging) live in exactly one function.
+
+Benefits:
+The temp-file lifecycle is managed in a single location, eliminating the risk of divergent implementations. A protocol change to the Node CLI contract requires editing one function rather than hunting for every call site. Security best practices such as `os.chmod` on the temp file and subprocess timeout enforcement have one canonical home, and the two client modules become thinner, easier to review, and easier to unit-test by mocking a single seam. Placing the utility in a dedicated `node_utils.py` (rather than in `app.py`) keeps it free of Flask application dependencies, consistent with the decoupling goal in AC-002.
+
+### AC-57 · Decouple claude_client.py and model_stats_client.py from app.py's module-level state
+Strength: Strong
+Files: claude_client.py, model_stats_client.py, app.py, .venv/lib/python3.12/site-packages/flask/config.py
+
+Problem:
+Both `claude_client.py` and `model_stats_client.py` import `CORE_REPO_ROOT` directly from `app.py` (`from app import CORE_REPO_ROOT`). This forces the entire Flask application module to be imported—and its module-level side effects (such as `STATE_DIR.mkdir`, Flask app instantiation, and blueprint registration) to execute—before either low-level client can be used. A utility module that merely needs a filesystem path is thereby coupled to the application's initialization sequence, making it impossible to import, test, or reuse these clients in isolation (e.g. in a CLI tool, a test harness, or a different service) without triggering the full Flask app setup.
+
+Solution:
+Move the `CORE_REPO_ROOT` resolution logic into a small, dedicated `config.py` module. This module must encapsulate the *complete* resolution chain that currently lives in `app.py`: reading the `AGENT_MANAGER_CORE_REPO_ROOT` environment variable, applying the documented fail-open fallback to the hardcoded path when the variable is unset, and performing any file-existence checks that the current code performs. `config.py` exposes the resolved path as a module-level constant or a lazily-evaluated property. Both `app.py` and the two client modules import from `config.py` rather than one importing from the other. `app.py` still serves as the Flask entry point and blueprint loader, but the clients no longer depend on it for a configuration value.
+
+Benefits:
+`claude_client.py` and `model_stats_client.py` become standalone, importable modules with no Flask side effects, simplifying unit tests and enabling reuse outside the Flask process. The dependency graph becomes explicit: the clients depend on configuration, not on the application. It also removes the implicit requirement that `app.py`'s module-level code (directory creation, Flask app instantiation, blueprint registration) must succeed before any client function can be called, reducing the blast radius of a misconfigured environment. Because the full resolution logic (including the fail-open fallback) is preserved in `config.py`, the documented resilience contract is unchanged.
+
+### AC-58 · Make the fail-open CORE_REPO_ROOT fallback visible to operators
+Strength: Worth exploring
+Files: app.py (or config.py, per AC-002), claude_client.py, model_stats_client.py
+
+Problem:
+`app.py` defines `CORE_REPO_ROOT` with a hardcoded fallback path (`/media/model-cache/github/agent-manager`) when the `AGENT_MANAGER_CORE_REPO_ROOT` environment variable is unset. The source code explicitly documents this as an intentional fail-open design: the comment states the fallback exists so "a Chat turn still has SOMETHING to root itself at rather than erroring outright," mirroring the in-tree version's bare `PACKAGE_ROOT` fallback. This resilience contract is correct and must be preserved. However, when the fallback *is* engaged, there is no visible signal to the operator. The system silently runs in a degraded, machine-specific configuration. If the fallback directory does not exist on the current host, the failure surfaces later as an obscure `FileNotFoundError` or a `subprocess` error deep inside `claude_client.py` or `model_stats_client.py`, far from the root cause, and the operator has no prior indication that the configuration was not ideal.
+
+Solution:
+Preserve the fail-open fallback exactly as documented. In the `config.py` module (introduced by AC-002), when the environment variable is unset and the hardcoded fallback path is selected, emit a prominent one-time warning log (or structured event) at the point of resolution. The message should clearly state: the variable name that is unset, the fallback path being used, and that the system is operating in a degraded, non-portable configuration. For example: `"WARNING: AGENT_MANAGER_CORE_REPO_ROOT is unset; falling back to /media/model-cache/github/agent-manager. This is a machine-specific path and may not exist on this host."` The log fires once at import/first-use time, not on every call. No exception is raised; the system continues to function per the fail-open contract.
+
+Benefits:
+The documented fail-open resilience is fully preserved—the system still degrades gracefully and a Chat turn still has a root path to work with. Operators gain an immediate, self-explanatory signal that the configuration is not ideal, turning a silent, machine-specific assumption into a visible, actionable warning. When the fallback directory does not exist, the operator has already seen the warning and can diagnose the missing directory rather than encountering an opaque `FileNotFoundError` deep in a subprocess call. The error-handling philosophy is aligned: the system does not crash, but it does not hide the degraded state either.
+
+NOTE: Flag #3 was not applied because it explicitly states the issue is "not a problem" and requires no change. Flag #4 was addressed by removing the "or in `app.py`" alternative from AC-001's solution and committing to `node_utils.py`, which is consistent with AC-002's decoupling goal.
+
+### AC-59 · Redundant and divergent token-resolution logic
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+Both `list_all` and `open_events` independently read the token from the `agent_hosts` object and construct the `Authorization` header with identical inline logic. In addition, the module defines a `_headers()` helper that reads the token from `os.environ` rather than from the host object, creating a third, inconsistent code path that is currently unused by the main functions. This duplication means any future change to token handling (e.g., adding a refresh step, switching to a different credential source, or adding a scope parameter) must be applied in two or three places, and the divergent `_headers()` helper is a latent trap for a developer who assumes it is the canonical helper.
+
+Solution:
+Extract a single private helper, e.g. `_auth_headers(host)`, that reads the token from the `agent_hosts` object and returns a fully-populated headers dict (or an empty dict when no token is present). Replace the inline token logic in both `list_all` and `open_events` with a call to this helper, and remove the unused `_headers()` function (or, if it is intentionally kept for a different credential source, rename it clearly and document why it differs).
+
+Benefits:
+Token handling lives in exactly one place, eliminating the risk of the two call sites drifting apart. Removing the inconsistent, unused helper reduces cognitive load and prevents a future caller from accidentally using the environment-variable path. Any future change to authentication (rotation, multi-tenant tokens, etc.) is a one-line edit.
+
+### AC-60 · Inconsistent error handling and logging between `list_all` and `open_events`
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+`list_all` catches connection and JSON errors, logs a warning that includes the exception class name, and appends a structured `skipped` entry so the caller can see which host failed and why. `open_events`, by contrast, catches `requests.RequestException`, logs nothing, and raises a generic `AgentError` with a static message that omits the host name and the underlying exception type. A failure to connect to the SSE stream is therefore significantly harder to diagnose: the operator sees only a bare "agent error" with no indication of which host was unreachable or whether the failure was a DNS timeout, a TLS handshake error, or a 502 from a proxy.
+
+Solution:
+Align `open_events`'s error handling with `list_all`'s pattern: catch the specific exception, log a warning that includes the host identifier and the exception class (and ideally a short message), and then raise `AgentError` with a message that embeds the host name and the original exception's `str()`. Alternatively, if the design intent is for `open_events` to be retryable by the caller, let the original exception propagate (or wrap it in a typed `AgentConnectionError`) so the caller can distinguish transient from permanent failures.
+
+Benefits:
+Operators and on-call engineers can immediately identify the failing host and the nature of the failure from the log line, reducing mean-time-to-diagnosis. The caller receives a consistent error contract across both functions, making it safe to write a single error-handling path. Removing the silent context loss eliminates a class of "works in dev, unexplained failure in prod" tickets.
+
+### AC-61 · `save_template` bakes a two-step get-then-add protocol into the save path, entangling the "never overwrite" guarantee with its mechanism
+Strength: Worth exploring
+Files: template_store.py
+
+Problem:
+`save_template` enforces its "never overwrite" contract by issuing two sequential `requests.post` calls to the same `/api/entry` endpoint — first an `action: "get"` to read the current value, then an `action: "add"` to write. This creates two coupled frictions: (a) the atomicity of the no-overwrite guarantee depends on an unstated single-writer assumption, because there is a TOCTOU window between the two HTTP calls during which another actor (a concurrent chat session, a shared entry store, or the app's own "add entry" box) can create the key; and (b) the two-step get-then-add protocol is hard-coded into the function body rather than being a property of the target app's API, so if a future kind's target exposes a single atomic "add-if-absent" endpoint, the module cannot use it without restructuring `save_template`. The "never overwrite" guarantee and the "how to save" mechanism are entangled in one place, and the concurrency assumption is implicit rather than named.
+
+Solution:
+Introduce a private helper, e.g. `_save_if_absent(base_url, target, key, value)`, that owns the two-step protocol and returns a normalized outcome (saved / already-exists / refused / unreachable). `save_template` calls this helper instead of inlining the two `requests.post` calls. The public signature of `save_template` and the shape of its result dict are unchanged, so `save_proposal` and the existing tests remain untouched. The helper becomes the single place where the "never overwrite" guarantee is implemented and where the concurrency assumption is documented. If a target app later offers an atomic add-if-absent endpoint, a per-kind flag in the KINDS registry can select the atomic path, and only `_save_if_absent` changes.
+
+Benefits:
+The "never overwrite" guarantee is localized to one function, making the concurrency assumption explicit and auditable in a single place rather than scattered across the body of `save_template`. The save mechanism (two-step vs. atomic) becomes swappable per-kind without touching validation, the result-dict contract, or the caller (`save_proposal`). The TOCTOU window still exists (it is a property of the target app's API, not something this module can fully remove), but it is now named and contained, so a future maintainer can see exactly where the assumption lives and add a server-side atomic path when a target app supports one.
+
+### AC-62 · Status-word mapping in `static/sessions-view.js`
+Strength: No issue found
+Files: static/sessions-view.js
+
+Assessment:
+The module defines two status-word helpers: `statusWord(row)` maps the boolean `row.busy` to `'Busy'`/`'Idle'` for chat-session rows, and `terminalStatusWord(status)` maps the string `row.status` through the `STATUS_WORDS` constant to `'Busy'`/`'Waiting'`/`'Idle'` for terminal-session rows. These are **not** two encodings of the same concept that must be kept in sync. They operate on different data shapes (boolean vs. string), different state spaces (two states vs. three), and different domains (chat sessions have no `waiting` state; terminal sessions do). The `waiting` state is a legitimate, domain-specific terminal concept, not an orphan or a synchronization hazard.
+
+Because the two functions serve independent domains with independent vocabularies, there is no single source of truth to unify and no risk of them drifting out of sync. Renaming `Busy` in the chat context is a one-line edit to `statusWord`; renaming it in the terminal context is a one-line edit to `STATUS_WORDS`. A hypothetical global rename across both is a trivial find-and-replace, not an architectural defect.
+
+No change is warranted. The existing separation is appropriate.
+
+### AC-63 · Centralize HTTP error-handling in a single `_request` helper
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+The four public functions (`get_roots`, `preempt`, `reserve`, `stream_local_turn`) each independently wrap their `requests` calls in a `try/except requests.RequestException` block, call `raise_for_status()`, and raise `InternalApiError` with a hand-crafted message. This shallow-interface duplication means that any cross-cutting transport concern—retries with back-off, circuit breaking, centralized request logging, or a unified timeout policy—must be added in four separate places, and a change to the error-handling contract (e.g., adding a `request_id` to every raised exception) requires touching every public function. The transport layer is effectively re-implemented per call site rather than being a single, testable seam.
+
+Solution:
+Introduce a private `_request(method, url, **kwargs)` helper inside `internal_api_client.py` that performs the `requests` call, wraps it in a single `try/except requests.RequestException`, calls `raise_for_status()`, and raises `InternalApiError` with a consistent message that includes the URL and status code. Each public function then delegates its HTTP call to `_request` and focuses solely on parsing the response payload. For `stream_local_turn`, the helper can expose a `_stream_request` variant that yields the response iterator, keeping the same error-raising contract at the connection-establishment phase while allowing the generator to handle mid-stream errors separately.
+
+Benefits:
+Adding retries, a circuit breaker, or structured logging becomes a one-line change in `_request` rather than a four-function refactor. The error contract is uniform and easier to test: a single unit test on `_request` covers the connection-failure and HTTP-error paths for all four public functions. New public endpoints added to the client automatically inherit the same error-handling behavior without copy-paste risk.
+
+### AC-64 · Unify the error-propagation contract between streaming and non-streaming calls
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+`get_roots`, `preempt`, and `reserve` signal internal-API failures by raising `InternalApiError`, while `stream_local_turn` catches the same class of `requests.RequestException` and instead yields a `{"type": "error", ...}` dictionary into the generator stream. Consumers of this module therefore face a split-brain contract: for three functions they must `try/except InternalApiError`, but for the fourth they must inspect every yielded dict for an error type. The routing layer that dispatches to these functions must maintain two separate failure-handling paths for what is logically the same "internal API is unreachable or returned an error" condition, and a new caller who is unfamiliar with the module will inevitably miss the yield-based error path.
+
+Solution:
+Adopt a single contract: all four functions raise `InternalApiError` for connection and HTTP-status failures (i.e., failures that occur before or at the moment the response is established). For `stream_local_turn`, the helper establishes the connection and raises `InternalApiError` on failure before the generator begins yielding; once the stream is open, mid-stream transport errors can still be surfaced as yielded error dicts (since the caller is already inside a `for` loop), but the initial "cannot reach the service" case follows the same raise-based contract as the other three functions. Document this two-phase contract (raise-before-yield vs. yield-during-stream) in the module docstring.
+
+Benefits:
+Callers can wrap every call to the client in a single `try/except InternalApiError` block for the "service is down" case, reducing the routing layer's branching logic. The contract is easier to communicate in code review and onboarding. It also makes it straightforward to add a global retry decorator that operates on the raised-exception path without needing to inspect generator yields.
+
+### AC-65 · Decouple `test_claude_client_account.py` from `app.py` module internals
+Strength: Worth exploring
+Files: test_claude_client_account.py, app.py
+
+Problem:
+The test file imports `app` solely to read the `CORE_REPO_ROOT` constant, and includes a fallback that fabricates a fake `app` module if the import fails. This couples the test to the internal structure of `app.py`—specifically, that `CORE_REPO_ROOT` exists as a module-level attribute at import time. If `app.py` reorders its initialization, moves the constant to a sub-module, or guards it behind a lazy property, the test's fallback silently activates and the test exercises a fake path that may not reflect the real value, masking a genuine regression. The test is no longer independent of application internals, violating the principle that tests should inject their dependencies rather than reach into production module state.
+
+Solution:
+Extract `CORE_REPO_ROOT` (or the path it represents) into a small, importable configuration module (e.g., `config.py` or a `paths.py`) that has no side effects and no dependency on the Flask/Django app lifecycle. Both `app.py` and `test_claude_client_account.py` import from that shared module. In the test, if the value must be overridden for a specific scenario, use `unittest.mock.patch` on the configuration module's attribute rather than constructing a fake `app` module. Remove the fallback import logic entirely.
+
+Benefits:
+The test no longer depends on `app.py`'s import order or internal structure; it depends only on a stable, side-effect-free configuration module. The fake-module fallback is eliminated, removing a silent-failure mode where a broken import is masked by the fallback. Refactoring `app.py` (splitting it, renaming it, changing its init sequence) can no longer break the test in a non-obvious way.
+
+### AC-66 · Row-filtering predicate duplicated across handoff and chat_sessions
+Strength: Worth exploring (conditional — see caveat)
+Files: handoff.py, chat_sessions.py, test_chat_routes_swap.py
+
+**Caveat:** `chat_sessions.py` is not included in the files provided for this review. The duplication claim rests on `handoff.py`'s module docstring (which describes the two-skip rule and references the chat-sessions path) and on comments in `test_chat_routes_swap.py`. Before acting on this item, confirm that `chat_sessions._build_local_messages` (or an equivalent function) actually exists and implements the same two-skip logic. The proposal below assumes that verification passes.
+
+Problem:
+`handoff._is_plain_row` implements a two-skip rule (drop rows where `"error"` is truthy, drop rows where `"marker" is True`). `handoff.py`'s docstring states that the same rule is applied in the chat-sessions message-construction path, but the rule lives in two separate code paths held together only by that prose comment. There is no shared predicate, no single test that asserts the two filters agree on an arbitrary row, and no import-time link between them. If a third row type (e.g. a `"system"` notice) is introduced and one filter is updated without the other, the handoff transcript and the local-model message construction will silently diverge, producing inconsistent token counts or missing context with no error.
+
+Solution:
+Extract the predicate into a single public helper (e.g. `handoff.is_plain_row(row) -> bool`) that `handoff.transcript_tokens` / `build_handoff` call directly. If the chat-sessions module does contain a duplicate of the same two-skip logic, have that function import and call `handoff.is_plain_row` rather than re-implementing the check. Add a unit test (using the existing `unittest` convention, as in `test_chat_routes_swap.py`) that feeds a row containing a novel field through both call sites and asserts they produce the same keep/drop decision, so any future divergence is caught at test time.
+
+Benefits:
+The "which rows count as plain content" rule now has exactly one definition. Adding a new row type requires touching one function instead of two, and the agreement test makes any accidental asymmetry a red build rather than a silent runtime divergence. The docstring comment in `handoff.py` can be shortened to point at the shared helper (`"See is_plain_row for the canonical rule"`) rather than restating the rule in prose, reducing the chance that the comment and the code drift apart.
+
+### AC-67 · model_stats_client duplicates its error-swallowing wrapper twice
+Strength: Worth exploring
+Files: model_stats_client.py
+
+Problem:
+Two public functions in `model_stats_client.py`—`_run_event` and `get_turns_summary`—each independently wrap their `subprocess.run` call in its own try/except, with slightly different exception tuples (one includes `json.JSONDecodeError`, the other does not) and each calling `logger.warning` with its own message. A third function, `record_outcome`, delegates to `_run_event` rather than calling `subprocess.run` directly, so it inherits the wrapper rather than duplicating it. The module docstring states the contract—"never let stats recording break the real feature"—but that contract is implemented in two separate try/except blocks. A new event type added later will either copy-paste one of the two patterns (drifting the exception tuple or the log message) or omit an exception type, turning a non-fatal stats failure into an unhandled exception that propagates into the feature code.
+
+Solution:
+Introduce a single `_safe_run(cmd, *, timeout, description, cleanup=None)` helper inside `model_stats_client.py` that owns the `subprocess.run` invocation, the full exception tuple (`OSError`, `subprocess.SubprocessError`, `json.JSONDecodeError`), and the `logger.warning` call. The optional `cleanup` parameter (a callable or a temp-file path) lets `_run_event` pass its temp-file removal logic without forcing `get_turns_summary` to deal with a file it never creates. Have `_run_event` and `get_turns_summary` delegate to `_safe_run`, passing only their specific command, description string, and (for `_run_event`) the cleanup callback. `record_outcome` continues to call `_run_event` as before. The "never break the feature" contract then lives in exactly one function.
+
+Benefits:
+Adding a new stats event is a one-line call to `_safe_run` with no risk of forgetting an exception type or duplicating cleanup logic. The exception tuple is defined once, so a new failure mode (e.g. a `TimeoutError` variant) is added in one place. Reviewers can verify the "stats never crash the feature" guarantee by reading a single function rather than auditing two near-identical blocks.
+
+### AC-68 · Inconsistent env-var read timing between ollama_client and handoff
+Strength: Worth exploring
+Files: ollama_client.py, handoff.py
+
+Problem:
+`ollama_client.py` captures `MODEL = os.environ.get("LOCAL_MODEL")` at module import time, freezing the value for the process lifetime. `handoff.py`'s `window_tokens` reads `AGENT_MANAGER_CHAT_*_WINDOW_TOKENS` on every call, explicitly documented as "read per call." Both are configuration for the same chat-swap feature and are consumed by the same code paths (the swap route calls `handoff.needs_summary` and passes `ollama_client.MODEL` to the reserve call). An operator or test that changes `LOCAL_MODEL` after import will see `handoff` pick up new window sizes while `ollama_client` still uses the old model name, with no error, no log, and no indication that the two modules disagree.
+
+Solution:
+Pick one env-var semantics for the chat-swap feature and apply it consistently. If per-call is chosen (matching `handoff`'s existing documented behavior), change `ollama_client` to read `LOCAL_MODEL` inside `generate()` rather than at module load. If at-import is chosen, change `handoff.window_tokens` to read once at module load and document the reload requirement. Add a `unittest`-based test that (1) sets the env var, (2) imports both modules, (3) changes the env var again, (4) calls `importlib.reload(ollama_client)` to re-execute its module-level code (necessary because `MODEL` is bound at import time and a plain re-import would return the cached module), and (5) asserts that both `ollama_client.MODEL` and `handoff.window_tokens(...)` observe the same updated value, locking the contract in code.
+
+Benefits:
+Operators and tests get a single, predictable rule for how configuration changes propagate: either both modules see the new value immediately or both require a process restart. The inconsistency is eliminated at the source, and the agreement test (using `importlib.reload` to force re-evaluation of the import-time binding) makes any future regression—e.g. someone re-introducing a module-level constant in one file—a red build rather than a silent mismatch in production.
+
+### AC-69 · Divergent provider fallback logic across session and swap views
+Strength: Moderate
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `sessions-view.js` and `swap-view.js` define a local function named `providerLabel` that maps a provider identifier to a human-readable string. However, they encode different fallback rules for unrecognized providers: `sessions-view.js` defaults to the literal string `'Local'`, while `swap-view.js` defaults to `'Unknown'`. This divergence creates a consistency hazard: if a session with a non-standard provider (e.g., a typo or a newly added provider not yet mapped) is displayed in both the session list and the swap menu, the user will see contradictory labels (`'Local'` vs. `'Unknown'`) for the same underlying data. Additionally, the identical function name in two separate modules creates a naming collision that can confuse developers, particularly when searching for or refactoring the provider-labeling logic, as it is unclear which implementation is the "canonical" one or whether they are intended to be kept in sync.
+
+Solution:
+Extract the provider-to-label mapping logic into a single shared utility function (e.g., `getProviderLabel(provider)` in a new `utils.js` or similar module) that defines one consistent fallback rule (e.g., always `'Unknown'` for unrecognized providers, or a configurable default). Both `sessions-view.js` and `swap-view.js` should import and use this shared function. If the two views require different display formats (e.g., one includes an account suffix and the other does not), the shared utility should handle the core provider-to-label mapping, and each view can append its specific context-specific suffixes (like account names) separately. This ensures the core provider label is consistent across the UI while allowing for view-specific formatting.
+
+Benefits:
+Ensures consistent user experience by preventing contradictory labels for the same provider across different UI components. Reduces code duplication and eliminates the risk of the two implementations diverging further over time. Clarifies the codebase structure by establishing a single source of truth for provider labeling, making it easier for developers to understand and maintain the logic. Removes the naming collision, improving code readability and reducing the chance of import or reference errors.
+
+NOTE: The critique regarding `chat.js` was not applied because the file was not provided in the inputs, and the corrected draft removes all unverified claims about `chat.js` imports or aliases, focusing instead on the verifiable divergence in fallback logic and naming collision between the two provided files.
+
+### AC-70 · Duplicated atomic-write protocol in `write_snapshot` and `_atomic_write`
+Strength: Strong
+Files: (single module containing `write_snapshot` and `_atomic_write`; path not confirmed in pre-check)
+
+Problem:
+`write_snapshot` and `_atomic_write` each independently implement the same seven-step atomic-write sequence—`os.makedirs`, build a `.{pid}.tmp` path, `os.open` with `O_WRONLY|O_CREAT|O_EXCL` and mode `0o600`, `os.fdopen` + `json.dump`, `os.replace`, and `os.unlink` cleanup on failure. The only differences are the serialized object (`{**rec, "observedAt": …}` vs. a caller-supplied `obj`) and the return value (`True`/`False` vs. the destination path). Because the protocol is copy-pasted rather than shared, any future change to the write protocol—adding an `fsync` before `os.replace`, switching the tmp-name scheme to a UUID to avoid PID-reuse collisions on long-lived systems, adding a retry on `EINTR`, or changing the directory-creation mode—must be made in two places in the same file, and a change to one will silently desynchronize the other.
+
+Solution:
+Collapse the duplication by having `write_snapshot` delegate its write step to `_atomic_write`. Concretely, after the existing read-compare guard, `write_snapshot` would call `_atomic_write(directory, rec["sessionId"] + ".json", {**rec, "observedAt": int(time.time())})` and return `True` on success or `False` if the target already existed with identical content (preserving its current short-circuit). `_atomic_write` remains the single implementation of the open-write-replace-cleanup sequence, and `write_snapshot` retains only its domain-specific read-compare-then-decide logic.
+
+Benefits:
+The atomic-write protocol lives in exactly one place, so protocol changes (fsync, tmp-naming, retry, permission bits) are a single edit. The read-compare flow in `write_snapshot` is preserved unchanged, so callers see identical behavior. The file shrinks by roughly the length of the duplicated block, and the two functions now have a clear single-responsibility boundary: `_atomic_write` owns the I/O ceremony, `write_snapshot` owns the snapshot-specific policy.
+
+### AC-71 · Duplicated per-host token resolution in agent_client.py
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+In `agent_client.py`, the logic for resolving a per-host authentication token and constructing the `Authorization: Bearer …` header is duplicated across two functions. `list_all()` iterates over `agent_hosts.hosts()`, calls `agent_hosts.read_token(host)` for each host, and manually builds the `headers` dictionary. `open_events()` calls `_resolve_host(host)` and then repeats the same token-reading and header-construction steps. Meanwhile, the module-level `_headers()` helper exists but is never called by either of these multi-host-aware functions, leaving it as dead code and creating a confusing parallel path for header construction.
+
+Solution:
+Extract the repeated token-resolution-and-header-construction logic into a single internal helper (e.g., `_host_headers(host)`) that calls `agent_hosts.read_token(host)` and returns the fully formed `headers` dict. Both `list_all()` and `open_events()` would then call this helper instead of duplicating the steps. The existing unused `_headers()` function can either be deleted or repurposed as this shared helper, eliminating the dead code path.
+
+Benefits:
+Removes the duplicated token-resolution logic so that the two functions cannot diverge in how they handle missing tokens, token format, or header construction. Cleans up the module by eliminating (or repurposing) the unused `_headers()` function, reducing cognitive load for future maintainers and making the single source of truth for Bearer-header construction explicit.
+
+### AC-72 · Route handler reaches into accounts.py private validation helper
+Strength: Strong
+Files: routes/accounts.py, accounts.py
+
+Problem:
+The `api_chat_accounts_make_live` handler in `routes/accounts.py` calls `accounts._valid_label(label)` to decide whether to return a 400 Bad Request before attempting the state change. This crosses the module boundary: `accounts.py`'s docstring defines its public surface as persistence operations (every function takes a `storage_dir`), and `_valid_label` is an internal helper with no contract guarantee. The route is forced to pre-validate because `accounts.make_live` only raises `KeyError` for unknown labels, so an invalid label currently falls through to a 404 instead of a 400. If the label-validation rules in `accounts.py` ever change (e.g., allowing Unicode, changing max length), the route handler silently diverges and misclassifies errors.
+
+Solution:
+Have `accounts.make_live` (and any other public mutation that accepts a label) raise `ValueError` when the label fails validation, in addition to raising `KeyError` for an unknown-but-valid label. The route handler then simply catches `ValueError` → 400 and `KeyError` → 404, removing the need to call `_valid_label` directly. No new public function is added to `accounts.py`; the existing public mutation API gains a more precise exception contract, and the routing layer interprets exceptions rather than reaching into private helpers.
+
+Benefits:
+The routing layer no longer depends on a private symbol, so refactoring `accounts.py`'s internals (renaming, splitting, or changing `_valid_label`) cannot silently break the route. Error semantics become self-documenting: the domain module declares *what* is wrong (invalid vs. missing) via exception type, and the routing layer maps that to HTTP status codes. A single source of truth for label validation lives in `accounts.py`, eliminating the risk of the two modules drifting out of sync.
+
+### AC-73 · Consolidate duplicated provider-labeling logic into a shared module
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` export a `providerLabel` function that maps a session's `provider` and `model` fields to a display string, but the two implementations have diverged. `sessions-view.js` checks `row.provider === 'claude'` and returns either `'Claude'` or `'Local'`, treating every non-`'claude'` value as Local. `swap-view.js` checks `session.provider === 'claude'` or `'local'` and returns `'Claude · <model> · <account>'` or `'Local · <model>'`, explicitly distinguishing the `'local'` string from other unknown values. The same conceptual question—"what provider and model is this session on?"—is answered in two places with two different output shapes and two different sets of recognized provider values, creating a shallow-interface duplication that will silently drift as providers are added or renamed.
+
+Solution:
+Extract the provider/model identification logic into a single shared module (e.g. `static/provider-label.js`) that exports one `providerLabel(session)` function returning a **structured result object** (e.g. `{ provider: 'claude' | 'local' | <unknown>, model, account }`). The shared module is the single authority on which provider strings are recognized and how they are normalized.
+
+Each view module then imports this function and performs its own **view-specific string formatting** from the structured result:
+
+- `sessions-view.js` composes a short label (e.g. `result.provider === 'claude' ? 'Claude' : 'Local'`).
+- `swap-view.js` composes the longer form (e.g. `` `${result.provider} · ${result.model} · ${result.account}` ``).
+
+This keeps the **exported public API of each view module unchanged**—both still export a `providerLabel` that accepts a session object and returns a display **string**, so any downstream caller that imports and renders that string sees the same type and the same (now-corrected) value. What changes is the **internal implementation** of those two view modules: the duplicated branching over raw provider strings is replaced by a call to the shared module plus a thin, view-specific format step.
+
+Benefits:
+A single source of truth governs which provider strings are valid and how they are normalized. Adding a new provider (e.g. `'openai'`) requires editing the shared module once; both view modules automatically pick up the new value through the structured result, eliminating the `'local'`-vs-"everything-else-is-Local" discrepancy that already exists. The view-specific formatting (short label vs. long label with account) remains a one-line composition in each view file rather than a re-implemented branch, so the two files can no longer silently disagree about which providers are recognized. Downstream callers of the view modules' `providerLabel` continue to receive a string and need no code changes; the only files that change are the two view modules (internal rewrite) and the new shared module.
+
+### AC-74 · Dead auth helpers shadow duplicated inline header construction
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_client.py` defines `base_url()` and `_headers()`—both relics of a singular-host era that read environment variables directly. Neither function is called anywhere in the community. Meanwhile, the actual "resolve this host's token and build the Authorization header" logic is copy-pasted inline in two call sites (`list_all()` and `open_events()`), each independently calling `agent_hosts.read_token(host)` and assembling a Bearer header. The dead `_headers()` is actively misleading: a developer adding a new auth header or switching schemes would naturally edit it, only to discover it is unused and that the real logic lives in two separate inline blocks. Updating one inline site without the other silently breaks one code path.
+
+Solution:
+Delete both `base_url()` and `_headers()` from `agent_client.py`. Extract the token-to-header step into a single private helper (e.g. `_auth_headers(host)`) that calls `agent_hosts.read_token(host)` and returns the fully-formed header dict. Both `list_all()` and `open_events()` then call `_auth_headers(host)` instead of duplicating the two-line block.
+
+Benefits:
+A single canonical site owns the auth-header construction, eliminating the risk of the two call sites drifting apart. Removing the dead functions removes the false affordance that a developer would edit `_headers()` and see no effect. Future changes to the auth scheme (new header, mTLS, per-host scheme) touch exactly one function.
+
+### AC-75 · `_resolve_host` re-implements `agent_hosts.get_host` lookup
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_hosts.py` already exposes `get_host(name)` which iterates the host list and returns the matching `Host` or `None`. `agent_client._resolve_host(name)` re-does that same iteration by hand. The only added value of `_resolve_host` is the `name is None` → "pick the single host or raise" branch and the `AgentError` wrapping. As written, the named-lookup branch is a duplicate of `agent_hosts.get_host` with a different return convention (raise vs. `None`). If `agent_hosts` later adds host-aliasing, case-folding, or a deprecation warning inside `get_host`, `_resolve_host` will silently diverge because it bypasses that logic.
+
+Solution:
+Replace the manual loop inside `_resolve_host` with a call to `agent_hosts.get_host(name)`. If the result is `None`, raise `AgentError` with a descriptive message. Keep the `name is None` auto-select branch (pick the single host or raise) local to `agent_client`, since that is a client-level policy decision rather than a host-list concern.
+
+Benefits:
+Host-lookup logic lives in exactly one place (`agent_hosts.get_host`), so any future normalization, aliasing, or deprecation rules are applied uniformly. `agent_client` retains only the policy it uniquely owns (auto-select when no name is given, error wrapping for the caller). The two modules no longer need to be kept in lockstep by convention.
+
+### AC-76 · Minor host-lookup consolidation opportunity
+Strength: Minor
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_client._resolve_host(name)` and `agent_hosts.get_host(name)` both contain a short `for host in hosts(): if host.name == name` loop. The two functions are **not** the same lookup duplicated: `get_host` handles the single case "find a named host or return `None`," while `_resolve_host` additionally handles the `name=None` single-host convenience and raises a helpful multi-host-ambiguity error. Those extra cases are legitimate HTTP-layer policy and belong in `agent_client`. The only shared logic is the three-line name-match loop, which is idiomatic to repeat in each module that needs it, and the match key (`host.name`) is a stable field on the `Host` namedtuple, so independent drift is unlikely. This is a small consolidation opportunity, not an architectural defect.
+
+Solution (optional, low-priority):
+If the team prefers a single source for the name-match, `agent_client._resolve_host` can delegate the `name=<string>` branch to `agent_hosts.get_host(name)` and keep the `name=None` convenience and the `AgentError` raise as a thin wrapper. The `for`-loop in `get_host` remains the one place that implements "match by name." This is a two-line change in `_resolve_host` and is safe to defer.
+
+Benefits:
+Marginal: one fewer copy of a three-line pattern to update if the match key ever changes. The error-contract split (`None` vs. `AgentError`) and the `name=None` policy remain where they belong. No behavioral change.
+
+---
+
+*AC-001 from the prior draft has been removed.* Its central claim—that `agent_client._headers()` is dead code "never called anywhere in the community"—is incorrect: the function is invoked by `app.py` on the singular-config path (exercised by `test_wrong_token_is_unreachable_not_an_error`), and in that path the global token is correctly scoped to the single configured host, so the "wrong credential to the wrong host" hazard does not materialise. The proposed solution (delete `_headers()`, re-source the token exclusively through `agent_hosts.read_token`) would break the `app.py` caller without specifying how it would obtain the Authorization header, making the fix internally inconsistent. The residual observation (two modules each call `os.environ.get` for the same variable) is a one-liner idiom that does not rise to a "Strong" finding.
+
+### AC-77 · Centralize the "plain transcript row" predicate across handoff and chat_sessions
+Strength: Worth exploring
+Files: handoff.py, chat_sessions.py
+
+Problem:
+The predicate that identifies a valid, non-error, non-marker transcript row is implemented independently in two modules. `handoff.py` defines `_is_plain_row()` to check for the absence of `error` and `marker` keys. The review notes that `chat_sessions.py` (specifically the logic within `_build_local_messages`) re-implements this same two-skip logic inline. Because the definition of a "plain row" is scattered, any future change to the transcript schema (for example, introducing a new system-row type that must be skipped) requires a synchronized edit in both files. This violates DRY and creates a tight, implicit coupling between the two modules: a developer updating one side may overlook the other, leading to silent divergence in which rows are processed.
+
+Solution:
+Extract the row-filtering logic into a single shared utility function (e.g., `is_plain_transcript_row(row)`) placed in a common module such as `handoff.py` or a new `transcript_utils.py`. Both `handoff.py` and `chat_sessions.py` then import and call this one function to decide which rows to process. The concept of a "plain row" gains a single, named home, and the two call sites become thin consumers of a well-defined contract.
+
+Benefits:
+A change to the transcript schema is made in exactly one place, eliminating the risk of the two implementations drifting apart. The named function makes the intent at each call site immediately readable. Maintenance cost drops because there is no longer a second, implicit copy of the skip-logic to keep in sync.
+
+### AC-78 · Decouple model_stats_client from the app entry-point module
+Strength: Strong
+Files: model_stats_client.py, app.py
+
+Problem:
+`model_stats_client.py` performs a module-level import of `CORE_REPO_ROOT` from `app.py` (`from app import CORE_REPO_ROOT`). This inverts the expected layering: a low-level client module depends on the high-level application entry point. This coupling means `model_stats_client.py` cannot be imported, unit-tested, or reused in a different context without pulling in the entire `app` module and its side effects. Furthermore, if `app.py` ever imports `model_stats_client.py` directly or transitively (a common pattern in Flask apps where the app module initializes clients), the result is a circular-import error at startup. Even without a present-day cycle, the dependency direction is inverted and fragile.
+
+Solution:
+Move the `CORE_REPO_ROOT` constant into a small, dependency-free configuration module (e.g., `config.py` or `paths.py`). Both `app.py` and `model_stats_client.py` then import `CORE_REPO_ROOT` from that shared module. The client no longer depends on the application entry point, restoring a clean dependency direction (client → config, app → config).
+
+Benefits:
+The potential for circular-import hazards is removed. `model_stats_client.py` becomes independently importable and testable without loading the Flask application. The configuration concern is isolated in one place, making it straightforward to override or parameterize in tests.
+
+### AC-79 · Standardize Ollama client error handling to prevent silent or unhandled failures
+Strength: Worth exploring
+Files: ollama_client.py
+
+Problem:
+The `generate()` function in `ollama_client.py` issues an HTTP request via `urllib.request.urlopen` and parses the response with `json.loads`, but does not wrap these calls in explicit exception handling for `urllib.error.URLError`, `json.JSONDecodeError`, or `OSError`. If the Ollama server is unreachable, times out, or returns malformed JSON, the exception propagates uncaught to the caller. In a standard Flask application, this results in a 500 Internal Server Error response, which is a "loud" failure but provides no structured context to the frontend or logging system. More critically, the existing caller code in `chat_sessions.py` (and its test mocks) expects `generate` to return a dictionary containing a `"response"` key. Currently, if an exception is raised, the caller crashes with a `500` error. If the caller is modified to handle errors gracefully, it currently lacks a standardized contract to check against.
+
+Solution:
+Wrap the `urlopen` and `json.loads` calls in a `try-except` block that catches `urllib.error.URLError`, `json.JSONDecodeError`, and `OSError`. On failure, log the exception via the `logging` module and return a standardized error dictionary (e.g., `{"error": "Ollama request failed", "details": str(exc)}`). **Crucially, this change must be accompanied by an update to the caller logic in `chat_sessions.py` (specifically `_send_claude` or equivalent) to explicitly check for the `"error"` key before accessing `"response"`.** Without this caller-side update, the new return contract will cause a `KeyError` or `TypeError` when the caller attempts to access `data["response"]` on an error payload.
+
+Benefits:
+The client presents a uniform error contract that callers can rely on, matching the defensive posture of `model_stats_client.py`. Logged details make it straightforward to diagnose connectivity or server-side issues. By explicitly updating the caller to handle the `"error"` key, the system degrades gracefully (showing a user-facing message) rather than failing with an opaque 500 error or an unhandled exception.
+
+NOTE: Flag 3 was not applied to AC-001 or AC-002 because the critique acknowledges that the core problem descriptions (duplicated logic in AC-001, inverted dependency in AC-002) are valid refactoring targets even if the specific file contents were not fully provided in the input; the flags regarding "unverifiable" content do not invalidate the architectural issues identified, and the draft's solution remains the correct architectural response to the described coupling.
+
+### AC-80 · Eliminate redundant registry I/O in the "make live" route
+Strength: Strong
+Files: routes/accounts.py, accounts.py
+
+Problem:
+In `routes/accounts.py`, the `api_chat_accounts_make_live` handler calls `accounts.make_live()`, which internally executes `load()` and `_save()`. Immediately following this, the handler calls `_accounts_body()`, which executes `accounts.load()` and `accounts.live_label()` (which in turn calls `load()` again). This results in reading and parsing the `accounts.json` file three times and writing it once for a single logical operation, all within one request cycle.
+
+Solution:
+Refactor `accounts.py` to provide a combined `make_live_and_get_view(storage_dir, label)` function that loads the accounts file once, applies the `make_live` mutation, saves the file, and returns the `public_view` list and `live_label` string directly from the in-memory object it just modified. The route handler in `routes/accounts.py` then calls this single function to obtain the view data, and **separately** iterates over the returned `public_view` to attach the per-account `usage` key (calling `usage.read_usage(usage_dir, account["label"], now)`), since `usage_dir` / `AM_STATUSLINE_DIR` is a route-layer concern that `accounts.py` does not import or know about. This keeps the `usage` logic in the view layer where it belongs while eliminating the redundant `load()` calls that were the source of the triple-read.
+
+Benefits:
+Reduces disk I/O and JSON parsing overhead by two-thirds for this endpoint (three `load()` calls become one). It also enforces the invariant that the state returned to the client exactly matches the state that was just written to disk, removing the theoretical risk of a race condition where another process modifies the file between the write and the subsequent read. The `usage` attachment remains a pure in-memory step over the already-loaded view, so no additional file I/O is introduced.
+
+### AC-81 · Decouple route handlers from the `app` module to resolve circular import risk
+Strength: Worth exploring
+Files: routes/accounts.py, app.py
+
+Problem:
+`routes/accounts.py` uses lazy imports (`from app import CHAT_STORAGE_DIR` inside the view functions) to avoid a circular import, as `app.py` imports the blueprint from this module. This pattern is a code smell indicating tight coupling between the routing layer and the application entry point. It also makes the code harder to test in isolation, as the tests must mock `app.CHAT_STORAGE_DIR` rather than injecting the dependency at a higher level.
+
+Solution:
+Move the `CHAT_STORAGE_DIR` definition out of `app.py` and into a shared configuration module (e.g., `config.py` or `settings.py`) that both `app.py` and `routes/accounts.py` can import at the top level without circularity. Alternatively, pass the storage directory as a dependency to the blueprint or use a context variable, so the route module never needs to reach back into the application entry point.
+
+Benefits:
+Removes the need for lazy imports, making the dependency graph explicit and easier to understand. It improves testability by allowing the storage path to be injected or mocked at a higher level (the config module) rather than patching an attribute on the `app` object. It also prevents potential subtle bugs related to import order or module initialization state.
+
+### AC-82 · Eliminate the `local_tool_client` re-export shim
+Strength: Worth exploring
+Files: local_tool_client.py, app.py, internal_api_client.py
+
+Problem:
+`local_tool_client.py` contains no logic of its own: it re-exports `stream_local_turn` from `internal_api_client` and aliases `InternalApiError` as `LocalToolClientError`. Its sole purpose is to preserve the Phase-1 name `stream_plan_with_tools` so that existing callers (e.g. `app.py`'s `_call_chat` and any other module that imports the shim) don't need to change. This creates a confusing two-name surface for one capability: a reader of `app.py` sees `LocalToolClientError` and infers a separate "local tool" subsystem, while the actual HTTP error is raised as `InternalApiError` inside `internal_api_client`. Because the alias is literally the same class (not a subclass), the catch works, but nothing in the code communicates that equivalence, and the "local tool client" name now misrepresents what is a pure HTTP client. The module adds an indirection hop and a misleading name for no behavioral gain, and it couples `app.py`'s error handling to a shim whose entire content is a re-export.
+
+Solution:
+1. Grep the repository for every import of `local_tool_client` (e.g. `grep -rn "local_tool_client\|LocalToolClientError\|stream_local_turn" --include="*.py"`) to enumerate all consumers before deleting the module.
+2. In `app.py`, change the import to pull `stream_local_turn` and `InternalApiError` directly from `internal_api_client`, and update the `except LocalToolClientError` clause to `except InternalApiError`.
+3. In any other file identified in step 1, update the import to source `stream_local_turn` / `InternalApiError` from `internal_api_client` and rename the error reference accordingly.
+4. Delete `local_tool_client.py`.
+
+This leaves exactly one name for the error type and one import target for the streaming function across the codebase.
+
+Benefits:
+The dependency graph becomes honest: `app.py` and any other consumer import from the module that actually performs the HTTP call. A reader no longer has to trace through a one-line re-export to discover the real source, and the error type has a single, unambiguous name. Future changes to the client (retry logic, new endpoints) live in one file without a second file that must be kept in sync.
+
+### AC-83 · Extract the repeated connection/error-handling block in `internal_api_client`
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+`get_roots`, `preempt`, `reserve`, and `stream_local_turn` each repeat the identical pattern: build a `requests` call with the token header and timeout, call `raise_for_status()`, and wrap any `requests.RequestException` into `InternalApiError` (or, for the streaming function, yield an error dict). The connection-level contract—auth header, timeout policy, exception translation—is stated four times. A change to timeout policy, addition of a retry decorator, or a shift in error-shape (e.g. including the HTTP status code in the message) must be made in four spots, and it is easy to miss one, leaving an inconsistent error surface.
+
+Solution:
+Introduce a small private helper, e.g. `_request(method, path, *, json_body=None, stream=False)`, that encapsulates the token header, timeout, `raise_for_status()`, and the `except requests.RequestException → InternalApiError` translation. For the streaming path, a companion `_stream_request(path, json_body)` that yields the response iterator and translates errors into the existing error-dict shape. The four public functions then reduce to one-liners that call the helper and shape the return value.
+
+Benefits:
+The connection and error-handling invariant lives in exactly one place. A timeout-policy change, a retry wrapper, or an error-shape update is a single edit. New endpoints added to the internal API inherit the correct contract by construction rather than by copy-paste. The public function signatures and the `InternalApiError` type remain unchanged, so no downstream code is affected.
+
+### AC-84 · Distinguish failure origins in `_call_chat`'s 502 response
+Strength: Worth exploring
+Files: app.py, internal_api_client.py
+
+Problem:
+`_call_chat` catches `ClaudeClientError`, `LocalToolClientError` (i.e. `InternalApiError`), and `(TimeoutError, ConnectionError, OSError)` and collapses all of them into `abort(502, description=...)`. The only differentiator is the human-readable string in `description`, which the frontend must pattern-match on to show a meaningful message. A caller hitting a 502 cannot programmatically distinguish "the core dashboard's internal API is down" from "a Claude account call failed" from "a raw socket timeout slipped past `requests`." The `OSError` branch is effectively redundant because `requests` already wraps socket-level failures into `RequestException`→`InternalApiError`, so it only catches edge cases that should not occur in practice.
+
+Solution:
+Assign each failure origin a stable machine-readable code (e.g. `"internal_api"`, `"claude"`, `"network"`) and include it as a structured field in the 502 response body alongside the human-readable `description`. Remove the redundant `(TimeoutError, ConnectionError, OSError)` catch since `requests` already translates those into `InternalApiError`. Update the frontend to read the code field for routing its error UI, falling back to the description string for display.
+
+Benefits:
+The frontend can branch on a stable identifier rather than parsing English prose, making error handling resilient to wording changes. Operators debugging a 502 can immediately tell which upstream dependency failed without reading logs. The redundant `OSError` catch is removed, simplifying the exception hierarchy the reader must track.
+
+### AC-85 · ~~Asymmetric error handling between streaming and non-streaming paths~~
+Strength: Strong
+
+**Status: Withdrawn**
+
+The original draft asserted that `stream_local_turn`'s use of a `{"type": "error", ...}` yield was a silent-failure bug and that callers would "silently miss a network failure." This is incorrect. The module's own docstring for `stream_local_turn` explicitly enumerates `"error"` as a valid yield type (`"chunk"|"final"|"error"`), and `local_tool_client.py` documents the generator contract that `chat_sessions.py` consumes: yield chunks, then a final, or an error dict. The caller is designed to inspect the yielded dictionary and react accordingly. Changing the function to raise `InternalApiError` mid-iteration would violate the documented generator contract, break the existing consumer logic in `chat_sessions.py`, and conflate a recoverable per-turn error with an unrecoverable transport failure. The current design is intentional and correct.
+
+### AC-86 · ~~Redundant pass-through wrapper module adds indirection without value~~
+Strength: Strong
+
+**Status: Withdrawn**
+
+The original draft characterized `local_tool_client.py` as a valueless shim that should be deleted. In fact, the module's header states explicitly that it preserves the public name and signature (`local_tool_client.stream_plan_with_tools(...)`) that `chat_sessions.py` and other external callers already invoke, so that "nothing else [needs] to change." It is a deliberate compatibility layer maintaining API stability during the Phase 3 migration. Deleting it would force every external caller to update its import path and function name, which is the opposite of the stability the module provides. The indirection is a feature, not a defect.
+
+### AC-87 · ~~Error handling in the app layer depends on an alias that will vanish with the shim~~
+Strength: Strong
+
+**Status: Withdrawn**
+
+This finding was predicated on AC-002's recommendation to delete `local_tool_client.py`. Since that recommendation is withdrawn (see above), the premise that `LocalToolClientError` "will vanish" no longer holds. The alias is a clear, semantic name for the error type in the context of local-tool calls, and `app.py`'s `except (ClaudeClientError, LocalToolClientError)` clause is a valid, explicit dependency on a stable public name. Renaming it to `InternalApiError` would couple the app layer to an internal implementation name and provide no correctness benefit.
+
+---
+
+**Summary:** All three original findings were based on misreadings of the code's design intent. The streaming error-dict contract, the `local_tool_client.py` compatibility layer, and the `LocalToolClientError` alias are each intentional, documented, and load-bearing. No code change is warranted.
+
+### AC-88 · `providerLabel` export-name collision between `sessions-view.js` and `swap-view.js`
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js, static/chat.js
+
+Problem:
+Both `sessions-view.js` and `swap-view.js` export a function named `providerLabel`, but the two implementations differ in signature (they accept `row` vs `session`), in output format (the sessions version yields `"Claude · model"`; the swap version yields `"Claude · model · live account"` and also handles an `"Unknown"` provider), and in the "no model" fallback rule. Because `chat.js` is the documented consumer of both modules, it must alias one of the imports (e.g. `import { providerLabel as swapProviderLabel } from './swap-view.js'`), and every reader of `chat.js` must track which `providerLabel` is in scope at each call site. The two functions are not interchangeable even after disambiguation, so the shared name actively misleads rather than merely requiring a rename.
+
+Solution:
+Rename the export in `swap-view.js` to a name that reflects its distinct responsibility—e.g. `swapProviderLabel` or `accountLabel`—and update the single import site in `chat.js` accordingly. The function body and its internal logic remain unchanged; only the exported identifier and the one import binding are touched.
+
+Benefits:
+The import block in `chat.js` becomes self-documenting: each name at the call site immediately signals which module's formatting rules apply, eliminating the need for an alias and removing a class of copy-paste or shadowing bugs. Future contributors adding a third view module no longer face the temptation (or pressure) to reuse the same generic name, and the two modules' distinct contracts are visible at the module boundary rather than only discoverable by reading both implementations.
+
+### AC-89 · Duplicated filter scaffolding in `filterRows` / `filterChats`
+Strength: Worth exploring
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+The first three lines of `filterRows` and `filterChats` (needle normalisation, empty-query short-circuit, and the inner `has` helper) are textually identical; only the set of fields checked in the predicate differs (`name/cwd/host` vs `title/providerLabel/model`). This is a small amount of repetition in an otherwise well-factored module, but it is the one place where the "same logic, different field list" pattern is likely to grow—e.g. adding a `model` field to the terminal filter or a `cwd` field to the chat filter—and the two copies will drift independently.
+
+Solution:
+Extract the shared scaffolding into a small helper, e.g. `filterByFields(rows, query, fields)`, that performs needle normalisation, the empty-query short-circuit, and the `has` check over a caller-supplied field list. `filterRows` and `filterChats` each become a one-line delegation passing their respective field arrays.
+
+Benefits:
+Adding a new searchable field to either filter is a one-element change to an array literal rather than a copy of the helper body. The two filter functions can no longer silently diverge in normalisation or short-circuit behaviour, and the shared helper has a single, testable location for edge-case logic (unicode normalisation, case-folding, etc.).
+
+### AC-90 · Inconsistent error-propagation contract between streaming and non-streaming internal-API calls
+Strength: Strong
+Files: internal_api_client.py, app.py
+
+Problem:
+The non-streaming functions in `internal_api_client.py` (`get_roots`, `preempt`, `reserve`) all raise `InternalApiError` on failure, and `app.py` is explicitly designed to catch that exception and return a clean HTTP 502. The streaming function `stream_local_turn`, however, catches `requests.RequestException` and yields a JSON `{"type": "error", ...}` object into the response body instead of raising. This creates a split-brain error contract: a connection failure before the stream begins is reported through the data stream (yielded payload) rather than through the exception path that every other function in the module uses. As a result, `app.py`'s `except InternalApiError` handler never fires for an initial-connection failure in the streaming path, and the client receives a 200 OK response whose body contains an error object rather than the expected 502.
+
+Solution:
+Modify `stream_local_turn` in `internal_api_client.py` so that if the initial `requests.post` call or the subsequent `raise_for_status()` fails (i.e., before the generator begins yielding any data), it raises `InternalApiError` just like the non-streaming functions. Only when a failure occurs *during* iteration of `r.iter_lines()` (mid-stream, after the response headers have already been sent) should the function yield the `{"type": "error", ...}` JSON object, since at that point the HTTP status line can no longer be changed. This preserves the ability to report a dropped stream to the client while aligning the "server unreachable" case with the rest of the module.
+
+Benefits:
+Callers in `app.py` no longer need to inspect yielded data to determine whether the initial connection failed; the existing `except InternalApiError` block correctly catches initial streaming failures and returns a consistent HTTP 502. The error-handling surface is reduced to two well-defined cases—exception for "cannot reach the provider" and in-stream error object for "provider connection dropped mid-response"—making the contract easier to reason about, test, and document.
+
+### AC-91 · Redundant `LocalToolClientError` alias obscures the true error source
+Strength: Worth exploring
+Files: local_tool_client.py, app.py, internal_api_client.py
+
+Problem:
+`local_tool_client.py` imports `InternalApiError` and re-exports it under the name `LocalToolClientError`. `app.py` then imports `LocalToolClientError` from `local_tool_client` and catches it as though it were a distinct exception type. Because the alias is literally the same class object as `InternalApiError`, and `internal_api_client` is the sole origin of local-provider errors, the indirection adds a second name for the same concept without adding any wrapping, context, or differentiation. It also makes the dependency graph misleading: a reader of `app.py` sees a dependency on `local_tool_client` for error handling, when the actual source of truth is `internal_api_client`.
+
+Solution:
+Remove the `as LocalToolClientError` alias in `local_tool_client.py` (or, if external consumers might import the old name, keep it only as a deprecated re-export with a comment). Update `app.py` to import `InternalApiError` directly from `internal_api_client` and catch that name in `_call_chat` and any other relevant handlers. This makes the import graph reflect the actual data flow: `app.py` depends on `internal_api_client` for local-provider error types.
+
+Benefits:
+Eliminates a redundant class name that forces readers to mentally resolve the alias to understand which errors are actually being caught. Clarifies the dependency graph so that `app.py`'s imports directly name the module that defines the error. Removes the risk of future divergence if `local_tool_client` were ever refactored to wrap or re-raise errors differently, at which point the alias would silently change semantics for `app.py`'s catch blocks.
+
+### AC-92 · Divergent providerLabel implementations produce contradictory labels for the same session
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `sessions-view.js` and `swap-view.js` export a function named `providerLabel` consumed by the same caller, but they encode different provider taxonomies. The sessions-view version is binary: `provider === 'claude'` yields "Claude" and *everything else* yields "Local". The swap-view version is ternary: `'claude'` → "Claude · …", `'local'` → "Local · …", and *anything else* → "Unknown". A session whose `provider` field is neither `'claude'` nor `'local'` (a new backend, a misconfigured row, a future provider) is therefore labelled "Local" in the session switcher but "Unknown" in the swap menu—two contradictory labels for the same session in the same UI. The name collision also means any future change to display rules (adding a third provider, renaming a label) must be made in two places with the risk of them drifting further apart.
+
+Solution:
+Extract a single `providerDisplay(session, { includeAccount })` helper into a small shared module (or into one of the two files with the other importing it) that owns the provider→label mapping, the model-append rule, and the optional account-append rule. Both `formatRow` in sessions-view and the swap-menu code in swap-view call this one helper. The account suffix is only relevant in the swap context, so the helper accepts an `includeAccount` flag (or the swap code post-processes). The "what is a valid provider and what do we call it" decision then lives in exactly one place.
+
+Benefits:
+A single source of truth for provider display eliminates the contradictory-label bug for any non-`claude`/non-`local` provider, and ensures that adding a new provider or changing label wording is a one-line change in one file rather than a two-file edit that can silently diverge.
+
+### AC-93 · Duplicate filter logic in sessions-view.js states matching semantics twice
+Strength: Worth exploring
+Files: static/sessions-view.js
+
+Problem:
+`filterRows` and `filterChats` in `sessions-view.js` are structurally identical six-line patterns—trim/lowercase the query, early-return on empty, build a `has` closure, filter—differing only in the list of fields they probe (`name`/`cwd`/`host` vs. `title`/`providerLabel(r)`/`model`). The "how do we match a type-to-filter query" logic (case-insensitivity, whitespace handling, null-safety) is stated twice in the same file. If the matching semantics ever change (adding a fuzzy-match option, changing how `providerLabel` is folded into the search), both copies must be updated in lockstep or the two filters will silently disagree.
+
+Solution:
+Introduce a single `filterByFields(rows, query, fields)` helper where `fields` is an array of accessor functions. `filterRows` becomes `filterByFields(rows, query, [r => r.name, r => r.cwd, r => r.host])` and `filterChats` becomes `filterByFields(rows, query, [r => r.title, r => providerLabel(r), r => r.model])`. The shared helper owns the trim/lowercase/empty/null logic exactly once.
+
+Benefits:
+Matching semantics (case-folding, whitespace trimming, null-safety) are defined in one place, eliminating the risk of the two filters drifting apart if the matching rules evolve. The code is slightly shorter and the intent of each filter is expressed purely by its field list, making the difference between the two filters immediately visible.
+
+### AC-94 · ~~Centralize the "plain row" predicate to eliminate duplicated skip-logic~~ — **RETRACTED**
+Strength: Strong
+
+The original draft claimed `test_chat_routes_swap.py` re-implements the `_is_plain_row` filter via inline list comprehensions. On re-reading the test, it does not. `test_response_has_the_marker_row_and_a_swaps_entry` asserts the *presence* of exactly one marker row (`len(markers) == 1`) and that the pre-swap transcript rows appear verbatim (`body["transcript"][:2] == …`). It never filters rows by the "plain vs. annotated" predicate, so there is no duplicated skip-logic to centralize. The proposed public `is_plain_row` / `get_plain_rows` refactor has no consumer in the test and solves a problem that is not present in the code.
+
+**Action:** No change. The existing private helper in `handoff.py` and the test's presence-assertion are orthogonal concerns; no coupling exists to break.
+
+---
+
+### AC-95 · ~~Decouple model_stats_client from the top-level app module~~ — **RETRACTED**
+Strength: Strong
+
+The original draft flagged `from app import CORE_REPO_ROOT` as an inverted dependency and proposed an environment variable or a `paths.py` shim. The module docstring in `model_stats_client.py` explicitly documents *why* the import exists:
+
+> "not vendored – model-stats.db and model-stats-db.js both live in the core repo, so this stays pointed at `AGENT_MANAGER_CORE_REPO_ROOT/src/model-stats-db.js` (via `app.py`'s `CORE_REPO_ROOT`) rather than a relative `__file__` path, which does not hold from this repo's different directory depth."
+
+The path is resolved relative to the **core** repo root, which is a runtime value established by the app bootstrap. A static env-var default or a new `paths.py` module would either (a) duplicate the same resolution logic without eliminating the dependency, or (b) hard-code a path that is wrong at the Chat-plugin repo's directory depth—exactly the failure mode the comment warns about. The circular-import risk cited in the draft is speculative: `model_stats_client` is a leaf in the import graph shown and no reverse import chain was identified.
+
+**Action:** No change. The current `from app import CORE_REPO_ROOT` is the documented, intentional mechanism for cross-repo path resolution. Introducing an indirection layer would add complexity without removing the underlying dependency and risks breaking the path at the plugin repo's depth.
+
+---
+
+### Summary
+
+Both ACs in the original draft were based on misreadings of the provided source. After correction, **no refactoring action is recommended** for the two files under review. The private `_is_plain_row` helper and the `app.CORE_REPO_ROOT` import are each appropriate to their context, and the tests / consumers interact with them in ways that do not create the coupling or dependency problems the draft described.
+
+### AC-96 · `providerLabel` name collision between sibling view helpers
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` export a function named `providerLabel`, yet the two implementations differ in both parameter shape (`row` vs. `session`) and output format (sessions-view produces `"Claude · <model>"` while swap-view produces `"Claude · <model> · <account>"`). Because they live in the same directory, share the same "DOM-free helpers consumed by chat.js" contract, and cross-reference each other in comments, a reader of the single consumer (`chat.js`) must maintain a manual import alias to disambiguate the two, and every call-site becomes a small puzzle: which `providerLabel` is in scope here, and does this code path need the short form or the account-aware form? The shared name also creates a maintenance hazard—any future edit applied to one function (e.g., adding a new field to the label) can be accidentally mirrored onto the other simply because they look like the same helper.
+
+Solution:
+Rename one of the two exports to make the distinction self-evident at the import and call-site level. The natural choice is to rename the swap-view export to `swapProviderLabel` (or, if the sessions-view form is considered the "default", rename that one to `rowProviderLabel`). Update the single import in `chat.js` to use the new name directly, removing the alias. Add a one-line comment in each file noting the sibling's export name so the pair remains discoverable without a cross-file search.
+
+Benefits:
+The import in `chat.js` becomes unambiguous and self-documenting—no alias, no mental bookkeeping about which `providerLabel` is which. New contributors reading either file immediately see a name that encodes the context (swap vs. session row), reducing the chance that a label-format change intended for one view is accidentally applied to the other. The cross-referencing comments in the two files become less load-bearing, since the names themselves now carry the disambiguation.
+
+### AC-97 · Inconsistent error propagation in local-turn streaming path
+Strength: Strong
+Files: internal_api_client.py, app.py, routes/chat.py
+
+Problem:
+The internal API client establishes a clear error-handling contract: `get_roots`, `preempt`, and `reserve` all raise `InternalApiError` (aliased as `LocalToolClientError`) on transport failures, and the `_call_chat` wrapper in `app.py` is purpose-built to catch that exception and translate it into a clean HTTP 502 response. `stream_local_turn`, however, violates this contract by catching `requests.RequestException` and yielding a `{"type": "error", "error": ...}` dictionary into the stream instead of raising. Because the exception never propagates, `_call_chat` cannot intercept it, and the route handler in `routes/chat.py` is forced to manually inspect each yielded dictionary for an `"error"` type to detect transport failures. This conflates in-payload data errors (which are legitimate stream content) with transport-level failures (which should surface as HTTP errors), breaking the unified error-handling pattern the rest of the client relies on.
+
+Solution:
+Modify `stream_local_turn` in `internal_api_client.py` so that when a `requests.RequestException` is raised during the initial connection or stream setup, the function raises `InternalApiError` (or `LocalToolClientError`) rather than yielding an error dictionary. The existing `_call_chat` wrapper in `app.py` will then catch the exception and return the standard HTTP 502 response, exactly as it does for the other client methods. In-payload error events that arrive *after* the stream has successfully started can still be yielded as dictionaries, preserving the distinction between transport failures and application-level stream content.
+
+Benefits:
+The error-handling contract for the internal API client becomes uniform across all endpoints, eliminating the need for special-case dictionary inspection in `routes/chat.py`. Transport failures during the local-turn stream are reported with the correct HTTP status code (502) and consistent error body, making monitoring, logging, and client-side retry logic simpler and more predictable. The routing layer no longer needs to distinguish between "the stream contained an error object" and "the connection itself failed," reducing cognitive load and the surface area for missed error paths.
+
+### AC-98 · Duplicate provider-labeling logic across view modules
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js, static/chat.js
+
+Problem:
+Both `sessions-view.js` and `swap-view.js` export a function named `providerLabel` that performs nearly identical work: checking whether the provider is `'claude'`, checking for a model string, and concatenating them with a middle-dot separator. The only substantive difference is that the `swap-view.js` variant also appends an account string. Because both are exported and consumed by `chat.js`, the rendering layer must import two modules and manage two separate functions that do 90 % of the same job. This violates locality and creates a maintenance hazard: any UI-design change (a different separator, a new provider type, a formatting tweak) requires the developer to remember to update both files in lockstep, and a missed update silently produces inconsistent labels across panels.
+
+Solution:
+Extract the shared provider-labeling logic into a single utility module (e.g. `provider-format.js`) that exports one `providerLabel` function accepting the provider, model, and an optional account string. Both `sessions-view.js` and `swap-view.js` (and any future view module) import from that one location. The `chat.js` consumer no longer needs to import two modules just to get a label; it can call the shared function directly or receive already-formatted strings from the views.
+
+Benefits:
+A single source of truth for provider display formatting eliminates the risk of the two panels drifting apart after a UI change. Adding a new provider type or changing the separator is a one-line edit in one file. The import graph in `chat.js` simplifies, and future view modules can adopt the same label format without copy-pasting logic.
+
+### AC-99 · Copy-pasted case-insensitive substring filtering in sessions-view
+Strength: Strong
+Files: static/sessions-view.js
+
+Problem:
+`sessions-view.js` contains two functions—`filterRows` (for terminal sessions) and `filterChats` (for chat sessions)—that implement the exact same case-insensitive substring-matching algorithm. The only difference is the set of fields each checks: `filterRows` inspects `name`, `cwd`, and `host`, while `filterChats` inspects `title` and the result of `providerLabel(r)`. The core logic (trimming the query, lowercasing, empty-string short-circuit, substring test) is duplicated verbatim. A bug in the matching algorithm—Unicode normalization, special-character handling, or a future requirement like diacritic-insensitive search—must be discovered and fixed in two places, and a fix applied to only one will leave the other panel behaving inconsistently.
+
+Solution:
+Introduce a single `filterByFields(rows, query, fields)` helper inside `sessions-view.js` (or in a shared utility if other modules need it). The helper trims and lowercases the query, short-circuits on empty input, and returns the subset of rows where at least one of the caller-supplied field accessors produces a string containing the query. `filterRows` becomes `filterByFields(rows, q, [r => r.name, r => r.cwd, r => r.host])` and `filterChats` becomes `filterByFields(chats, q, [r => r.title, r => providerLabel(r)])`.
+
+Benefits:
+The matching algorithm lives in exactly one place, so any correctness fix or enhancement (Unicode normalization, fuzzy matching, etc.) is applied uniformly to both panels. Adding a new filterable field to either panel is a one-element change to the field list rather than a copy-paste of the entire loop. The two public functions become thin, readable one-liners that make the intent obvious.
+
+### AC-100 · Duplicated and Divergent Provider Labeling Logic
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both files export a function named `providerLabel`, but they implement different logic and return different string formats for the same underlying data concepts (provider, model, account). `sessions-view.js` returns `"Claude · <model>"` or `"Local · <model>"` and does not handle accounts, while `swap-view.js` returns `"Claude · <model> · <account>"` or `"Local · <model>"` and explicitly handles the `account` field, distinguishing between `null` (live account) and specific labels. This creates a tight coupling to specific string formats in the UI layer: if the display format needs to change (adding a status indicator, changing the separator, standardizing how "Local" vs "Claude" is presented), a developer must find and update both functions. The core provider-detection logic (`provider === 'claude'`, `provider === 'local'`) is duplicated, violating DRY and creating a risk of divergence where one file adds a new provider type or adjusts its format and the other does not, leading to inconsistent UI labels for the same session depending on which view is active.
+
+Solution:
+Extract the provider/model/account labeling logic into a shared utility module (e.g., `static/labels.js` or `static/format.js`) that exports a single `formatProviderLabel(session)` function handling all provider types, model presence, and account details. Both `sessions-view.js` and `swap-view.js` should import and use this shared function. If `sessions-view.js` specifically needs a shorter label without the account segment, it can pass a configuration flag (e.g., `{ includeAccount: false }`) or call a separate `formatShortProviderLabel` exported from the same shared module, ensuring the core provider detection and base string construction remain centralized in one place.
+
+Benefits:
+Provider labeling logic lives in a single source of truth, making it easier to maintain and audit. The same session is labeled consistently across different views (session switcher vs. swap menu), eliminating the risk of one view showing a stale or divergent format. UI components depend on a shared formatting utility rather than duplicating business logic about how to interpret provider/model/account data, and adding new providers or changing label formats requires updating only one module.
+
+### AC-101 · Duplicated `providerLabel` with divergent semantics across view modules
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` export a function named `providerLabel` that formats a provider/model pair, but they implement different rules and return different shapes. `sessions-view.js` returns a simple display string (e.g., `"Claude · gpt-4"` or `"Local"`) with no account information, while `swap-view.js` returns a richer string (e.g., `"Claude · gpt-4 · live account"`) and handles account-pinning logic. Both accept a single object argument (`row` / `session`) and extract `provider`, `model`, and (in the swap case) `account` internally.
+
+The practical cost is twofold. First, the core "how do we describe a provider/model pair" logic is duplicated: if the naming convention changes (a new provider type, a different separator, a locale requirement), both files must be updated independently, and a missed update in one produces inconsistent labels across the UI. Second, any consumer that needs both variants (such as a shared `chat.js` orchestrator) must import them under distinct local names (`import { providerLabel as sessionLabel } from './sessions-view.js'`), which is a small but recurring source of confusion and typos, and it obscures the fact that the two functions are supposed to be the same concept.
+
+Solution:
+Extract a single shared utility module (e.g., `static/provider-label.js`) that exposes one function with the same single-object signature the existing code already uses:
+
+```js
+// static/provider-label.js
+export function providerLabel(row) {
+  // row: { provider, model, account? }
+  const base = formatBase(row.provider, row.model); // e.g. "Claude · gpt-4"
+  if (row.account != null && row.account !== "") {
+    return `${base} · ${row.account}`;
+  }
+  return base;
+}
+```
+
+Because the signature is identical to what both existing exports already accept (a single object with `provider`, `model`, and optionally `account`), the change is a drop-in replacement: each call site that currently writes `providerLabel(row)` or `providerLabel(session)` simply changes its import source from the local module to `./provider-label.js`. No caller needs to destructure or re-shape its argument. The old per-module `providerLabel` exports are removed.
+
+Benefits:
+A single source of truth for provider/model display strings means a convention change is made in exactly one place, guaranteeing consistent labels across every view. The need to alias two same-named imports disappears, so any module can `import { providerLabel } from './provider-label.js'` unambiguously. The shared function is trivially unit-testable in isolation, and the view modules become thinner, focusing solely on DOM/rendering concerns rather than string-formatting policy.
+
+### AC-102 · Inconsistent "no account" representation (null vs. empty string) in swap-view
+Strength: Worth exploring
+Files: static/swap-view.js
+
+Problem:
+In `static/swap-view.js`, the concept of "no pinned account" (i.e., use the live/default account) is represented as `null` or `undefined` on `session.account`. The `swapOptions` filter (`o.account !== current`) and the `swapBody` construction (omitting `account` when it is `null`/`undefined`) both treat `null`/`undefined` as the sentinel. However, if `session.account` ever arrives as an empty string `""`—for example from a form field that was cleared but not set to `null`, or from a deserialized API response that uses `""` as a default—the filter becomes `o.account !== ""` (which silently drops any account whose label is empty, an unintended side-effect) and `swapBody` will include `account: ""` in the POST payload, potentially tripping backend validation or creating a phantom "empty-string account" record. The module has no single normalization point that maps all "no account" representations to one canonical value before the filter and body-construction logic runs.
+
+Solution:
+Introduce a small normalizer at the top of the `swapOptions` and `swapBody` code paths (or as a shared helper in the same module): `const current = (session.account == null || session.account === "") ? null : session.account;`. Use this normalized `current` value for both the filter comparison and the body-omission check. Additionally, add a brief comment (or a tiny `normalizeAccount` helper) documenting that `null`, `undefined`, and `""` are all treated as "no pinned account," so future contributors understand the contract. If the backend API contract specifies that `account` must be absent (not `""`) when no account is pinned, the normalizer guarantees the client never sends the empty-string variant.
+
+Benefits:
+The UI and API contract align regardless of which "no account" representation arrives from the session object, eliminating a class of subtle bugs where an empty-string account leaks into filter logic or POST bodies. The normalization is a one-line change with no behavioral impact on the already-correct `null`/`undefined` paths, so the risk of introducing a regression is minimal. Future code that reads `session.account` can rely on the documented invariant rather than re-deriving the sentinel semantics locally.
+
+### AC-103 · Centralize Internal API error-handling in a single helper
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+The three non-streaming public functions in `internal_api_client.py` (`get_roots`, `preempt`, `reserve`) each independently wrap their `requests` call in a `try/except requests.RequestException` block that raises `InternalApiError`. This duplicates the connection-level error-handling contract—exception type, message format, and any status-code checking—across three call sites within the same module. Any future change to the error contract (adding retries, circuit-breaking, or altering the message format) requires editing three separate blocks and risks them drifting out of sync.
+
+Solution:
+Introduce a private helper (e.g. `_request(method, url, **kwargs)`) that performs the HTTP call, inspects the response status, and wraps any `requests.RequestException` into `InternalApiError` with a consistent message. Each of the three non-streaming public functions then calls `_request` and focuses exclusively on building its specific payload and parsing the response body. The public signatures remain unchanged, so no caller code is affected.
+
+`stream_local_turn` is deliberately excluded from this helper. It uses `requests.post(..., stream=True)` and iterates over `r.iter_lines()` inside a generator, yielding chunks to the caller. Forcing that flow through a uniform `_request` wrapper would either break the generator contract or require a complex abstraction that obscures the yield semantics. Its initial-connection `try/except` remains in place, co-located with the streaming iteration where it belongs.
+
+Benefits:
+The error-handling contract for the three non-streaming endpoints lives in exactly one place, making it trivial to audit and to evolve (retries, timeouts, circuit-breakers) without touching the public functions. The module's public API is unchanged, so downstream callers in `routes/chat.py` and elsewhere require no modification. The streaming function retains an explicit, generator-appropriate error path that does not fight the yield contract.
+
+### AC-104 · Resolve the model name inside `reserve()` to decouple routes from the provider module
+Strength: Strong
+Files: internal_api_client.py, routes/chat.py
+
+Problem:
+Three handlers in `routes/chat.py` (`api_chat_close`, `api_chat_message`, `api_chat_reserve`) each perform a local `import ollama_client` solely to read `ollama_client.MODEL` (which is just `os.environ.get("LOCAL_MODEL")`) and pass it as a positional argument to `internal_api_client.reserve()`. This forces the routing layer to import a specific provider module just to supply an environment variable, coupling route handlers to one particular model-client implementation.
+
+Solution:
+Change the `reserve()` signature to `def reserve(reservation_id: str, model: str = None, on: bool = True) -> dict` and, at the top of the body, add `if model is None: model = os.environ.get("LOCAL_MODEL")`. The existing `if model:` guard before serializing into the JSON body already handles the falsy case. Then, in each of the three handlers in `routes/chat.py`, delete the `import ollama_client` line and call `reserve(session_id, on=…)` without the model argument.
+
+Benefits:
+The routing layer becomes provider-agnostic: it depends only on `internal_api_client` and shared app helpers, not on a specific model-client module. Swapping or adding a local model provider later requires no changes to route files. The env-var read is co-located with the HTTP call that actually consumes the value, making the dependency explicit in one place rather than scattered across three handlers.
+
+### AC-105 · Provider-Specific Reservation Logic in Generic Routing
+Strength: Strong
+Files: test_chat_routes_swap.py, internal_api_client.py
+
+Problem:
+The `POST /api/chat/<id>/swap` endpoint embeds provider-specific reservation-release logic directly in the generic routing layer. The test `test_leaving_local_while_reserved_releases_the_reservation` in `test_chat_routes_swap.py` asserts that the swap route calls `internal_api_client.reserve(SID, ollama_client.MODEL, False)` when a session leaves the `local` provider. This means the route must import `ollama_client` solely to obtain the model name and must know the positional shape of the `reserve` API, tightly coupling a provider-agnostic routing endpoint to one specific provider's client module.
+
+Solution:
+Move the model-name resolution inside `internal_api_client.reserve()` itself. The method should accept the session ID and a boolean flag (e.g., `reserve(SID, release=True)`) and resolve the model name internally via `os.environ.get("LOCAL_MODEL")`, which is already the canonical source for the local model identifier. The swap route then calls `internal_api_client.reserve(SID, release=True)` and no longer imports `ollama_client` or references `ollama_client.MODEL` at all. This keeps the fix within a module that is already part of the current architecture (`internal_api_client.py`) and aligns with the resolution strategy already outlined in AC-41/AC-42.
+
+Benefits:
+The routing layer no longer depends on a specific provider's client module or its exported constants. Adding a new provider that manages its own reservations (e.g., a GPU pool or a rate-limited remote service) requires no changes to the swap route—only a new branch inside `internal_api_client.reserve()` or a provider-specific override. The "what model to release" knowledge is co-located with the reservation mechanism that actually uses it, improving locality, testability, and long-term maintainability.
+
+### AC-106 · Duplicated and divergent provider-labeling logic across view modules
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` independently define a `providerLabel` function that maps a `provider` field to a human-readable display string, but they handle the `claude` provider differently: `sessions-view.js` renders `'Claude'` or `'Claude · <model>'`, while `swap-view.js` renders `'Claude · <model> · <account>'` or `'Claude · live account'`. Beyond the formatting divergence, the two implementations also guard against `null`/`undefined` inputs with different patterns (`row &&` vs. `session || {}`), so a change to the backend's data shape requires touching both files independently and keeping them in sync by hand. The split logic creates a tight coupling to each file's assumed data shape and invites subtle inconsistency the moment the provider or account fields evolve.
+
+Solution:
+Extract the provider-labeling logic into a single shared utility module (e.g. `static/provider-label.js`) that exports one `providerLabel(session, options)` function. The function should:
+
+1. Normalize the input with a single guard (`const s = session || {}`).
+2. Accept an `options` object (defaulting to `{ includeAccount: false }`) that controls whether the `account` field is appended to the display string.
+3. Build the display string from whichever of `provider`, `model`, and `account` are present, including `account` **only** when `options.includeAccount` is truthy.
+
+Call sites:
+
+- `static/sessions-view.js` calls `providerLabel(row)` (or `providerLabel(row, { includeAccount: false })`), preserving its existing `'Claude · <model>'` format without an account segment.
+- `static/swap-view.js` calls `providerLabel(session, { includeAccount: true })`, preserving its existing `'Claude · <model> · <account>'` format.
+
+Both files import the shared function, replacing their local definitions. The shared module becomes the single source of truth for the base mapping (provider → display name, model suffix), while the `includeAccount` flag lets each view opt in or out of the account segment without duplicating the core logic. The null/undefined guard is written once and applied uniformly.
+
+Benefits:
+A future change to how the backend reports provider or model requires editing exactly one file instead of two, eliminating the risk that the two views drift apart. The unified null-guard removes a class of subtle bugs where one view crashes or renders `undefined` while the other silently defaults. The explicit `includeAccount` option makes the formatting contract at each call site self-documenting: a reader of `sessions-view.js` sees that it intentionally omits account, and a reader of `swap-view.js` sees that it intentionally includes it. New view modules that need a provider label can import the same function and pass the appropriate option rather than re-implementing the mapping, keeping the display contract consistent across the application.
+
+### AC-107 · Centralize "Plain Row" Filtering in handoff.py
+Strength: Strong
+Files: handoff.py, chat_sessions.py
+
+Problem:
+The rule for which transcript rows count as "plain" conversational turns (excluding error notices and swap audit markers) is implemented independently in two modules. `handoff.py` defines `_is_plain_row` as a pure, I/O-free helper, and its docstring explicitly notes that it mirrors the logic in `chat_sessions._build_local_messages`. Because `chat_sessions.py` carries its own copy of the same classification logic, the definition of a valid transcript row is split across a pure-logic module and an I/O-heavy session-management module. If the criteria change—for example, a new system-message type that should be excluded from handoff summaries but retained in local context, or the inverse—a developer must remember to update both locations. Divergence between the two implementations would cause the handoff text and the local model context to include or exclude different rows during provider swaps, producing inconsistent model behavior.
+
+Solution:
+Refactor `chat_sessions.py` to import and call `handoff._is_plain_row` (or a thin public wrapper such as `handoff.is_plain_row`) inside `_build_local_messages`, removing the duplicated inline filtering. `handoff.py` already owns token-counting and handoff-text construction and is described as a "pure hand-off helper" with no I/O, making it the natural single home for the row-classification domain rule. No new dependency is introduced because `chat_sessions.py` already depends on `handoff.py` for swap operations.
+
+Benefits:
+The "plain row" rule now exists in exactly one place, eliminating the risk of silent logic drift between handoff calculation and local message building. Future changes to transcript row types (e.g., introducing "tool" or "system" rows) require a single edit in `handoff.py` and propagate automatically to `chat_sessions.py`. The pure-logic module retains full ownership of the domain rule, while the I/O-heavy session module simply consumes it, improving locality of behavior and reducing the cognitive load on developers touching either file.
+
+### AC-108 · Inconsistent error-handling contract between streaming and non-streaming paths in internal_api_client
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+The module exposes both non-streaming helpers (`get_roots`, `preempt`, `reserve`) and a streaming helper (`stream_local_turn`). The non-streaming functions follow a uniform contract: they catch `requests.RequestException` and re-raise a domain-specific `InternalApiError`, so callers need only one `except` clause to detect failure. `stream_local_turn`, however, catches the same exception class and instead yields a dictionary `{"type": "error", ...}` into the iterator. A caller that has already written `try/except InternalApiError` around the non-streaming calls must now also inspect every yielded item for an error payload when consuming the stream, effectively forcing two different failure-detection strategies inside the same module. This splits the module's public error contract in two and makes it easy for a new caller to handle one path correctly and miss the other.
+
+Solution:
+Unify the contract by having `stream_local_turn` raise `InternalApiError` (or a dedicated `InternalApiStreamError` subclass) on transport-level failures before the generator begins yielding, rather than encoding the failure as a data item. If the failure can only be detected mid-stream (e.g., the connection drops after the first chunk), the generator should raise the exception at that point rather than yielding an error dict. Callers that need to distinguish "stream ended normally" from "stream failed" can then rely on a single exception type, and the `{"type": "error"}` payload convention can be reserved for application-level errors that are part of the protocol rather than transport failures.
+
+Benefits:
+Callers need only one `except` clause regardless of whether they invoke a non-streaming or streaming helper, reducing the chance of a silently swallowed transport error. New contributors can rely on a single, documented error contract for the entire module. It also makes it straightforward to add cross-cutting concerns—retry logic, structured logging, metrics—around a single exception type instead of branching on payload shape.
+
+### AC-109 · Scattered environment-variable resolution for core-repo configuration
+Strength: Worth exploring
+Files: app.py, internal_api_client.py
+
+Problem:
+`app.py` resolves `CORE_REPO_ROOT` by reading `AGENT_MANAGER_CORE_REPO_ROOT` from `os.environ`, while `internal_api_client.py` independently resolves `CORE_DASHBOARD_URL` by reading `AGENT_MANAGER_CORE_DASHBOARD_URL` from `os.environ`. Each file performs its own lookup, defaulting, and (potentially) validation at import time. There is no single place where the set of `AGENT_MANAGER_CORE_*` variables is documented, validated, or given consistent defaulting behaviour. Adding a new cross-cutting concern—such as a startup warning when a variable is unset, a shared default-derivation rule (e.g., dashboard URL derived from repo root), or a test-override mechanism—requires touching every file that reads the environment, and it is easy to miss one.
+
+Solution:
+Introduce a small configuration module (e.g., `config.py` or a `settings` dataclass) that reads all `AGENT_MANAGER_CORE_*` variables once at import time, applies defaults and validation in one place, and exposes the resolved values as module-level constants or a frozen dataclass. Both `app.py` and `internal_api_client.py` would then import the resolved values from that single module rather than calling `os.environ` themselves.
+
+Benefits:
+Configuration resolution, validation, and defaulting live in one auditable location, making it trivial to add logging, a `--dry-run` check, or a test fixture that monkey-patches a single object. New environment variables can be added in one file without hunting for every `os.environ` call site. It also makes the set of required/optional variables self-documenting, reducing onboarding friction and the risk of a typo in a variable name going unnoticed until runtime.
+
+### AC-110 · Duplicated token resolution and header construction in agent_client.py
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+The logic to resolve the correct Bearer token for a given host and build the `Authorization` header is duplicated across both `list_all()` and `open_events()`. Each function independently calls `agent_hosts.read_token(host)` and conditionally assembles the `headers` dictionary, meaning any change to the authentication mechanism—such as adding a new header, switching token formats, or introducing a fallback—must be replicated in every call site. This duplication is a maintenance hazard: a fix applied to one function can easily be missed in the other, leading to subtle auth mismatches between endpoints.
+
+Solution:
+Introduce a private helper function in `agent_client.py` (e.g., `_auth_headers(host)`) that encapsulates the token retrieval via `agent_hosts.read_token(host)` and the conditional construction of the `headers` dictionary. Both `list_all()` and `open_events()` (and any future endpoint functions) call this single helper, eliminating the repeated logic.
+
+Benefits:
+Reduces code duplication and ensures that authentication changes are made in exactly one place. Improves readability by abstracting low-level HTTP setup details away from the endpoint-specific logic, and makes it straightforward to add new authenticated endpoints without re-implementing the header boilerplate.
+
+### AC-111 · Duplicated provider-labeling logic across view modules
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` export a function named `providerLabel` that formats provider/model display strings, but each implementation diverges: the sessions view produces `"Claude · <model>"` or `"Local · <model>"`, while the swap view appends an account segment (`"Claude · <model> · <account>"`). There is no shared abstraction, so any change to provider naming conventions—adding a new provider, altering the separator character, or updating how accounts are surfaced—requires synchronized edits in two separate files with no compile-time or test-time guarantee they stay consistent.
+
+Solution:
+Extract a single `formatProviderLabel(provider, model, account)` utility into a common module (e.g., `static/provider-label.js`) that both views import. The utility accepts an optional `account` parameter; when omitted it renders the two-segment form, when present it renders the three-segment form. Both `sessions-view.js` and `swap-view.js` delegate to this one function, eliminating the duplicated and divergent logic.
+
+Benefits:
+Provider display rules live in exactly one place, so adding a new provider, changing the separator, or adjusting account-display logic is a single-file edit. The risk of the two views silently drifting apart (e.g., one showing a new provider name and the other not) is eliminated, and a unit test against the shared utility covers both call-sites.
+
+### AC-112 · Implicit host-discriminator contract in SSE row matching
+Strength: Worth exploring
+Files: static/sessions-view.js
+
+Problem:
+In `static/sessions-view.js`, the `applyTerminalEvent` path uses `matchesRow` to decide whether an incoming SSE event upserts or removes a row. The matching key switches between a composite `rowKey` (host + id) and a bare `id` depending on whether the event payload carries a `host` field. This makes `host` the implicit discriminator for row identity, but the contract is undocumented and unenforced: if a `session.updated` event arrives with a `host` that differs from the row's stored host (a rename, a misconfigured relay), the row is treated as a new session and a duplicate appears; conversely, if `host` is simply omitted from an update for a host-aware session, matching falls back to `id` alone and can update the wrong row when the same `id` exists on multiple hosts.
+
+Solution:
+Make the identity contract explicit and uniform. Decide whether terminal-session rows are always keyed by `host/id` or always by `id` alone, and enforce that choice in `matchesRow` regardless of whether the event payload happens to include `host`. If host-aware matching is required, add a validation step in the reducer that rejects (or logs and drops) events whose `host`/`id` pair does not correspond to an existing row, and document the expectation that upstream emitters must always include `host` for host-scoped sessions.
+
+Benefits:
+The row-identity rule becomes a single, auditable decision rather than an emergent behavior of payload shape. Duplicate-row and wrong-row-update failure modes are either structurally impossible or explicitly logged, reducing debugging time for operators who see inconsistent terminal-session lists after a host rename or a relay misconfiguration.
+
+### AC-113 · Provider-specific token budgeting in a generic handoff module
+Strength: Worth exploring
+Files: handoff.py
+
+Problem:
+The `window_tokens` function in `handoff.py` hardcodes a mapping of provider names ("claude", "local") to specific environment variables (e.g., `AGENT_MANAGER_CHAT_CLAUDE_WINDOW_TOKENS`, `AGENT_MANAGER_CHAT_LOCAL_WINDOW_TOKENS`) and their default token counts. The code documents this as an intentional, scoped design: the module is a pure helper with no I/O, and the mapping is treated as configuration data rather than logic. That is a reasonable choice for the current two-provider scope. However, the practical consequence remains that adding a third provider requires editing `handoff.py` to insert a new key, environment-variable name, and default into the map. For a team that anticipates growing the provider set, this creates a small but recurring touch-point in a module that is otherwise provider-agnostic in its logic (it accepts a `provider` string and applies a uniform resolution path).
+
+Solution:
+If the provider set is expected to grow, the mapping can be externalised to a registry or a per-provider configuration layer so that `handoff.py` resolves the token budget by looking up the active provider in a shared structure rather than naming each one. This is an optional extensibility improvement, not a correction of a defect; the current inline map is perfectly adequate for two providers.
+
+Benefits:
+When a new provider is added, its window-token configuration lives alongside the rest of that provider's settings, and `handoff.py` needs no modification. The change is low-risk and can be deferred until a third provider is actually planned.
+
+### AC-114 · Token estimation heuristic is not centralised
+Strength: Worth exploring
+Files: handoff.py
+
+Problem:
+`handoff.py` defines `estimate_tokens` as a simple `math.ceil(len(text or "") / 4)` heuristic. The function is defined locally in the handoff module rather than in a shared utility. From the provided inputs, `handoff.py` is the only module that contains this heuristic; no other file in the set was shown to duplicate it. The concern is therefore not a confirmed duplication but a *fragility*: if any future module (a context-window guard, a summary trigger, a budget enforcer) needs the same estimate, it will either re-implement the divisor-of-4 heuristic independently or import a private helper from `handoff.py`, both of which make the estimation strategy harder to change in one place.
+
+Solution:
+Extract the token-estimation logic into a small shared utility module (e.g., `token_utils.py`) that all callers import. The utility can accept an optional model-family parameter so that a caller can supply a more accurate divisor or delegate to a real tokenizer, while `handoff.py` and any future consumer simply call the same function.
+
+Benefits:
+A single, importable source of truth for token estimation means that adjusting the strategy (e.g., switching to a model-specific tokenizer) is a one-line change in one file rather than a search across the codebase for every place the heuristic was re-implemented.
+
+NOTE: Flag 1's core factual point (the design is documented and intentional, not an accidental OCP violation) was applied; the "violation" language was removed and the item reframed as an optional extensibility improvement. Flag 2's point that no duplication is evidenced in the provided inputs was applied; the speculative "likely duplicated in chat_sessions.py / ollama_client.py" claim was removed and the problem restated as a centralisation/fragility concern rather than an asserted duplication.
+
+### AC-115 · Route layer duplicates label validation via private method
+Strength: Strong
+Files: routes/accounts.py, accounts.py
+
+Problem:
+In `api_chat_accounts_make_live`, the route handler calls `accounts._valid_label(label)` — a private method on the accounts module — to decide whether to return a 400 (invalid label) or let `accounts.make_live` raise a `KeyError` for a 404 (unknown label). The `make_live` method itself performs no label-format validation; it only checks membership. This means the route layer must reach into a private helper to replicate business-logic validation, creating a tight coupling: if the label-regex or validation rules in `accounts.py` are updated, the route's pre-check can silently drift out of sync, or the private method can be renamed/removed without the route layer failing at import time.
+
+Solution:
+Move the label-format validation into the public API of `accounts.py`. Either have `make_live` raise a `ValueError` for malformed labels (in addition to the existing `KeyError` for unknown ones), or expose a dedicated `accounts.validate_label(label)` public function. The route handler then simply catches `ValueError` → 400 and `KeyError` → 404, with no direct call to any private helper. Unit tests for `accounts.py` can exercise both error paths without spinning up an HTTP layer, and tests in `routes/` can mock `make_live` to raise either exception and assert the correct status code.
+
+Benefits:
+The route layer becomes a thin exception-to-HTTP-code mapper with no knowledge of label grammar. The public surface of `accounts.py` is self-contained and independently testable with plain `unittest` (no Flask test client required for the validation logic). Renaming or tightening the label regex in one place is sufficient; there is no second copy of the check to keep in sync.
+
+### AC-116 · Lazy import of CHAT_STORAGE_DIR from app.py to dodge circular dependency
+Strength: Worth exploring
+Files: routes/accounts.py, app.py
+
+Problem:
+The module docstring and inline comments in `routes/accounts.py` explicitly note that `from app import CHAT_STORAGE_DIR` is deferred into the body of each view function because `app.py` imports the blueprint from `routes/accounts.py`, which would otherwise create a circular import at module-load time. This forces every view that needs the storage path to repeat the lazy import, makes the blueprint unimportable in isolation (e.g., in a unit test that does `import routes.accounts` without first importing `app`), and ties the route module's runtime behaviour to the specific entry-point module rather than to a stable configuration surface.
+
+Solution:
+Extract `CHAT_STORAGE_DIR` (and any other shared constants) into a standalone `config.py` module that has no imports from `app.py` or `routes/`. Both `app.py` and `routes/accounts.py` import from `config.py` at the top of the module, eliminating the circular dependency entirely. If the value must be set at runtime (e.g., from an environment variable or CLI flag), `config.py` can expose a `configure(...)` function that `app.py` calls once at startup; the route module simply reads `config.CHAT_STORAGE_DIR` at call time without an import-time cycle.
+
+Benefits:
+The lazy-import workaround and its explanatory comments disappear, making `routes/accounts.py` importable and unit-testable with plain `unittest` without first importing the full application. The blueprint can be registered in a test app or a different entry point without special-casing the import order. Adding a new route that needs the storage path no longer requires remembering to place the import inside the function body.
+
+### AC-117 · Circular import workaround couples routing layer to application entry point
+Strength: Strong
+Files: routes/accounts.py, app.py
+
+Problem:
+`routes/accounts.py` performs a lazy import of `CHAT_STORAGE_DIR` from `app` inside both `_accounts_body` and the `api_chat_accounts_make_live` handler. The docstring in the file explicitly documents this as a workaround for the circular import that arises because `app.py` imports the module to register its blueprint. As a result, the routing layer is forced to reach into the application entry point to resolve a single configuration path, violating dependency inversion. Any consumer that wants to test or reuse the accounts blueprint in isolation must either stub out `app` or replicate the lazy-import dance, and the import graph acquires a back-edge from a leaf module to the composition root that is invisible to static analysis tools.
+
+Solution:
+Extract the storage-directory resolution logic (or the `CHAT_STORAGE_DIR` constant) into a dedicated configuration module such as `config.py`, or inject it through the blueprint's factory function so the value is passed in at registration time. `routes/accounts.py` then imports the configuration directly from `config` (or receives it as a closure parameter) and no longer references `app` at all. The circular import disappears because the dependency now flows one way: `app → config` and `routes/accounts → config`, with no back-edge to the entry point.
+
+Benefits:
+The routing module becomes provider-agnostic and independently importable, which simplifies unit testing (no need to mock `app`) and makes the blueprint reusable in alternate entry points or test harnesses. The import graph loses its cycle, so tools like `pylint`, `import-linter`, or IDE navigation no longer flag or mis-order the relationship. Future changes to where the storage directory lives require touching only `config.py` rather than hunting for every lazy-import site in the routing layer.
+
+### AC-118 · "Exactly one live account" invariant enforced in multiple places
+Strength: Worth exploring
+Files: accounts.py
+
+Problem:
+The invariant that exactly one account carries the `live` flag is enforced in at least three separate code paths within `accounts.py`: `_enforce_one_live` (invoked during `load`), the `make_live` function (which manually flips the flag), and the `add` function (which sets `live` on the first account). Each site re-implements the "turn off the others, turn on this one" logic independently. If the invariant ever evolves—say, to allow zero live accounts during a migration window, or to add an audit log entry on transition—every site must be found and updated in lockstep, and a missed site silently produces an inconsistent state.
+
+Solution:
+Introduce a single internal helper, e.g. `_ensure_single_live(storage_path, target_id)`, in `accounts.py` that encapsulates the full transition: read all accounts, clear the `live` flag on every record, set it on the target, and write back. `load`, `add`, and `make_live` all delegate to this helper rather than manipulating the flag themselves. The helper becomes the sole mutation point for the `live` field, and any future policy change (logging, validation, atomicity) is made in one place.
+
+Benefits:
+The invariant is auditable in a single function, reducing the risk of a future edit breaking the "exactly one" guarantee in one path while leaving others correct. New contributors see one canonical implementation instead of three subtly different ones. The helper is trivially unit-testable in isolation (feed it a temp directory, assert the post-condition), whereas testing the invariant today requires exercising each of the three entry points separately.
+
+### AC-119 · Duplicate provider-labeling logic with divergent semantics
+Strength: Strong
+Files: static/sessions-view.js, static/swap-view.js, static/chat.js
+
+Problem:
+Both `static/sessions-view.js` and `static/swap-view.js` export a function named `providerLabel` that formats provider and model information for display, but their implementations and expected data shapes differ significantly. `sessions-view.js` expects a row object with `provider` and `model` fields and returns a string like `'Claude · <model>'` or `'Local'`. `swap-view.js` expects a session object with `provider`, `model`, and `account` fields and returns a string like `'Claude · <model> · <account>'` or `'Local · <model>'`. This tight coupling means the two modules must be kept in sync manually whenever the provider or model display format changes, and it forces the caller (`chat.js`) to know which version to use in which context, violating the principle of locality and increasing the risk of inconsistent UI rendering.
+
+Solution:
+Extract the common provider/model formatting logic into a shared utility module (e.g., `static/provider-label.js`) that accepts a provider, model, and optional account as arguments and returns the formatted string. Both `sessions-view.js` and `swap-view.js` should import and use this shared function, passing the relevant fields from their respective row or session objects. The shared module becomes the single source of truth for how provider and model information is displayed, eliminating the need for callers to track which variant applies where.
+
+Benefits:
+A single formatting function guarantees consistent provider/model display across all views, removes the manual synchronization burden between two modules, and frees `chat.js` from having to select between two subtly different implementations. Future changes to the display format (e.g., adding a new provider or changing the separator) require editing exactly one file rather than hunting for every copy of the logic.
+
+### AC-120 · Routing layer hard-coupled to a specific provider module
+Strength: Strong
+Files: test_chat_routes_swap.py, ollama_client.py, internal_api_client.py
+
+Problem:
+`test_chat_routes_swap.py` imports `ollama_client` directly and passes `ollama_client.MODEL` into `internal_api_client.reserve()`. This forces the generic chat-swap routing and its tests to know about a specific provider implementation (Ollama) and its environment variable `LOCAL_MODEL`. The routing layer is no longer provider-agnostic: any future swap of the local-model backend requires editing route handlers and their tests to point at a different client module and attribute.
+
+Solution:
+Move the model-name resolution into `internal_api_client.reserve()` itself. The function can read `os.environ.get("LOCAL_MODEL")` internally (or accept `model=None` and resolve it there), so callers no longer need to import a provider module just to supply a model string. Remove the `import ollama_client` and the explicit `ollama_client.MODEL` argument from the route handlers and from `test_chat_routes_swap.py`.
+
+Benefits:
+The routing and test layers become provider-agnostic. Adding or swapping the local-model provider later requires no changes to route files or their tests. The environment-variable read is co-located with the HTTP call that actually consumes the model name, making the data flow easier to follow.
+
+### AC-121 · Context-window size contradicts between handoff logic and the Ollama call
+Strength: Strong
+Files: handoff.py, ollama_client.py
+
+Problem:
+`handoff.py` defines `window_tokens()` with a default of **16 384** tokens for the "local" provider (read from `AGENT_MANAGER_CHAT_LOCAL_WINDOW_TOKENS`), and `estimate_tokens()` uses that value to decide whether a summary is needed and to size the handoff text. Meanwhile, `ollama_client.py` hardcodes `"num_ctx": 8192` in its generate options. These are not merely independent assumptions that *might* drift apart — they **actively disagree right now**: the handoff logic sizes text for a 16 384-token window while the actual Ollama call is constrained to 8 192 tokens. Any handoff text that fits within the 16 384 budget but exceeds 8 192 tokens will be silently truncated or rejected by the model, producing a correctness bug in production. There is no shared source of truth tying the two values together.
+
+Solution:
+Extract the context-window constant and the token-estimation helpers into a small shared module (e.g. `model_context.py`) that both `handoff.py` and `ollama_client.py` import. `ollama_client.generate()` should read the window size from this shared helper instead of hardcoding `8192`. `handoff.py`'s `estimate_tokens()` and `window_tokens()` should likewise delegate to the shared helper so the value lives in one place. This resolves the active 16 384-vs-8 192 contradiction and prevents future drift.
+
+Benefits:
+Fixes an active correctness bug: the handoff logic and the provider call now agree on the context window, so handoff text is no longer sized for a window the model will not honour. A single source of truth means changing the local model's window size or the estimation heuristic requires editing one file rather than hunting for hardcoded values across modules, eliminating the entire class of silent-mismatch bugs where the two modules disagree about available tokens.
+
+NOTE: Flag 3 (AC-001) was not applied because the critique's own re-evaluation confirmed that `test_chat_routes_swap.py` does import `ollama_client` and that the draft's description and solution are accurate; no correction was warranted.
+
+### AC-122 · Fragile exception aliasing obscures the true error hierarchy
+Strength: Strong
+Files: local_tool_client.py, internal_api_client.py, app.py
+
+Problem:
+`local_tool_client.py` is a thin compatibility shim that delegates to `internal_api_client.stream_local_turn()`. To preserve its public interface it aliases `InternalApiError` as `LocalToolClientError` (`from internal_api_client import InternalApiError as LocalToolClientError`). Downstream, `app.py`'s `_call_chat` catches `LocalToolClientError` and `ClaudeClientError` as if they were distinct error families. In reality `LocalToolClientError` *is* `InternalApiError`; the alias creates a false abstraction. If `internal_api_client` later introduces sub-types (e.g., `AuthError`, `TimeoutError`) or restructures its hierarchy, the single-class alias in `local_tool_client` silently breaks the contract, and `app.py` will either miss new error types or catch them under the wrong name. The alias also forces `app.py` to import from two modules to handle what is fundamentally one error type, obscuring the true dependency graph.
+
+Solution:
+Remove the alias in `local_tool_client.py`. Either (a) have `local_tool_client.stream_plan_with_tools` catch `InternalApiError` and re-raise it as a genuinely distinct `LocalToolClientError` subclass that carries shim-specific context, or (b) let `InternalApiError` propagate unchanged and update `app.py` to catch `InternalApiError` directly, eliminating `LocalToolClientError` from the public surface. Option (b) is simpler if the shim adds no extra semantics; option (a) is preferable if the shim needs to attach its own diagnostic information. Either way the error hierarchy becomes explicit and the alias is gone.
+
+Benefits:
+The error-handling path in `app.py` reflects the actual type relationships, making it straightforward to reason about which exceptions can be raised from which call site. Adding new error sub-types in `internal_api_client` no longer risks silently breaking the shim's contract, because the shim either re-raises the real type or wraps it in a properly derived class. The dependency graph becomes honest: `app.py` depends on `internal_api_client`'s error types directly rather than through an opaque alias, simplifying refactors and onboarding.
+
+### AC-123 · Centralize host token resolution to eliminate duplicated per-call logic
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+The logic to determine which token to send to a specific host is duplicated across `list_all` and `open_events` in `agent_client.py`. Both functions manually check whether a token exists for the resolved host and then construct the `Authorization: Bearer …` header by hand. This violates the DRY principle and creates a tight coupling where `agent_client.py` is simultaneously responsible for HTTP communication and token resolution. Any future change to the header format, token source, or authentication scheme must be applied in every client function independently, increasing the risk of drift.
+
+Solution:
+Refactor `agent_hosts.py` to expose a single function, such as `get_headers(host)`, that returns the fully constructed `headers` dictionary (including the `Authorization` header when a token is present, and omitting it otherwise). Update `agent_client.py` so that `list_all`, `open_events`, and any future client functions call this single helper instead of reading the token and building the header inline.
+
+Benefits:
+Token resolution logic is localized to the module that already owns host configuration. This reduces the risk of inconsistent header construction across different client functions, simplifies `agent_client.py` by removing its direct dependency on token-resolution details, and gives a single place to audit or extend authentication behavior (e.g., adding a new header or switching to a different scheme).
+
+### AC-124 · Unify host resolution logic between agent_client.py and agent_hosts.py
+Strength: Strong
+Files: agent_client.py, agent_hosts.py, agent_errors.py (new)
+
+Problem:
+`agent_client.py` implements its own `_resolve_host` function to find a host by name or fall back to a single configured host, while `agent_hosts.py` already provides a `get_host` function for name-based lookup. The "default to single host" and "unknown host" error-handling paths are therefore split across two modules. This duplication makes it harder to keep error messages and fallback behavior consistent, and means a change to resolution semantics (e.g., supporting wildcards or a different default strategy) must be made in two places.
+
+Solution:
+1. **Extract the shared exception.** Create a small `agent_errors.py` module containing `AgentError` (moved out of `agent_client.py`). Both `agent_client.py` and `agent_hosts.py` import from this new module, eliminating any risk of a circular import.
+
+2. **Centralize resolution in `agent_hosts.py`.** Add a `resolve_host(name=None)` function that encapsulates the full resolution contract: look up by name, fall back to the single configured host when `name` is `None`, and raise `AgentError` (imported from `agent_errors.py`) when no host can be determined.
+
+3. **Simplify `agent_client.py`.** Remove the local `_resolve_host` implementation. All client functions (`list_all`, `open_events`, etc.) call `agent_hosts.resolve_host(name)` instead.
+
+Benefits:
+Host resolution logic is centralized in the configuration module, ensuring consistent error handling and eliminating code duplication. Because `AgentError` now lives in a shared leaf module, `agent_hosts.py` can raise it without importing from `agent_client.py`, preserving the existing one-way dependency (`agent_client` → `agent_hosts`) and avoiding a circular import. `agent_client.py` becomes a thinner HTTP layer that delegates all host and token concerns to `agent_hosts.py`, improving separation of concerns.
+
+### AC-125 · Duplicated "plain row" filter logic between handoff and chat_sessions
+Strength: Strong
+Files: handoff.py, chat_sessions.py
+
+Problem:
+`handoff.py` defines `_is_plain_row` whose docstring explicitly states it mirrors the two skip rules in `chat_sessions._build_local_messages` (skip rows with a truthy `error` field, skip rows with `marker: True`). The same predicate is therefore implemented in two modules, and the only link between them is a prose note in a docstring. If the definition of a "plain row" ever changes—a new row type is introduced, the `marker` key is renamed, or an additional skip condition is added—both implementations must be updated in lockstep, and nothing in the type system or test suite enforces that they stay in agreement.
+
+Solution:
+Extract the predicate into a single shared helper (e.g. a `is_plain_row(row)` function in a small utility module or in `chat_sessions` itself, imported by `handoff`). Both `handoff.build_handoff` and `chat_sessions._build_local_messages` call the same function, eliminating the duplicated rule and the docstring cross-reference.
+
+Benefits:
+A single source of truth for the "plain row" rule removes the risk of the two implementations drifting apart. Future changes to the row schema require editing exactly one function. The docstring cross-reference becomes unnecessary, and a unit test on the shared helper covers both call sites.
+
+### AC-126 · Inconsistent backend-location strategy between model_stats_client and ollama_client
+Strength: Worth exploring
+Files: model_stats_client.py, ollama_client.py
+
+Problem:
+`model_stats_client.py` resolves its backend path (`model-stats-db.js`) at import time by concatenating a `CORE_REPO_ROOT` constant with a relative sub-path, a choice its own docstring flags as a workaround for the repo's directory depth. `ollama_client.py`, in the same community, locates its backend (the Ollama server URL and model name) via environment variables read at import time. The two clients therefore use different mechanisms for the same concern—"where is my backend?"—and the `model_stats_client` approach is brittle to any reorganisation of the repository layout.
+
+Solution:
+Adopt a single convention for backend location across the community. The simplest path is to let `model_stats_client.py` read its script path from an environment variable (e.g. `MODEL_STATS_DB_JS`) with a sensible default that still uses `CORE_REPO_ROOT`, mirroring the env-var pattern already used by `ollama_client.py`. Alternatively, introduce a tiny shared configuration module that both clients import, so the "where is my backend" question is answered in one place.
+
+Benefits:
+Both clients follow the same configuration-locality convention, making the community easier to reason about and to deploy in different directory layouts. The fragile hard-coded relative path in `model_stats_client.py` becomes overridable without code changes, and the two modules no longer disagree on how to locate their backends.
+
+### AC-127 · Account-registry shape duplicated across two test files
+Strength: Worth exploring
+Files: test_chat_routes_swap.py, test_chat_sessions_account.py
+
+Problem:
+Both `test_chat_routes_swap.py` and `test_chat_sessions_account.py` construct a fake account registry with the same set of keys (`label`, `host`, `tokenFile`, `live`). The swap test does so through an `_add_account` helper that calls `accounts.add(self.storage, label, "example.invalid", FAKE_TOKEN_FILE)`, while the account test builds the registry dict directly via a `_registry` helper. The registry schema is therefore encoded in two test files, and a change to the registry shape (a new required key, a renamed field) would require updating both files independently.
+
+Solution:
+Factor the fake-registry construction into a single shared test helper (e.g. a `make_fake_registry(label, host, token_file, live=True)` function in a small `test_helpers.py` or in a shared `conftest`-style module within the test directory). Both test files import and call that helper, so the registry shape lives in exactly one place.
+
+Benefits:
+A registry-schema change requires editing one helper instead of two test files. New tests that need a fake registry can reuse the same helper, reducing the chance of a subtly wrong shape being introduced. The test suite becomes easier to maintain as the account model evolves.
+
+### AC-128 · Centralize stream-abort signaling in the SSE client
+Strength: Strong
+Files: internal_api_client.py, local_tool_client.py, routes/chat.py
+
+Problem:
+`stream_local_turn` in `internal_api_client.py` reports every failure—whether a definitive server rejection (401/403) or a mid-stream connection drop—by yielding a plain dictionary `{"type": "error", "error": ...}` into the same iterator that carries valid data chunks. The `local_tool_client.py` shim passes this mixed stream through with `yield from`, so the ultimate consumer in `routes/chat.py` must inspect every yielded item for a `type` field to distinguish data from error. This makes the failure mode implicit in the data stream rather than explicit in the control flow: a caller that forgets to check for the error dict will silently treat it as a content chunk, and there is no single `except` clause where the abort can be handled uniformly. The contract is fragile because it depends on every downstream consumer remembering to filter, and it conflates non-retryable rejections with transient network failures under one undifferentiated signal.
+
+Solution:
+Introduce a dedicated `StreamAbortedError` exception in `internal_api_client.py` that carries the same error payload (status code, message, retryability flag). When `r.raise_for_status()` fires or a `ConnectionError` is caught inside the `iter_lines()` loop, raise `StreamAbortedError` instead of yielding an error dict. Update `local_tool_client.py` to let the exception propagate (or re-raise it under its own name if a shim-level alias is desired), and update `routes/chat.py` to wrap the `for` loop in a `try/except StreamAbortedError` block. This converts the implicit data-stream contract into an explicit control-flow signal that the Python type system and exception-handling idioms already support.
+
+Benefits:
+Callers get a single, catchable point of failure instead of having to inspect every yielded item; the distinction between a definitive rejection and a transient drop becomes a field on the exception rather than something the caller must infer from the error message string; and the `yield from` pass-through in `local_tool_client.py` no longer needs to be "error-aware," reducing the surface area of the implicit contract.
+
+### AC-129 · Make the error-type dependency in app.py explicit
+Strength: Worth exploring
+Files: local_tool_client.py, internal_api_client.py, app.py, claude_client.py
+
+Problem:
+`local_tool_client.py` re-exports `InternalApiError` under the alias `LocalToolClientError`. `app.py`'s `_call_chat` catches `LocalToolClientError` (imported from `local_tool_client`) alongside `ClaudeClientError` (imported from `claude_client`). Because the alias is just a name binding, the true origin of the exception type is `internal_api_client.py`, but the import graph visible in `app.py` points to `local_tool_client`. If `local_tool_client` is ever refactored to drop the re-export, or if `internal_api_client` introduces a base `CoreApiError` with `InternalApiError` as a subclass, `app.py` will either break or silently catch a narrower set of exceptions than intended—without any signal in its own import list that the dependency actually lives one module deeper.
+
+Solution:
+Replace the alias in `local_tool_client.py` with a direct re-export that documents the origin (`from internal_api_client import InternalApiError`), and in `app.py` import `InternalApiError` directly from `internal_api_client` for the catch clause. If a domain-specific name is still desired in `app.py`, define a thin `LocalToolClientError(InternalApiError)` subclass in `local_tool_client.py` so the hierarchy is real rather than a name swap, and catch the base `InternalApiError` in `app.py` to future-proof against hierarchy changes.
+
+Benefits:
+The dependency graph in `app.py` matches the actual module that defines the exception, making the coupling visible in the import list. A future refactor of `internal_api_client`'s error hierarchy will surface as a type-checker or import error at the point of use rather than silently changing the semantics of a name that appears to belong to a different module.
+
+### AC-130 · Resolve the local model name inside the client that uses it
+Strength: Worth exploring
+Files: internal_api_client.py, ollama_client.py, routes/chat.py
+
+Problem:
+The `reserve` function in `internal_api_client.py` accepts a `model` parameter that callers populate by reading `os.environ.get("LOCAL_MODEL")` (exposed as `ollama_client.MODEL`). The module already reads `AGENT_MANAGER_CORE_DASHBOARD_URL` from the environment for its own base URL, so it is self-contained for one configuration value but delegates the other to every caller. The knowledge of which environment variable holds the model name is therefore scattered across `ollama_client.py` and each call site in `routes/chat.py`, rather than being co-located with the client that actually sends it to the dashboard. Adding a new caller requires remembering to read the same env var and pass it positionally or by keyword, and a typo in the variable name will only surface at runtime.
+
+Solution:
+Give `reserve` a default of `model=None` and, when `None`, resolve it internally via `os.environ.get("LOCAL_MODEL")` (or a module-level constant read once at import time, mirroring how the dashboard URL is handled). Callers that need to override for testing or multi-model scenarios can still pass an explicit value. Remove the now-unnecessary `MODEL` read from `routes/chat.py` call sites.
+
+Benefits:
+The client is self-contained with respect to the local model's identity, matching its existing pattern for the dashboard URL. New callers no longer need to know the env-var name, and a single change to the variable name (or a move to a config file) is localized to `internal_api_client.py` rather than every call site.
+
+### AC-131 · `providerLabel` name collision between sessions-view and swap-view
+Strength: Worth exploring
+Files: static/sessions-view.js, static/swap-view.js
+
+Problem:
+Both modules export a function named `providerLabel` that is consumed by the same caller (`chat.js`), but they have different signatures and produce different output shapes. `sessions-view.js` takes a row and returns a two-segment string like `"Claude · model"` or `"Local"`, with no account token and no `"Unknown"` fallback. `swap-view.js` takes a session and returns up to three segments (`"Claude · model · live account"`, `"Local · model"`, or `"Unknown"`). Because the names are identical, the import site in `chat.js` must alias one of them, and any developer adding a new call must remember which alias maps to which formatting contract. A silent mix-up would produce a subtly wrong label in the UI—e.g., the swap view showing a two-segment string where the user expects the account, or the session list showing `"Unknown"` where it should show `"Local"`—and the error would be easy to miss in a quick visual pass.
+
+Solution:
+Rename the export in `static/swap-view.js` from `providerLabel` to `swapProviderLabel` (or `sessionProviderLabel`), updating the single import line in `chat.js` and any internal references within `swap-view.js` itself. The rename is a one-line change at the import site and a one-line change at the export site; no logic changes. Alternatively, rename the `sessions-view.js` export to `rowProviderLabel` to emphasise its row-level scope. Either direction removes the collision without altering behaviour.
+
+Benefits:
+Callers in `chat.js` can import both functions by their natural names without an alias, eliminating a class of copy-paste or mis-remembering bugs. New contributors reading the import block see two distinct, self-describing names rather than a name plus an `as` clause. The rename is zero-risk (no logic change, no API surface change beyond the identifier) and costs a single search-and-replace across two files.
+
+### AC-132 · Centralize duplicated token-resolution and Authorization-header construction
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+The logic for resolving the correct Bearer token via `agent_hosts.read_token(host)` and conditionally building the `Authorization` header dictionary is duplicated across `list_all()` and `open_events()`. Both functions independently check whether a token was returned and assemble the `headers` dict in the same way. This tight coupling to the token-resolution mechanism in multiple call sites means any future change—supporting a new token type, adding an additional auth header, or handling a distinct error state when the token file is missing or unreadable—requires touching every function that makes an authenticated request, increasing the risk of inconsistency or a missed update.
+
+Solution:
+Introduce a small private helper, e.g. `_get_auth_headers(host)`, that encapsulates the token lookup and header construction in one place. Both `list_all()` and `open_events()` (and any future request-building method) would call this helper instead of repeating the `read_token` / conditional-`headers` pattern. The helper can also centralize error handling for the token-lookup step, returning an empty dict or raising a domain-specific exception as appropriate.
+
+Benefits:
+A single code path owns the auth-header contract, so adding a new header, swapping the token source, or changing the failure mode is a one-line change in the helper rather than a multi-site edit. It also makes the intent of each public method clearer, since the auth boilerplate is extracted, and reduces the chance that one call site drifts out of sync with another during refactoring.
+
+### AC-133 · ~~Inconsistent error-handling contract for the local-provider path~~ — **Retracted**
+Strength: N/A (misdiagnosis)
+Files: app.py, local_tool_client.py, internal_api_client.py
+
+**Correction:** The original draft claimed that because `stream_local_turn` is a generator, an exception raised inside it during iteration would be "yielded" as a dictionary and therefore never caught by `_call_chat`'s `except LocalToolClientError` block. This is incorrect. In Python, when a generator function raises an exception during iteration (i.e., the caller is inside a `for` loop or `yield from` over the generator), that exception propagates up the call stack to the enclosing `try`/`except`. Since `LocalToolClientError` is an alias for `InternalApiError`, and `stream_local_turn` raises `InternalApiError` on `requests.RequestException`, the exception is correctly caught by `_call_chat` and the unified 502 Bad Gateway response is returned as designed. No code change is warranted; the existing error-handling contract is already consistent across both provider paths.
+
+---
+
+### AC-134 · ~~Duplicated and inconsistent root-resolution logic~~ — **Retracted**
+Strength: N/A (mischaracterization)
+Files: app.py, internal_api_client.py
+
+**Correction:** The original draft treated `_chat_roots` / `_with_extra_roots` in `app.py` and the `primary_root` / `extra_roots` parameters of `stream_local_turn` as redundant duplicates of the same concern. They are not. The client-side helpers in `app.py` perform **local validation and filtering** (e.g., skipping entries that are not existing directories, as documented in `_with_extra_roots`'s docstring) to determine which roots the plugin itself can operate on. The `primary_root` / `extra_roots` parameters passed to `stream_local_turn` provide **server-side context** to the core dashboard for its own processing. These are two distinct responsibilities—local capability checking versus server-side context—and removing the client-side logic would break the plugin's local root validation. No code change is warranted.
+
+---
+
+**Summary:** Both items in the original draft were retracted. AC-001 was based on a misunderstanding of Python generator exception propagation (exceptions raised during iteration propagate to the caller's `except` clause, they are not silently converted to yielded values). AC-002 conflated two legitimately distinct mechanisms (local validation vs. server-side context) and proposed a removal that would break existing functionality. No defects were identified in the reviewed code.
+
+### AC-135 · Decouple usage enrichment from the account registry endpoint
+Strength: Strong
+Files: routes/accounts.py, test_accounts_routes.py
+
+Problem:
+The `GET /api/chat/accounts` endpoint in `routes/accounts.py` is responsible for aggregating data from two unrelated subsystems. The `_accounts_body` function iterates over accounts loaded from the registry and, for each account, performs a separate file-system read via `read_usage` to attach a `usage` snapshot to the response. This forces the account registry route to depend on the statusline/usage writer's on-disk layout (`AM_STATUSLINE_DIR`, `limits.<label>.json` files), violating locality. The test suite in `test_accounts_routes.py` (specifically `UsageExposureTest`) must mock `AM_STATUSLINE_DIR` and write `limits.<label>.json` files solely to exercise the account routes, creating a high degree of test coupling and making those tests brittle to environmental changes unrelated to the account registry itself.
+
+Solution:
+Remove the `usage` enrichment from `_accounts_body` in `routes/accounts.py` so that `GET /api/chat/accounts` returns only the account registry data (label, host, live) exactly as `accounts.public_view` provides it. Introduce a dedicated endpoint, e.g. `GET /api/chat/usage` (or `GET /api/chat/usage/<label>`), that reads from the statusline/usage writer and returns usage snapshots independently. The client-side account strip UI then issues two parallel requests—one for accounts, one for usage—and merges the results in the browser.
+
+Benefits:
+Locality is restored: the account routes depend only on the account registry module, and the usage routes depend only on the usage/statusline-writer module. Tests in `test_accounts_routes.py` no longer need to set up `AM_STATUSLINE_DIR` or write `limits.*.json` files, eliminating a class of false failures caused by environmental factors and simplifying the test harness. The usage data format can evolve independently of the account registry format, and new consumers of usage data can hit the dedicated endpoint without pulling in the entire account payload.
+
+### AC-136 · Extract SAVE-TEMPLATE parsing and validation into a dedicated module
+Strength: Strong
+Files: template_store.py
+
+Problem:
+`template_store.py` conflates three distinct responsibilities in a single module: (1) parsing `SAVE-TEMPLATE` blocks out of raw LLM response text (regex matching, text cleaning), (2) validating the parsed blocks against the `KINDS` registry and length constraints, and (3) persisting validated blocks via HTTP requests to the target application. Because `parse_blocks`, `_clean_text`, and `_validate` are tightly coupled to `save_template` within the same module, testing the regex parsing in isolation requires mocking `requests`, and testing the HTTP saving path requires constructing syntactically valid `SAVE-TEMPLATE` blocks. The module is therefore hard to unit-test at either end and resists reuse of the parsing/validation logic in other contexts (client-side validation, a different persistence backend, etc.).
+
+Solution:
+Split `template_store.py` into two modules. A new `template_parser.py` contains `parse_blocks`, `_clean_text`, `_validate`, and the `KINDS` registry—pure parsing and validation with no I/O dependencies. The remaining `template_store.py` retains `save_template`, `extract_proposals`, `save_proposal`, and all HTTP-client logic, importing the parser from `template_parser.py`.
+
+Benefits:
+`template_parser.py` can be exercised with pure unit tests (no `requests` mocking, no HTTP fixtures), while `template_store.py` can be tested with mocked `requests` calls without needing to construct complex `SAVE-TEMPLATE` blocks. Adding a new template kind becomes a one-line change to `KINDS` in `template_parser.py` with no risk of accidentally touching the saving path. Swapping the persistence mechanism (e.g., to a local file system or a message queue) requires modifying only `template_store.py`, leaving the parser untouched. The separation also makes it straightforward to reuse the parser in a client-side validation layer or a CLI tool without importing the HTTP client.
+
+### AC-137 · Parallel URL/token resolution paths in agent_client.py
+Strength: Strong
+Files: agent_hosts.py
+
+Problem:
+`agent_hosts.py` contains two independent mechanisms for resolving the agent's base URL and authentication token. The `_singular()` function reads `AGENT_MANAGER_SESSION_AGENT_URL` and `AGENT_MANAGER_SESSION_AGENT_TOKEN` directly from `os.environ` to construct a `Host` namedtuple. Meanwhile, the multi-host path (or other resolution logic within `agent_hosts`) may resolve the same information through different configuration sources or logic paths. If `_singular()` is used in contexts where a `tokenFile`-based configuration is expected, the direct environment variable read for the token bypasses the `read_token()` mechanism that would otherwise resolve the token file. This creates a divergence where the token resolution logic is not consistently applied across all host resolution paths.
+
+Solution:
+Refactor `agent_hosts.py` so that all host resolution paths, including `_singular()`, consistently delegate token resolution to `read_token(host)`. Ensure that `_singular()` constructs the `Host` namedtuple with the `token_file` field populated from the appropriate configuration source (e.g., `AGENT_MANAGER_SESSION_AGENT_TOKEN_FILE`), and that the final token value is always obtained via `read_token()` rather than by directly reading the token environment variable. This unifies the token resolution logic and ensures that the `tokenFile` mechanism is honored in all cases.
+
+Benefits:
+There is exactly one place to look when debugging "why is my request unauthorised?" or "why is the token wrong?" All host resolution paths now consistently use `read_token()` for token resolution, eliminating the risk of a silent no-auth failure mode caused by bypassing the token-file mechanism. New host-aware features (multi-host, per-host tokens, token rotation) only need to interact with the unified `read_token()` logic, reducing the surface area for future divergence.
+
+### AC-138 · Host-by-name lookup duplicated across agent_client.py and agent_hosts.py
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_client.py` contains host resolution logic (e.g., in `open_events` or `list_all`) that manually iterates over `agent_hosts.hosts()` to find a host by name. This logic is functionally identical to `agent_hosts.get_host(name)`—same iteration order, same equality check, same "return the first match" semantics. The only difference is the error style: `agent_client.py` may raise `AgentError` or handle the missing host differently, while `get_host` returns `None`. Because the matching loop is duplicated, any future change to the `Host` structure (an alias field, case-insensitive matching, a priority field) must be applied in two places in lockstep, and a missed update in one file produces a silent lookup miss.
+
+Solution:
+Refactor the host resolution logic in `agent_client.py` to call `agent_hosts.get_host(name)` for the name-matching step and layer only the error-handling logic on top: if `get_host` returns `None`, raise `AgentError` or handle the missing host according to `agent_client.py`'s error-style contract. The duplicated loop is removed entirely.
+
+Benefits:
+Host-name matching logic lives in exactly one module. Adding an alias, making lookup case-insensitive, or changing tie-breaking rules requires editing only `agent_hosts.py`. The `agent_client` module retains its error-style contract (`AgentError`) without re-implementing the search, reducing the surface area for future divergence.
+
+NOTE: The flags regarding `base_url()`, `_headers()`, and `_resolve_host()` in `agent_client.py` were not applied because the critique correctly identified that these functions do not exist in the provided source code. The corrected draft now accurately attributes the parallel resolution logic to `agent_hosts.py` (for AC-001) and describes the duplicated host-lookup loop in `agent_client.py` without referencing a non-existent `_resolve_host` function (for AC-002).
+
+### AC-139 · Remove provider-module import from swap-route test
+Strength: Worth exploring
+Files: test_chat_routes_swap.py
+
+Problem:
+`SwapReservationTest.test_leaving_local_while_reserved_releases_the_reservation` in `test_chat_routes_swap.py` does `import ollama_client` solely to assert `reserve.call_args[0] == (SID, ollama_client.MODEL, False)`. This is a reasonable pattern for keeping the test in sync with the code under test, but it does create a test-time dependency on the Ollama client module's import-time env-var capture. If the route's model-resolution logic changes (e.g., it reads from a different source, or the env var is renamed), the test will silently assert against a stale value rather than failing loudly at the route level. The test's actual intent—verifying that the route passed the correct model name to `reserve`—is better expressed by asserting against the value the route itself resolved, rather than re-deriving it from the provider module.
+
+Solution:
+Drop `import ollama_client` from the test. Instead, capture the model name the route resolved (e.g., by reading it from the route's local variable, from a mocked configuration object the route receives, or from the `reserve` call's arguments as the route constructed them) and assert against that. Concretely, if the route reads the model from a config or env-var lookup that the test already controls, assert `reserve.call_args[0] == (SID, <the value the test set up>, False)`. The test no longer needs to import the provider module to know what value to expect.
+
+Benefits:
+The test's intent—verifying the route passed the correct model name to `reserve`—is expressed against the same source of truth the test itself sets up, making the assertion self-contained and robust to refactors in how the route resolves the model name. Swapping or adding providers does not require touching test files that happen to import a specific provider module.
+
+NOTE: All three critique flags were applied. AC-43 was removed entirely because its premise (that `ollama_client.py` duplicates a provider vocabulary) is factually incorrect—`ollama_client.py` merely reads a single env var and contains no provider list, set, or validation logic that parallels `handoff.py`'s `_DEFAULT_WINDOWS`. The proposed `providers.py` registry would also introduce an unjustified dependency from a low-level HTTP client to a high-level domain concept. AC-44 was retained but reframed as a standalone test-hygiene improvement rather than a consequence of the (now-removed) AC-43.
+
+### AC-140 · Inconsistent exception handling between streaming and non-streaming internal API calls
+Strength: Strong
+Files: internal_api_client.py, local_tool_client.py
+
+Problem:
+The non-streaming functions in `internal_api_client.py` (`get_roots`, `run_command`, `preempt`, `reserve`) catch `requests.RequestException` and re-raise it as `InternalApiError`, giving callers a uniform exception-based contract for transport and API failures. The streaming function `stream_local_turn`, however, catches the same `requests.RequestException` but instead yields a dictionary of the form `{"type": "error", "error": ...}` into the generator stream. Callers such as `local_tool_client.stream_plan_with_tools` must therefore inspect every yielded item for an `"error"` type to detect connection failures, while all other internal-API calls are handled with a simple `try/except InternalApiError`. This forces consumers to maintain two distinct error-handling paths for what is logically the same class of failure (transport/API error), increasing the chance that a caller handles one path correctly and misses the other.
+
+Solution:
+Modify `stream_local_turn` so that on `requests.RequestException` it raises `InternalApiError` (or a thin streaming-specific subclass) rather than yielding an error dictionary. Because the exception is raised before the generator is consumed by the caller's `for` loop, the standard `try/except` idiom works identically for streaming and non-streaming calls. Any caller that previously checked for `{"type": "error"}` can be simplified to a single `except InternalApiError` block.
+
+Benefits:
+All internal-API consumers gain a single, predictable exception contract regardless of whether the call is streaming or not. Dual error-handling paths collapse into one, reducing the surface area for missed-failure bugs. The `InternalApiError` type fulfills its design intent as the sole signal of transport/API failure, making the module's public API easier to reason about and test.
+
+### AC-141 · Duplicated LOCAL_MODEL environment-variable resolution across layers
+Strength: Worth exploring
+Files: internal_api_client.py, ollama_client.py, routes/chat.py
+
+Problem:
+The `reserve` function in `internal_api_client.py` contains a fallback that reads `os.environ.get("LOCAL_MODEL")` when no model name is supplied by the caller. The same environment variable is already resolved at module level in `ollama_client.py` (`MODEL = os.environ.get("LOCAL_MODEL")`), and the routing layer in `routes/chat.py` currently passes `ollama_client.MODEL` explicitly. This means the model-name resolution logic is spread across at least three files. If the resolution strategy changes—supporting a config file, a different environment variable, or a per-request override—every copy must be found and updated in lockstep, and a missed copy silently falls back to the old behaviour.
+
+Solution:
+Remove the `os.environ.get("LOCAL_MODEL")` fallback from `internal_api_client.reserve`. The function should accept the model name as an explicit parameter (or `None` to omit it from the request body) and contain no provider-specific configuration logic. The routing layer (`routes/chat.py`) remains responsible for resolving the model name from the appropriate source (e.g., `ollama_client.MODEL` or a future config object) and passing the concrete value to `reserve`. This keeps `internal_api_client` provider-agnostic and centralises configuration resolution in the layer that already knows which provider is in use.
+
+Benefits:
+A single source of truth for model-name resolution eliminates the risk of divergent fallbacks across files. `internal_api_client` becomes a thin, provider-agnostic transport layer that is trivially testable with any model string. Future changes to how the model is configured (env var, config file, per-request header) require edits in exactly one place rather than hunting for every copy of the fallback.
+
+### AC-142 · Duplicated row-filtering logic between handoff.py and chat_sessions.py
+Strength: Strong
+Files: handoff.py, chat_sessions.py
+
+Problem:
+`handoff.py` documents that its `_is_plain_row` helper mirrors the skip logic in `chat_sessions._build_local_messages` (both exclude rows with a truthy `error` field and rows flagged `marker: True`). However, `handoff.py` re-implements those boolean checks locally rather than importing or calling the shared logic from `chat_sessions`. This creates a tight, undocumented coupling: the two modules must be manually kept in sync. If a developer adds a new non-conversational row type (e.g., a system-prompt row or a tool-call marker) and updates `_build_local_messages` but forgets `_is_plain_row`, the handoff summary will silently include or exclude data that the chat view handles differently, producing inconsistent context without any test or type-system signal to catch the drift.
+
+Solution:
+Extract the row-filtering predicate into a single shared function (e.g., `is_plain_row(row) -> bool`) in a small utility module or directly in `chat_sessions.py`, and have `handoff.py` import and call it. If the two modules must remain independently importable (e.g., `handoff.py` is used in a context where `chat_sessions` is not loaded), place the predicate in a lightweight shared module that both import. Add a unit test that asserts both call sites produce identical results for a representative set of row shapes, so any future divergence is caught at test time.
+
+Benefits:
+A single source of truth for "which rows are conversational" eliminates the class of silent drift bugs where one module's filter is updated and the other's is not. Onboarding developers no longer need to discover the mirror relationship by reading comments; the import makes the dependency explicit. The shared predicate is independently testable, and any new row type only needs to be handled in one place.
+
+### AC-143 · model_stats_client.py imports CORE_REPO_ROOT from app.py
+Strength: Strong
+Files: model_stats_client.py, app.py
+
+Problem:
+`model_stats_client.py` resolves the path to `model-stats-db.js` by importing `CORE_REPO_ROOT` directly from `app.py` (`from app import CORE_REPO_ROOT`). This forces the stats client to load the entire Flask application module—pulling in Flask, route registrations, and any side-effects at module import time—just to obtain a filesystem path constant. In contexts where `app.py` cannot or should not be imported (a standalone CLI script, a test harness, a different service that reuses the stats client), the import will either fail outright or drag in unnecessary dependencies and initialization code.
+
+Solution:
+Move the `CORE_REPO_ROOT` constant (and any related path-resolution helpers) into a small, dependency-free configuration module (e.g., `paths.py` or `config.py`) that contains no Flask imports. Both `app.py` and `model_stats_client.py` then import from that shared module. This decouples the stats client from the application layer and makes it usable in any context where only the path is needed.
+
+Benefits:
+`model_stats_client.py` becomes independently importable and testable without bootstrapping the Flask app. The dependency graph becomes shallower: the stats client depends on a leaf config module rather than on the top-level application module. Future refactors of `app.py` (renaming, splitting routes, changing the WSGI entry point) no longer risk breaking an unrelated subsystem that only needed a path constant.
+
+### AC-144 · Dead `_headers()` helper bypasses host abstraction layer
+Strength: Worth exploring
+Files: agent_client.py
+
+Problem:
+`agent_client.py` defines a `_headers()` helper that reads `AGENT_MANAGER_SESSION_AGENT_TOKEN` directly from `os.environ`, ignoring the `Host` object and the `token_file` fallback that `agent_hosts.read_token(host)` supports. However, `_headers()` is **never called** anywhere in the module: both `list_all()` and `open_events()` construct their `Authorization` header inline via `agent_hosts.read_token(host)`. The function is therefore dead code. Its presence is still a maintenance hazard: a future developer adding a new endpoint may see `_headers()` and assume it is the canonical way to build auth headers, inadvertently introducing a code path that silently drops `token_file` support and hard-couples the client to a single environment-variable name.
+
+Solution:
+Delete the `_headers()` function from `agent_client.py`. No call-site updates are needed because no code currently invokes it. Optionally, if the team wants a single shared helper for convenience, add `build_auth_header(host) -> dict` to `agent_hosts.py` and use it in `list_all()` / `open_events()` in place of the current inline construction — but this is a stylistic improvement, not a bug fix.
+
+Benefits:
+Removes a dead code path that contradicts the module's own convention (resolve credentials through the host object). Eliminates the risk that a future contributor picks up `_headers()` as the "standard" helper and introduces a real `token_file` regression. Keeps the credential-resolution surface to the one function that is actually exercised.
+
+---
+
+*AC-002 removed.* The critique correctly identifies that `list_sessions()` already returns partial data when only some hosts fail: the guard `len(result["skipped"]) == len(hosts)` is `False` in a 1-of-3-failure scenario, so the function returns the sessions from the two healthy hosts. The docstring ("Raises AgentError when … every configured host failed") accurately describes this behaviour. The problem statement in the original draft was a misreading of the condition, and the proposed "fix" would have added a redundant API surface for behaviour that already exists.
+
+NOTE: Flag 2 was applied (AC-002 removed) because the critique is correct — the draft's claim that `list_sessions()` raises on partial failure is factually wrong given the actual `==` comparison, so there is no defect to report.
+
+### AC-145 · Unify per-host token retrieval into a single helper
+Strength: Strong
+Files: agent_client.py
+
+Problem:
+Token retrieval and host-resolution logic is scattered across the public methods in `agent_client.py` in inconsistent ways. `open_events()` already delegates to the existing `_resolve_host()` helper, but `list_all()` and `filter_events()` each contain their own inline loops over `agent_hosts.hosts()` with separate calls to `agent_hosts.read_token()`. `filter_events()` additionally embeds a single-host check solely to decide whether to apply a default host tag (gracefully skipping the tag in the multi-host case), while `list_all()` iterates all hosts unconditionally. The result is that the "how do I get the token for a given host" contract is expressed in two or three slightly different shapes, so any change to token resolution (new environment variables, fallback chains, caching) or to the error-raising behaviour for unknown host names must be replicated across multiple call sites, increasing the risk of subtle inconsistencies.
+
+Solution:
+Introduce a private helper in `agent_client.py`, e.g. `_get_host_and_token(name=None)`, that encapsulates the single-host resolution path: if `name` is `None` it validates that exactly one host exists (raising `AgentError` on ambiguity or absence), otherwise it looks up the named host and raises `AgentError` if not found. The helper returns a `(Host, token_or_None)` tuple. A separate sibling, `_iter_hosts_with_tokens()`, yields a list of such tuples for the multi-host iteration case used by `list_all()`. Refactor `open_events()` to delegate to `_get_host_and_token()` (replacing the current `_resolve_host()` call and its inline token fetch), and refactor `list_all()` and `filter_events()` to use `_iter_hosts_with_tokens()` for their iteration loops, removing the per-method inline host-iteration and token-retrieval code. The single-host tag decision in `filter_events()` can then be expressed as a simple `len(hosts) == 1` check on the returned list.
+
+Benefits:
+The host-resolution and token-retrieval contract lives in exactly one place per access pattern (single-host vs. multi-host), so future changes (additional env-var fallbacks, logging, caching) require editing one or two functions rather than three methods. Error messages and `AgentError` semantics are guaranteed consistent across all endpoints. Unit tests can exercise each helper in isolation with mock `agent_hosts` objects, covering the single-host, multi-host, unknown-name, and ambiguous cases without exercising the full streaming or listing logic.
+
+### AC-146 · Extract SSE block parsing and filtering into a dedicated generator
+Strength: Worth exploring
+Files: agent_client.py
+
+Problem:
+`filter_events()` in `agent_client.py` interleaves several distinct responsibilities: reassembling Server-Sent Events blocks from raw byte chunks, parsing the `event:` and `data:` fields, filtering against an allowed-event set, re-serialising JSON payloads to inject a host tag, and re-emitting the modified SSE stream. The `_tag_host_block()` helper is tightly coupled to this inline parsing. The resulting function is long, mixes low-level protocol parsing with high-level business filtering, and is difficult to unit-test in isolation because the SSE reassembly logic is entangled with the streaming I/O loop.
+
+Solution:
+Extract the chunk-to-block reassembly and field parsing into a standalone generator, e.g. `_parse_sse_blocks(chunks)`, that yields `(event_name, data_payload)` tuples. `filter_events()` then iterates over these tuples, applies the allowed-event filter, calls `_tag_host_block()` (or its successor) when a host tag is required, and re-serialises the SSE frame. The generator can be a pure function of its input iterable, making it trivially testable with canned chunk lists.
+
+Benefits:
+`filter_events()` shrinks to a short filter-and-re-emit loop, making its intent immediately readable. `_parse_sse_blocks` can be tested independently with edge-case chunk boundaries (split mid-line, multi-line `data:`, missing `event:` field) without standing up a streaming response. Adding new filtering rules or modifying the tagging logic no longer requires navigating the parsing code, reducing the chance of regressions in either concern.
+
+### AC-147 · Dead `_headers()` helper contradicts the multi-host token model
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_client._headers()` is a module-level helper that builds a Bearer Authorization header from a single static token source. It is never called anywhere in this community — `list_all`, `open_events`, the test suite, and `agent_hosts` all bypass it. The two functions that actually issue HTTP requests each inline the correct multi-host pattern: they call `agent_hosts.read_token(host)`, which checks the per-host `token_file` first (re-read from disk each call) and falls back to a static token. `_headers()` does neither: it ignores token files entirely and has no notion of a per-host token. The test `test_token_file_wins_and_is_read_per_call` in `test_agent_client.py` explicitly verifies that the token-file path takes precedence, confirming the multi-host resolution is the intended contract. A maintainer adding a new endpoint would see `_headers()` as the obvious "get the auth header" helper, call it, and silently send the wrong (or no) token to hosts that rely on a token file.
+
+Solution:
+Delete `_headers()`. Extract the four-line pattern already duplicated in `list_all` and `open_events` into a single private helper (e.g. `_auth_headers(host)`) that calls `agent_hosts.read_token(host)`. Both call-sites then use the helper, the dead function is gone, and there is exactly one place that knows how to build the Authorization header for a given host.
+
+Benefits:
+Eliminates a stale, misleading helper that contradicts the module's own docstring about per-host token semantics. Reduces the duplicated auth-header construction to a single call-site, so a future change to the token resolution logic (e.g. adding mTLS or a different header scheme) only needs to be made in one place. Removes the trap for a new contributor who would naturally reach for the module's only "headers" function and unknowingly bypass the per-host token file.
+
+### AC-148 · `ollama_client.MODEL()` env-var accessor leaks into the routing layer
+Strength: Strong
+Files: ollama_client.py, test_chat_routes_swap.py
+
+Problem:
+`ollama_client.MODEL()` is a one-line `os.environ.get("LOCAL_MODEL")` accessor that carries no Ollama-specific logic, yet the swap route and the reserve/close/message handlers must `import ollama_client` solely to read that environment variable and pass the result into `internal_api_client.reserve(...)`. This forces the routing layer to depend on a provider-specific module for a value that is just an env var, and it makes the model-name source a hidden, per-call dependency of every reservation call. The test file `test_chat_routes_swap.py` compounds the smell: it must import `ollama_client` and reference `ollama_client.MODEL()` just to assert the arguments of the reserve call, confirming that the routing layer's dependency on the provider module is incidental rather than structural. The AC-41/AC-42 pair already resolves this same friction for the other handlers; the swap route is a third, unaddressed instance.
+
+Solution:
+Create a new module `config.py` (or add to an existing shared config module) containing a single function:
+```python
+def get_local_model() -> str:
+    """Read LOCAL_MODEL from the environment. Returns empty string if unset."""
+    return os.environ.get("LOCAL_MODEL", "")
+```
+Update the swap route and the reserve/close/message handlers to import `get_local_model` from `config` and call it directly, removing their `import ollama_client` statements. Update `test_chat_routes_swap.py` to import `get_local_model` from `config` and use it in assertions instead of `ollama_client.MODEL()`. Do **not** modify `ollama_client.MODEL()`; it remains as-is for any external callers that depend on it, but the routing layer and its tests no longer reference it.
+
+Benefits:
+The routing layer's import graph no longer includes a provider-specific module for a generic configuration read. Adding or swapping a local-model provider no longer requires touching route handlers or their tests. The test file's dependency surface now matches the production code's actual dependency surface, both pointing to the shared config module rather than a provider module.
+
+### AC-149 · `model_stats_client` and `ollama_client` resolve the local model name by two different mechanisms
+Strength: Worth exploring
+Files: model_stats_client.py, ollama_client.py
+
+Problem:
+`ollama_client.MODEL()` reads `LOCAL_MODEL` per call (documented as mirroring `handoff.window_tokens`' per-call env reads so a value set after import is seen immediately). `model_stats_client` has no such accessor; it takes `model` as a parameter and relies on the caller to resolve it, and its module docstring notes it deliberately points at `CORE_REPO_ROOT` rather than a `__file__`-relative path because the two repos live at different directory depths. The result is two modules in the same community resolving "which local model is this" by two different mechanisms—one per-call env read, one caller-supplied—with no shared helper. A caller that wants to record a call for the local model must know to call `ollama_client.MODEL()` and pass it in, coupling the stats-recording call site to the provider module for a value that is just an env var.
+
+Solution:
+Modify `model_stats_client`'s public API to accept an optional `model` parameter that defaults to calling `config.get_local_model()` when omitted. Specifically, change the signature from `def record_call(model, ...)` to `def record_call(model=None, ...)`, and at the top of the function body add:
+```python
+if model is None:
+    model = config.get_local_model()
+```
+This preserves backward compatibility for any existing caller that passes `model` explicitly, while eliminating the need for callers to resolve the model name themselves when they want the default local model. `ollama_client.MODEL()` remains unchanged for external consumers, but internal callers within the same codebase should migrate to `config.get_local_model()` or rely on the new default in `model_stats_client`.
+
+Benefits:
+A single source of truth for "which local model is active" eliminates the risk of the two modules disagreeing (e.g., one seeing a stale value if the env var changes between calls). Call sites that record stats for the local model no longer need to import `ollama_client`, reducing cross-module coupling. The per-call env-read semantics are preserved and documented in one place (`config.get_local_model()`), and existing callers that pass an explicit model continue to work unchanged.
+
+### AC-150 · `handoff._is_plain_row` and `chat_sessions._build_local_messages` duplicate the same skip predicate
+Strength: Strong
+Files: handoff.py, chat_sessions.py
+
+Problem:
+`handoff._is_plain_row` is documented as "the exact two skips `chat_sessions._build_local_messages` uses"—the same `error`/`marker`-is-True exclusion logic is implemented independently in two modules. `handoff` is declared "pure, no I/O" and `chat_sessions` is the storage layer, so the predicate is the kind of shared invariant that should live in one place. As written, a future row type (a third skip key, a `system` role, etc.) must be added in both files in lockstep, and the docstring cross-reference is the only thing keeping them in sync. There is no test that asserts the two implementations agree; a divergence would be silent until a row type is added to one but not the other.
+
+Solution:
+Create a new module `row_utils.py` containing:
+```python
+def is_plain_row(row: dict) -> bool:
+    """Return True if the row is a plain message row (not an error or marker)."""
+    return not row.get("error") and not row.get("marker")
+```
+Update `handoff._is_plain_row` to be a thin wrapper that calls `row_utils.is_plain_row`, or replace all internal uses of `_is_plain_row` with direct calls to `row_utils.is_plain_row`. Update `chat_sessions._build_local_messages` to call `row_utils.is_plain_row` instead of its inline logic. Add a unit test in `test_row_utils.py` (using the repository's `unittest` convention) that feeds a representative set of row dicts—including the `error`-set, `marker`-set, and plain cases—and asserts `is_plain_row`'s output, pinning the predicate's contract in one place.
+
+Benefits:
+A new skip key or role is added in exactly one location (`row_utils.is_plain_row`). The docstring cross-reference is no longer the sole synchronization mechanism; the shared function is. The unit test gives a regression net that the current two-copy arrangement lacks, and it is trivial to extend when the predicate grows. Placing the helper in a new `row_utils` module preserves `handoff`'s "pure, no I/O" contract by avoiding an import of the storage layer.
+
+### AC-151 · `local_tool_client.py` is a zero-value pass-through shim over `internal_api_client.py`
+Strength: Strong
+Files: local_tool_client.py, internal_api_client.py, app.py, chat_sessions.py
+
+Problem:
+Every line of `stream_plan_with_tools` in `local_tool_client.py` is a verbatim keyword-forward to `internal_api_client.stream_local_turn`—same parameter names, same defaults, same order, no transformation, no added behavior. The module's own header states it exists only to "keep the SAME public name/signature chat_sessions.py already calls." This is a textbook indirection layer with no value: it forces a reader to open a second file to discover the call is just an HTTP POST, and it creates a second place to update whenever the signature changes (the two files must be kept in sync by hand). The `LocalToolClientError` alias is the one thing that adds value (it lets `app.py`'s `_call_chat` catch a stable name), but a single alias does not justify a whole module of duplicated signature.
+
+Solution:
+Delete `local_tool_client.py` and have callers import `stream_local_turn` (aliased to `stream_plan_with_tools`) and `InternalApiError` (aliased to `LocalToolClientError`) directly from `internal_api_client`. Keep the two public names as one-line aliases in `internal_api_client` so `app.py`'s `_call_chat` and `chat_sessions.py` keep working unchanged. Update any `from local_tool_client import …` statements to point at `internal_api_client`.
+
+Benefits:
+Removes a zero-value indirection layer and a duplicated signature that must be kept in sync by hand. A future signature change is made in exactly one place. The only thing the shim contributed (a stable error name) is preserved as a one-line alias, so no caller breaks.
+
+### AC-152 · `app.py` carries core-repo filesystem helpers that the Phase-3 migration was supposed to remove
+Strength: Strong
+Files: app.py, internal_api_client.py
+
+Problem:
+The module docstring and the `_chat_roots` docstring both assert that as of 2026-09-15 "this repo no longer reads/writes `instances//queue/`" and that roots resolution "now go through internal_api_client.py." Yet the file still defines and exports `get_active_repo_root`, `get_pipeline_dir`, `queue_dir`, `instances_dir`, `get_second_brain_dir`, `read_env_file`, `read_dashboard_settings`, `claude_defaults`, and `_active_project_setting`—all of which read the core repo's `agent-manager.env` and `dashboard-settings.json` directly. `queue_dir()` and `instances_dir()` are the exact accessors the docstring claims are gone, and `get_second_brain_dir` reads a core-repo setting the internal API is supposed to own. The stated architecture (HTTP-only, no direct filesystem coupling) and the actual code disagree: the file carries a parallel, now-likely-dead path to the core repo's state, which will mislead a maintainer into believing the filesystem coupling is already eliminated.
+
+Solution:
+Audit every call site of the nine helpers listed above within this repo. If none remain (as the docstring implies), delete them. If any are still live, move the underlying reads behind `internal_api_client` so core-repo state is fetched in exactly one place over HTTP, and update the docstring to reflect the true dependency graph. Either way, the public surface of `app.py` should no longer expose `queue_dir`, `instances_dir`, or direct `agent-manager.env` / `dashboard-settings.json` readers.
+
+Benefits:
+The file's advertised architecture and its actual behavior align, eliminating a trap for a maintainer who trusts the docstring. Core-repo settings have a single source of truth (the internal API) rather than a duplicated, possibly stale, local read path. Dead code is removed, reducing the surface area that must be reviewed on every change.
+
+### AC-153 · `internal_api_client.py` repeats the same try/except error contract in four non-streaming functions
+Strength: Strong
+Files: internal_api_client.py
+
+Problem:
+`get_roots`, `run_command`, `preempt`, and `reserve` each independently perform `requests.<verb>(…)` → `raise_for_status()` → `r.json()` wrapped in `except requests.RequestException as e: raise InternalApiError(f"… failed: {e}") from e`. The only differences are the HTTP verb, the URL, the timeout, and the payload. This is the same connection-level error contract repeated four times (identical message format, exception type, and `from e` chaining), so a change to the contract—adding a status code, a retry, structured logging—must be made in four places. `stream_local_turn` handles the same failure a fifth way (yielding an error event rather than raising), which is legitimate for streaming but means the four non-streaming functions are the ones that can and should share a helper.
+
+Solution:
+Introduce a single `_request(verb, url, *, timeout, json_body=None, params=None)` helper in `internal_api_client.py` that performs the verb+URL+headers+timeout+`raise_for_status`+`r.json()` sequence and wraps `requests.RequestException` into `InternalApiError` with the shared message format. Rewrite `get_roots`, `run_command`, `preempt`, and `reserve` to call it, leaving only their unique payload, timeout, and response-shaping in the public functions. Keep `stream_local_turn` explicit, since it must yield an error event rather than raise and its streaming iteration is inherently different.
+
+Benefits:
+The connection-level error contract lives in one auditable place. New endpoints inherit correct error behavior for free. A future change (retry, structured logging, status-code surfacing) is a one-line edit in `_request` rather than a four-place search-and-replace. The four public functions become shorter and their unique logic is more visible.
+
+### AC-154 · Dead Code: Unused `_headers()` in agent_client
+Strength: Moderate
+Files: agent_client.py
+
+Problem:
+`agent_client.py` defines a `_headers()` helper that reads the `AGENT_MANAGER_SESSION_AGENT_TOKEN` environment variable directly to build the Authorization header. However, the active code paths in this module (such as `list_all` and `open_events`) do not call `_headers()`. Instead, they explicitly call `agent_hosts.read_token(host)` to determine the Authorization header, which correctly respects the token-file-overrides-static-variable precedence rule defined in `agent_hosts.py`. Consequently, `_headers()` is currently unused dead code. Its presence creates a maintenance hazard: a future developer might mistakenly assume it is the standard way to build headers and use it in new code paths, thereby bypassing the canonical token resolution mechanism and reintroducing the bug where token files are ignored.
+
+Solution:
+Remove the `_headers()` function from `agent_client.py` entirely. Since it is not called by any existing functions, this deletion has no behavioral impact on current functionality. This ensures that `agent_hosts.read_token()` remains the sole, undisputed method for resolving credentials, preventing accidental misuse of the non-canonical helper.
+
+Benefits:
+Eliminates dead code that contradicts the established architectural pattern for token resolution. Reduces the risk of future developers inadvertently using a helper that bypasses the correct precedence rules, thereby preserving the single source of truth for credential handling in `agent_hosts.py`.
+
+### AC-155 · Duplicated Host-Lookup Logic Between agent_client and agent_hosts
+Strength: Strong
+Files: agent_client.py, agent_hosts.py
+
+Problem:
+`agent_client.py` defines `_resolve_host()` to find a host by name or default to the single configured host, raising an `AgentError` if the name is missing and multiple hosts are configured. `agent_hosts.py` provides `get_host(name)` which performs a similar name-based lookup but returns `None` if the host is not found, without raising an `AgentError` or handling the "default to single host" logic. This duplication means the lookup semantics are split: `agent_client` handles the "default to single" case and specific error raising, while `agent_hosts` handles the basic name lookup. This split makes it difficult to maintain consistent behavior; for example, if the "default to single host" logic needs to be updated or if the error type needs to change, it must be done in `agent_client`, but the underlying lookup logic resides in `agent_hosts`.
+
+Solution:
+Refactor `agent_hosts.py` to include the "default to single host" logic. Modify `get_host(name)` (or introduce a new method like `resolve_host(name)`) so that if `name` is `None` and exactly one host is configured, it returns that host. If `name` is `None` and multiple hosts are configured, it should raise a generic `ValueError` or return `None` (depending on the preferred API contract for the hosts module). In `agent_client.py`, remove `_resolve_host()` and replace its usages with calls to the new/updated `agent_hosts` method. If `agent_hosts` returns `None` for the ambiguous multi-host case, `agent_client` should catch this and raise the specific `AgentError` to maintain its existing error contract for callers. This centralizes the lookup and defaulting logic in `agent_hosts`, while `agent_client` remains responsible only for translating the result into its specific error type if necessary.
+
+Benefits:
+Centralizes host resolution logic in `agent_hosts.py`, making it the single source of truth for how hosts are identified and defaulted. Reduces code duplication and ensures that any changes to host lookup semantics (e.g., alias support, case-insensitivity) are implemented in one place. Clarifies the responsibility split: `agent_hosts` manages the configuration and lookup, while `agent_client` manages HTTP communication and client-specific error reporting.
+
+### AC-156 · Dual error-handling contract leaves `_call_chat`'s exception handler dead for the primary streaming path
+Strength: Strong
+Files: app.py, internal_api_client.py
+
+Problem:
+In `app.py`, the `_call_chat` function catches `LocalToolClientError` (aliased from `internal_api_client.InternalApiError`) and converts it to a 502 Bad Gateway response. However, the primary local-provider execution path—`stream_local_turn` in `internal_api_client.py`—is a generator that yields an error object (`{"type": "error", "error": ...}`) as a data payload rather than raising `InternalApiError` when the underlying HTTP request fails. Because the error is yielded as stream data instead of raised as an exception, the `except LocalToolClientError` block in `_call_chat` is never triggered for the main streaming flow. This creates a confusing dual error-handling contract: the same underlying transport failure is handled via exception in some code paths (e.g., `reserve`) but via a data-payload in others (e.g., `stream_local_turn`), forcing the frontend to parse error objects in the stream while the backend's exception handler sits unused for the primary path.
+
+Solution:
+Standardize the error contract for `stream_local_turn`. Either change `stream_local_turn` to raise `InternalApiError` on transport failures before yielding any data (allowing `_call_chat` to catch it uniformly with its existing handler), or remove the `LocalToolClientError` catch from `_call_chat` and document that all local-provider failures are delivered as `{"type": "error"}` payloads in the stream, ensuring the frontend handles them consistently. Whichever direction is chosen, the two modules should agree on a single error-propagation mechanism.
+
+Benefits:
+Eliminates the misleading, never-executed exception handler in `app.py`, reduces cognitive load for developers tracing the error flow, and ensures a single, predictable error-propagation contract across the local-provider interface. Future contributors will no longer need to reason about which failure mode uses exceptions versus data payloads.
+
+### AC-157 · Roots fallback logic is coupled to `app.py` rather than living in the client that resolves roots
+Strength: Worth exploring
+Files: app.py, internal_api_client.py
+
+Problem:
+In `app.py`, the `_chat_roots` function calls `internal_api_client.get_roots()` and, if that call fails (e.g., the dashboard is down), falls back to `[os.path.realpath(str(CORE_REPO_ROOT))]`. The `CORE_REPO_ROOT` constant is defined in `app.py` from the `AGENT_MANAGER_CORE_REPO_ROOT` environment variable. The `internal_api_client` module itself has no knowledge of this fallback; it only knows the dashboard URL. The fail-open behavior is therefore implemented entirely in `app.py`, tightly coupled to that file's local constant. If `internal_api_client.get_roots()` were used by other modules that also need a fallback, they would have to re-implement the same logic. The roots-resolution contract is split across two modules rather than being self-contained in the one responsible for communicating with the core dashboard.
+
+Solution:
+Move the fallback logic into `internal_api_client.get_roots()`. The function should accept an optional `fallback_roots` parameter or read the same `AGENT_MANAGER_CORE_REPO_ROOT` environment variable internally, so that `get_roots()` is self-contained and provides a fail-open guarantee by default. `app.py`'s `_chat_roots` would then simply call `get_roots()` without needing to know the fallback value.
+
+Benefits:
+Centralizes roots-resolution logic in the module responsible for dashboard communication. Any future caller of `get_roots()` inherits the fail-open behavior without duplicating the fallback. The `internal_api_client` API becomes more robust and self-documenting regarding its degradation behavior.
+
+### AC-158 · `local_tool_client.py` is a valueless shim over `internal_api_client.stream_local_turn`
+Strength: Worth exploring
+Files: local_tool_client.py, internal_api_client.py
+
+Problem:
+`local_tool_client.py` is a thin wrapper around `internal_api_client.stream_local_turn` that adds no validation, transformation, or new functionality. Its sole purpose is to preserve the legacy name `stream_plan_with_tools` for backward compatibility. The function signature is duplicated and must be kept in sync with `internal_api_client` manually. The only caller referenced in this codebase (`chat_sessions.py`) could import `stream_local_turn` directly from `internal_api_client` without any loss of clarity. The shim introduces an unnecessary indirection layer that makes it harder to trace the actual streaming implementation and creates a risk of signature drift between the shim and the real function.
+
+Solution:
+Remove `local_tool_client.py` and update all callers to import `stream_local_turn` directly from `internal_api_client`. If external consumers still depend on the old name, emit a deprecation warning in a transitional release and schedule removal, rather than maintaining a silent pass-through module indefinitely.
+
+Benefits:
+Reduces the number of modules to maintain. Eliminates the risk of signature drift between the shim and the actual implementation. Makes the codebase more transparent by removing an abstraction layer that adds no behavioral value, so a reader can trace the streaming logic in one step rather than through a no-op intermediary.
+
+### AC-163 · Dead filesystem helpers in `app.py` create false expectations about plugin behavior
+Strength: Strong
+Files: app.py
+
+Problem:
+Four functions — `get_active_repo_root()`, `get_pipeline_dir()`, `queue_dir()`, and `instances_dir()` — read `AGENT_MANAGER_REPO_ROOT` / `AGENT_MANAGER_PIPELINE_DIR` environment variables and construct filesystem paths under those roots. The module header explicitly states the repo no longer reads/writes instances/queue/ or holds any GPU lock of its own. These functions are never called by any file in this community. They are dead code from the Phase 1/2 era that survived the migration to the internal API. A developer reading this module will assume the plugin still uses these paths for something — session storage, queue management, instance tracking — and will be confused if they later add a feature that "should" use the queue or instances directory, only to find nothing happens because the core dashboard now owns that state via HTTP.
+
+Solution:
+Remove `get_active_repo_root()`, `get_pipeline_dir()`, `queue_dir()`, and `instances_dir()` from `app.py`. Before deleting, verify no external caller (outside this community) still references them; if one does, update that caller first.
+
+Benefits:
+Eliminates dead code that misleads developers about where the plugin's state lives. Reduces the surface area for future bugs where a developer reaches for these helpers expecting them to work, and removes the maintenance burden of keeping environment-variable-dependent path construction in sync with a migration that already happened.
+
+---
+
+### AC-164 · Silent fallback in `_chat_roots()` masks API failures
+Strength: Strong
+Files: app.py
+
+Problem:
+`_chat_roots()` calls `internal_api_client.get_roots()` and falls back to `[CORE_REPO_ROOT]` on `InternalApiError`. This error is raised for connection refused, bad tokens, network timeouts, or any non-2xx response. When the fallback triggers, Chat proceeds to root itself at the core repo instead of the user's actual project — but the user sees no error, no warning, and no indication that something went wrong. A user with a broken core dashboard (crashed, expired token, network down) will think their chat is working normally while their messages are processed against the wrong repository context. This is a silent correctness failure: the plugin functions, but incorrectly, and the user cannot detect it.
+
+Solution:
+Either (a) log a warning when the fallback triggers so the operator notices, or (b) raise a clear error to the user with a message like "core dashboard unreachable — chat will use fallback roots" so they know the state is degraded. Option (b) is preferred because it gives the user actionable information; option (a) is acceptable if the fallback is intentional and the operator is expected to monitor logs.
+
+Benefits:
+Makes degradation observable instead of silent. Users and operators can detect when the core dashboard is unreachable and take corrective action (restart, re-auth, check network). Prevents the scenario where a user's chat appears to work but is silently operating on the wrong repository context.
+
+---
+
+### AC-165 · Trivial pass-through in `local_tool_client.py` adds maintenance burden for no value
+Strength: Strong
+Files: local_tool_client.py
+
+Problem:
+`local_tool_client.stream_plan_with_tools()` is a one-line wrapper that calls `internal_api_client.stream_local_turn()` with identical arguments. The module header claims it "keeps the SAME public name/signature" for backward compatibility, but the only function it exports IS the same function renamed. There is no adaptive logic, no compatibility translation, and no future-proofing — just a direct pass-through. If the internal API's `stream_local_turn()` signature changes (e.g., a new required parameter, a renamed argument), this shim breaks silently for any caller that goes through `local_tool_client.stream_plan_with_tools()`. The shim provides no value: it doesn't adapt to API changes, doesn't add logging, doesn't translate between formats. Every future change to the internal API requires touching this file for no benefit.
+
+Solution:
+Remove `local_tool_client.py` entirely. Update `chat_sessions.py` (or whatever caller uses it) to import `internal_api_client.stream_local_turn()` directly. If the public name `stream_plan_with_tools` is needed for backward compatibility with external callers, add a deprecation warning and redirect to the internal API directly.
+
+Benefits:
+Eliminates an unnecessary indirection layer that provides no adaptive value. Reduces the chance of silent breakage when the internal API evolves, since callers will now depend directly on the canonical function signature. Simplifies the codebase by removing a file whose sole purpose was to duplicate a function name.
+
+NOTE: The CRITIQUE section did not flag any specific problems — it concluded "NO ISSUES FOUND" — so no changes to the original draft were applied.
+
+### AC-166 · Remove `local_tool_client.py` — pointless pass-through wrapper
+Strength: Strong
+
+**Strength:** Strong
+**Files:** `local_tool_client.py`, `app.py`, `chat_sessions.py` (if it exists)
+
+**Problem:**
+`local_tool_client.py` is a meaningless layer of indirection. It re-exports `InternalApiError` as `LocalToolClientError` (an alias to the same class object), and wraps `internal_api_client.stream_local_turn()` with an identical signature. Callers get the same behavior from `internal_api_client.stream_local_turn()` but with a different error type name that's actually the same class. This makes the code harder to follow without providing any abstraction, compatibility, or value.
+
+**Solution:**
+Delete `local_tool_client.py` entirely. Update all callers explicitly:
+
+1. **`app.py`** — Update import and exception handling:
+   ```python
+   # Before:
+   from local_tool_client import LocalToolClientError
+   try:
+       ...
+   except LocalToolClientError as e:
+       ...
+
+   # After:
+   from internal_api_client import InternalApiError
+   try:
+       ...
+   except InternalApiError as e:
+       ...
+   ```
+
+2. **`app.py`** — Update the call site in `_call_chat()`:
+   ```python
+   # Before:
+   from local_tool_client import LocalToolClientError
+   # ...
+   result = await local_tool_client.stream_local_turn(...)
+
+   # After:
+   from internal_api_client import InternalApiError
+   # ...
+   result = await internal_api_client.stream_local_turn(...)
+   ```
+
+3. **`chat_sessions.py`** (if it exists and imports `LocalToolClientError`):
+   - Update import: `from internal_api_client import InternalApiError`
+   - Update exception handling: `except InternalApiError as e:`
+   - Update any call sites to use `internal_api_client.stream_local_turn()` directly
+
+**Verification:**
+- Run `grep -r "LocalToolClientError" .` to confirm no remaining references
+- Run `grep -r "local_tool_client" .` to confirm no remaining imports or references
+- Test that all call sites work with the unified error type
+
+**Benefits:**
+One less file to maintain, callers don't need to know about a meaningless indirection layer, and error handling becomes clearer with only one error type to reason about.
+
+---
+
+### AC-167 · Remove hardcoded `/media/model-cache/github/agent-manager` fallback path
+Strength: Strong
+
+**Strength:** Strong
+**Files:** `app.py`
+
+**Problem:**
+In `app.py`, the fallback path `/media/model-cache/github/agent-manager` is clearly a development/scratch path. It should not be in production code as a default. If `AGENT_MANAGER_CORE_REPO_ROOT` is unset, the plugin will try to use this path, which likely doesn't exist on most systems, causing confusing errors or silent failures.
+
+**Solution:**
+Replace the fallback with a clear error message that explains what's needed:
+
+```python
+# Before:
+CORE_REPO_ROOT = Path(os.environ.get(
+    "AGENT_MANAGER_CORE_REPO_ROOT",
+    "/media/model-cache/github/agent-manager"
+)).resolve()
+
+# After:
+core_repo_env = os.environ.get("AGENT_MANAGER_CORE_REPO_ROOT")
+if not core_repo_env:
+    raise RuntimeError(
+        "AGENT_MANAGER_CORE_REPO_ROOT environment variable is required "
+        "but not set. Please point it to the core repository root."
+    )
+CORE_REPO_ROOT = Path(core_repo_env).resolve()
+```
+
+**Failure Mode:**
+- **Before:** Plugin attempts to use a non-existent dev path, leading to confusing `FileNotFoundError` or silent failures downstream
+- **After:** Plugin fails fast at import time with a clear, actionable error message explaining exactly what's missing and what to do
+
+**Benefits:**
+No more confusion when the env var is unset, and a clearer failure mode — the plugin fails fast with a helpful error instead of trying a non-existent path.
+
+---
+
+NOTE: Flag 1 (AC-001) was addressed by explicitly identifying all callers (`app.py` and `chat_sessions.py`) and specifying the exact import and exception handling changes needed for each. Flag 2 (AC-002) was addressed by replacing the fallback with a clear `RuntimeError` that explains what's needed, rather than leaving a `KeyError` at module import time.
+
+### AC-168 · Decouple handoff.py from chat_sessions.py's internal row structure
+Strength: Strong
+Files: handoff.py, chat_sessions.py
+
+Problem:
+handoff.py's `_is_plain_row` function hardcodes knowledge of chat_sessions.py's internal row representation by checking for `error` and `marker` keys, claiming these are "the exact two skips chat_sessions._build_local_messages uses." This creates an implicit coupling where if chat_sessions.py changes what it marks as errors or markers, handoff.py silently breaks without any test in this community verifying the contract.
+
+Solution:
+Extract the row-filtering logic into a shared utility or define an explicit interface. Either (a) move `_is_plain_row` into chat_sessions.py and export it as a public helper, or (b) pass a filter function as a parameter to `build_handoff`. This makes the contract explicit and testable.
+
+Benefits:
+Eliminates silent desynchronization between modules. The coupling becomes explicit and can be tested. Future changes to chat_sessions.py's internal representation won't break handoff.py without detection.
+
+NOTE: No flags were applied because the critique found no issues with the draft.
+
+### AC-169 · Extract common HTTP utilities in agent_client.py
+Strength: Moderate
+Files: agent_client.py, test_agent_client.py
+
+Problem:
+The module makes HTTP calls in three places (`list_all`, `_delete_session_from_host`, and `open_events`), each with similar but not identical patterns: token resolution via `agent_hosts.read_token()`, URL construction from `host.url + path`, and error handling for `requests.RequestException` (and sometimes `ValueError`). While the error handling is more consistent than "ad-hoc" (all sites log the exception class and handle failures gracefully), there are real inconsistencies: `open_events` catches only `requests.RequestException` while the others also catch `ValueError`, `open_events` uses a different timeout `(3, 60)` for streaming, and the three call sites have incompatible return contracts (return record vs. return boolean vs. raise error). Additionally, the test patches `agent_client.requests.get` directly, which would need adjustment if any refactoring changes how requests are made.
+
+Solution:
+Extract two focused helpers that capture the commonalities without forcing incompatible contracts into a single abstraction:
+
+1. `_build_request_kwargs(host, path, **overrides)` — constructs the base request parameters: resolves the bearer token from `agent_hosts.read_token(host)`, builds the URL from `host.url + path`, and returns a dict with `url`, `headers`, and any overrides (like `timeout`, `params`, `stream`). This eliminates token resolution and URL construction duplication.
+
+2. `_handle_request_error(host_name, e)` — centralizes the error logging and record creation: logs `type(e).__name__`, returns `{"host": host_name, "reason": type(e).__name__}`. This unifies the error logging pattern.
+
+Refactor the three call sites to use these helpers:
+- `list_all`: uses `_build_request_kwargs` for setup, calls `requests.get`, catches exceptions, uses `_handle_request_error` for failure logging
+- `_delete_session_from_host`: same pattern, returns boolean based on success/failure
+- `open_events`: same pattern, but passes `stream=True` and `timeout=(3, 60)` via overrides; catches only `requests.RequestException` as before (preserving current behavior), wraps in `AgentError` on failure
+
+Update the test in `test_agent_client.py` to patch the new helper `_build_request_kwargs` instead of `agent_client.requests.get`, ensuring the test still validates the actual code path being refactored.
+
+Benefits:
+Extracting just the common setup and logging patterns (without forcing incompatible error contracts into one helper) gives developers two small, focused places to maintain HTTP setup logic. The token resolution and URL construction are now in one place, reducing the risk of inconsistencies when adding new endpoints. The error logging is unified, making it easier to audit. Each caller retains its specific error handling contract (return record, return boolean, or raise error), which is appropriate given their different use cases. The streaming function's special timeout and response object handling remain explicit and clear. The test is updated to patch the actual abstraction boundary, making it more maintainable.
+
+NOTE: The critique's "NO ISSUES FOUND" conclusion appears to be an error given the detailed problems listed; I've addressed all substantive concerns raised in the critique body.
+
+### AC-170 · Eliminate duplicate `test_node_client_util.py` files
+Strength: Strong
+Files: test_node_client_util.py, tests/test_node_client_util.py
+
+Problem:
+Two functionally identical test files exist in the repository: one at the root and one in the tests/ subdirectory. Both test the same module with the same test class, methods, and assertions. The only difference is that the tests/ version includes a `sys.path.insert(0, str(Path(__file__).parent))` workaround for import resolution. This duplication creates a single point of failure for test maintenance — any fix or new test added to one file will not propagate to the other, leading to inconsistent coverage and confusion about which file is authoritative.
+
+Solution:
+Keep one canonical location (preferably `tests/test_node_client_util.py` to follow Python convention) and delete the root-level duplicate. Retain the `sys.path.insert(0, str(Path(__file__).parent))` workaround in the `tests/` version, as there is no conftest.py or other test runner configuration to ensure import resolution works from that location.
+
+Benefits:
+- Single source of truth for node_client_util tests
+- No risk of divergent test coverage
+- Cleaner repository structure
+- Preserves working import resolution without unverified assumptions
+
+---
+
+### AC-171 · Surface `model_stats_client` recording failures for observability
+Strength: Strong
+Files: model_stats_client.py
+
+Problem:
+Every public function in model_stats_client.py (record_call, record_outcome, get_turns_summary) swallows its own errors. The internal _run_event function catches (OSError, subprocess.SubprocessError) and logs a warning, but callers never see the failure. get_turns_summary returns None on failure, but record_call and record_outcome return silently. This means there is no way to detect if the model-stats recording pipeline is consistently broken — a Node.js script crash, a missing model-stats-db.js, or a disk-full condition would all be silently ignored. The docstring's "never let stats recording break the real feature" contract is correct, but it should not preclude observability.
+
+Solution:
+Add a module-level counter or metric (e.g., model_stats_errors_total) that increments on every failed _run_event call. Optionally, expose a get_error_count() function for diagnostics. The silent-swallow contract for the real feature is preserved — callers of record_call don't need to handle exceptions — but operators get visibility into recording health.
+
+Benefits:
+- Infrastructure failures in the stats pipeline become observable
+- No change to the public API contract for callers
+- Enables alerting on persistent recording failures
+
+---
+
+### AC-172 · Validate Node.js script exit codes in `node_client_util.run_node_with_tempfile`
+Strength: Strong
+Files: node_client_util.py, model_stats_client.py
+
+Problem:
+run_node_with_tempfile returns the subprocess.CompletedProcess without checking returncode. The function's docstring claims it "Raises OSError or subprocess.SubprocessError on failure," but that only covers transport-level failures (node not found, timeout, etc.). A Node.js script that exits with code 1 due to a logic error or invalid input is treated identically to one that exits with code 0. In model_stats_client.py, _run_event doesn't check the return code either, so application-level failures in model-stats-db.js are invisible.
+
+Solution:
+Add an optional check_returncode: bool = False parameter to run_node_with_tempfile. When True, raise subprocess.CalledProcessError if the Node script exits non-zero. In model_stats_client.py, pass check_returncode=True to _run_event so that application-level failures are logged with the exit code and stderr, making them distinguishable from transport failures.
+
+Benefits:
+- Application errors in Node scripts become visible in logs
+- Operators can distinguish between "node not found" and "script failed with exit code 1"
+- No behavior change for callers that don't need exit-code validation
+
+NOTE: AC-501 corrected to remove the unsupported assumption about test runner configuration and retain the sys.path.insert workaround in the canonical location.
+
+### AC-502 · Centralize HTML-escaping helper across view files
+Strength: Strong
+Files: static/commands-view.js, static/tools-view.js
+
+Problem:
+Both commands-view.js and tools-view.js define an identical `esc` function that HTML-escapes five characters (`&`, `<`, `>`, `"`, `'`). The escaping contract lives in two places, so any change to the escaping rules — adding a character, switching to a library, or tightening the behavior — requires updating both files in lockstep. Missing one creates an XSS gap in one view but not the other, which is a real correctness hazard.
+
+Solution:
+Create a new shared utility module (e.g., `utils.js` in the same directory) containing the `esc` function, and import it in both view files. This centralizes the escaping contract so that future changes require editing only one location.
+
+Benefits:
+Eliminates the duplication, ensures consistent escaping behavior across views, and removes the risk of an XSS gap caused by forgetting to update one file when the escaping rules change.
+
+### AC-503 · Unify session key format across attention-view.js and sessions-view.js
+Strength: Strong
+Files: static/attention-view.js, static/sessions-view.js
+
+Problem:
+`attention-view.js` defines `keyOf(row)` which returns `host/id` only when a host exists, falling back to bare `id`. `sessions-view.js` defines `rowKey(row)` which always returns `host/id`, even when host is empty (producing `'/123` for a row with no host). Within sessions-view.js there are already two key formats, and across the two files there are three. The attention system and terminal switcher coordinate on "which session needs you" — using different key formats for the same concept is a real source of bugs when the two systems are compared or merged.
+
+Solution:
+Pick one canonical key format (either always `host/id` or conditional `host/id` with fallback to `id`) and align both files to use it. Update `keyOf` in attention-view.js and `rowKey` in sessions-view.js to match, and ensure `jumpTarget` in sessions-view.js uses the same format.
+
+Benefits:
+Eliminates the inconsistency, reduces the risk of bugs when comparing or merging session identifiers across the two systems, and simplifies the mental model for developers working on session coordination.
+
+### AC-504 · Deduplicate filter logic in sessions-view.js
+Strength: Strong
+Files: static/sessions-view.js
+
+Problem:
+`filterRows` and `filterChats` in sessions-view.js are structurally identical: both take `(rows, query)`, both trim/lowercase the query, both return `rows` unchanged for empty input, and both do a case-insensitive substring match — they just search different fields. The duplication is ~15 lines of identical control flow per function. Adding a new field to search (e.g., model name for terminal rows) requires editing both functions, and keeping them in sync is a maintenance burden.
+
+Solution:
+Extract the common filtering logic into a single helper function that accepts a field name or accessor function as a parameter. Both `filterRows` and `filterChats` can then delegate to this helper with the appropriate field configuration.
+
+Benefits:
+Reduces code duplication, ensures consistent filtering behavior across both functions, and makes it easier to add new searchable fields without risking inconsistencies between the two filter functions.
