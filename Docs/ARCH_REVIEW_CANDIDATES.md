@@ -2324,3 +2324,55 @@ Benefits:
 Extracting just the common setup and logging patterns (without forcing incompatible error contracts into one helper) gives developers two small, focused places to maintain HTTP setup logic. The token resolution and URL construction are now in one place, reducing the risk of inconsistencies when adding new endpoints. The error logging is unified, making it easier to audit. Each caller retains its specific error handling contract (return record, return boolean, or raise error), which is appropriate given their different use cases. The streaming function's special timeout and response object handling remain explicit and clear. The test is updated to patch the actual abstraction boundary, making it more maintainable.
 
 NOTE: The critique's "NO ISSUES FOUND" conclusion appears to be an error given the detailed problems listed; I've addressed all substantive concerns raised in the critique body.
+
+### AC-170 · Eliminate duplicate `test_node_client_util.py` files
+Strength: Strong
+Files: test_node_client_util.py, tests/test_node_client_util.py
+
+Problem:
+Two functionally identical test files exist in the repository: one at the root and one in the tests/ subdirectory. Both test the same module with the same test class, methods, and assertions. The only difference is that the tests/ version includes a `sys.path.insert(0, str(Path(__file__).parent))` workaround for import resolution. This duplication creates a single point of failure for test maintenance — any fix or new test added to one file will not propagate to the other, leading to inconsistent coverage and confusion about which file is authoritative.
+
+Solution:
+Keep one canonical location (preferably `tests/test_node_client_util.py` to follow Python convention) and delete the root-level duplicate. Retain the `sys.path.insert(0, str(Path(__file__).parent))` workaround in the `tests/` version, as there is no conftest.py or other test runner configuration to ensure import resolution works from that location.
+
+Benefits:
+- Single source of truth for node_client_util tests
+- No risk of divergent test coverage
+- Cleaner repository structure
+- Preserves working import resolution without unverified assumptions
+
+---
+
+### AC-171 · Surface `model_stats_client` recording failures for observability
+Strength: Strong
+Files: model_stats_client.py
+
+Problem:
+Every public function in model_stats_client.py (record_call, record_outcome, get_turns_summary) swallows its own errors. The internal _run_event function catches (OSError, subprocess.SubprocessError) and logs a warning, but callers never see the failure. get_turns_summary returns None on failure, but record_call and record_outcome return silently. This means there is no way to detect if the model-stats recording pipeline is consistently broken — a Node.js script crash, a missing model-stats-db.js, or a disk-full condition would all be silently ignored. The docstring's "never let stats recording break the real feature" contract is correct, but it should not preclude observability.
+
+Solution:
+Add a module-level counter or metric (e.g., model_stats_errors_total) that increments on every failed _run_event call. Optionally, expose a get_error_count() function for diagnostics. The silent-swallow contract for the real feature is preserved — callers of record_call don't need to handle exceptions — but operators get visibility into recording health.
+
+Benefits:
+- Infrastructure failures in the stats pipeline become observable
+- No change to the public API contract for callers
+- Enables alerting on persistent recording failures
+
+---
+
+### AC-172 · Validate Node.js script exit codes in `node_client_util.run_node_with_tempfile`
+Strength: Strong
+Files: node_client_util.py, model_stats_client.py
+
+Problem:
+run_node_with_tempfile returns the subprocess.CompletedProcess without checking returncode. The function's docstring claims it "Raises OSError or subprocess.SubprocessError on failure," but that only covers transport-level failures (node not found, timeout, etc.). A Node.js script that exits with code 1 due to a logic error or invalid input is treated identically to one that exits with code 0. In model_stats_client.py, _run_event doesn't check the return code either, so application-level failures in model-stats-db.js are invisible.
+
+Solution:
+Add an optional check_returncode: bool = False parameter to run_node_with_tempfile. When True, raise subprocess.CalledProcessError if the Node script exits non-zero. In model_stats_client.py, pass check_returncode=True to _run_event so that application-level failures are logged with the exit code and stderr, making them distinguishable from transport failures.
+
+Benefits:
+- Application errors in Node scripts become visible in logs
+- Operators can distinguish between "node not found" and "script failed with exit code 1"
+- No behavior change for callers that don't need exit-code validation
+
+NOTE: AC-501 corrected to remove the unsupported assumption about test runner configuration and retain the sys.path.insert workaround in the canonical location.
