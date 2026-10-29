@@ -543,8 +543,9 @@ def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
     )
     if result.get("sessionId"):
         session["claudeSessionId"] = result["sessionId"]
-    model_stats_client.record_call("chat-session", result["model"], int((time.time() - started) * 1000),
-                                    stage="chat", result=result, source="chat")
+    model_stats_client.record_call(session["id"], result["model"], int((time.time() - started) * 1000),
+                                    stage="chat", result=result, source="chat",
+                                    instance_id="chat")
     return result["response"].strip()
 
 
@@ -1028,8 +1029,9 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
             yield {"type": "tool_end", "name": tool_name, "ok": ok, "summary": summary}
         elif event.get("type") == "final":
             result = event
-    model_stats_client.record_call("chat-session", ollama_client.MODEL(), int((time.time() - started) * 1000),
-                                    stage="chat", result=result or {}, source="chat")
+    model_stats_client.record_call(session["id"], ollama_client.MODEL(), int((time.time() - started) * 1000),
+                                    stage="chat", result=result or {}, source="chat",
+                                    instance_id="chat")
     final_text = (result or {}).get("response")
     if final_text is None:
         final_text = "".join(raw_chunks)
