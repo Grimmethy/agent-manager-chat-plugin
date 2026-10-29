@@ -484,5 +484,58 @@ class ChosenProjectRouteTest(unittest.TestCase):
         self.assertEqual(body["active"], "agent-manager")
 
 
+class EnforceFooterTest(unittest.TestCase):
+    """Tests for the new enforce_footer() function (HUB0027): retry logic that
+    APPENDS instead of replaces, with deterministic fallback."""
+
+    def test_enforce_footer_preserves_existing_task_ref(self):
+        """Answer with TASK-REF should be returned unchanged."""
+        answer = "Here's the answer.\n\nTASK-REF: AC-123"
+        result = chat_sessions.enforce_footer(answer)
+        self.assertEqual(result, answer)
+
+    def test_enforce_footer_preserves_existing_context_log(self):
+        """Answer with CONTEXT-LOG should be returned unchanged."""
+        answer = "Here's the answer.\n\nCONTEXT-LOG: distilled summary"
+        result = chat_sessions.enforce_footer(answer)
+        self.assertEqual(result, answer)
+
+    def test_enforce_footer_appends_task_ref_when_missing(self):
+        """Answer without footer should get TASK-REF: N/A appended (not replaced)."""
+        answer = "Here's the answer."
+        result = chat_sessions.enforce_footer(answer)
+        self.assertIn("Here's the answer.", result)
+        self.assertIn("TASK-REF: N/A", result)
+        self.assertTrue(result.endswith("TASK-REF: N/A"))
+
+    def test_enforce_footer_preserves_original_content(self):
+        """Original answer content must never be discarded."""
+        answer = "Long answer with important details.\n\nIt covers X, Y, and Z."
+        result = chat_sessions.enforce_footer(answer)
+        self.assertIn("Long answer with important details.", result)
+        self.assertIn("It covers X, Y, and Z.", result)
+        self.assertNotIn("TASK-REF: N/A", answer)  # original didn't have it
+        self.assertIn("TASK-REF: N/A", result)  # result should have it
+
+    def test_enforce_footer_handles_empty_string(self):
+        """Empty answer should still get footer appended."""
+        answer = ""
+        result = chat_sessions.enforce_footer(answer)
+        self.assertIn("TASK-REF: N/A", result)
+
+    def test_has_footer_detects_task_ref(self):
+        """_has_footer() should detect TASK-REF pattern."""
+        self.assertTrue(chat_sessions._has_footer("text TASK-REF: 123"))
+        self.assertTrue(chat_sessions._has_footer("TASK-REF: abc"))
+        self.assertFalse(chat_sessions._has_footer("no footer here"))
+        self.assertFalse(chat_sessions._has_footer(""))
+
+    def test_has_footer_detects_context_log(self):
+        """_has_footer() should detect CONTEXT-LOG pattern."""
+        self.assertTrue(chat_sessions._has_footer("text CONTEXT-LOG: summary"))
+        self.assertTrue(chat_sessions._has_footer("CONTEXT-LOG: abc"))
+        self.assertFalse(chat_sessions._has_footer("no footer here"))
+
+
 if __name__ == "__main__":
     unittest.main()
