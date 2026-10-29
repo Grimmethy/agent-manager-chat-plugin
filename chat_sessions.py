@@ -699,7 +699,7 @@ _LOCAL_SYSTEM_PROMPT = (
     "block in a code fence.\n\n"
     + _FRESHNESS_RULES
     + "\n\n" + _PROJECT_RULES
-    + "\\n\\n" + _BEHAVIORAL_RULES
+    + "\n\n" + _BEHAVIORAL_RULES
 )
 
 

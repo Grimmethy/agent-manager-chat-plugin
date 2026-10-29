@@ -315,6 +315,12 @@ class BehavioralRulesPromptTest(unittest.TestCase):
         self.assertIn(chat_sessions._BEHAVIORAL_RULES, prompt)
         self.assertLess(prompt.index(chat_sessions._PROJECT_RULES), prompt.index(chat_sessions._BEHAVIORAL_RULES))
 
+    def test_local_system_prompt_joins_the_rules_with_a_real_blank_line(self):
+        # The join once used a literal backslash-n pair, so the prompt held the characters \\n\\n instead of a blank line.
+        prompt = chat_sessions._LOCAL_SYSTEM_PROMPT
+        self.assertIn(chat_sessions._PROJECT_RULES + "\n\n" + chat_sessions._BEHAVIORAL_RULES, prompt)
+        self.assertNotIn("\\n", prompt)
+
     def test_claude_first_turn_preamble_includes_behavioral_rules(self):
         import inspect
         src = inspect.getsource(chat_sessions._send_claude)
