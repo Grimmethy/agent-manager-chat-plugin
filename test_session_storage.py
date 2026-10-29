@@ -163,10 +163,49 @@ class ConcurrentStreamsTest(StorageTestBase):
 class LifecycleTest(StorageTestBase):
     def test_new_conversation_leaves_the_previous_one_active(self):
         first = chat_sessions.start_new_conversation(self.storage, ROOTS)
+        # "New" twice before any message returns the same empty chat (dedup); once the first has been used, New makes a second one.
+        chat_sessions.inject_user_message(self.storage, first["id"], "first message")
         second = chat_sessions.start_new_conversation(self.storage, ROOTS)
         self.assertNotEqual(first["id"], second["id"])
         self.assertEqual(chat_sessions.get_session(self.storage, first["id"])["status"], "active")
         self.assertEqual(chat_sessions.get_session(self.storage, second["id"])["status"], "active")
+
+    def test_new_conversation_twice_before_any_message_returns_the_same_empty_chat(self):
+        first = chat_sessions.start_new_conversation(self.storage, ROOTS)
+        again = chat_sessions.start_new_conversation(self.storage, ROOTS)
+        self.assertEqual(first["id"], again["id"])
+        self.assertEqual(len([s for s in chat_sessions._read_sessions(self.storage).values() if s["status"] == "active"]), 1)
+
+    def test_empty_roots_are_normalised_the_same_way_a_new_session_stores_them(self):
+        first = chat_sessions.start_new_conversation(self.storage, [])
+        self.assertEqual(first["roots"], ["."])
+        self.assertEqual(chat_sessions.start_new_conversation(self.storage, [])["id"], first["id"])
+        self.assertEqual(chat_sessions.start_new_conversation(self.storage, ["", "."])["id"], first["id"])
+
+    def test_an_empty_chat_for_another_provider_model_effort_or_roots_is_not_a_duplicate(self):
+        base = chat_sessions.start_new_conversation(self.storage, ROOTS)
+        other_provider = chat_sessions.start_new_conversation(self.storage, ROOTS, provider="claude")
+        other_model = chat_sessions.start_new_conversation(self.storage, ROOTS, model="some-model")
+        other_effort = chat_sessions.start_new_conversation(self.storage, ROOTS, effort="high")
+        other_roots = chat_sessions.start_new_conversation(self.storage, ROOTS + ["/elsewhere"])
+        ids = {base["id"], other_provider["id"], other_model["id"], other_effort["id"], other_roots["id"]}
+        self.assertEqual(len(ids), 5)
+        # and each of those is itself deduplicated against a repeat of the same request
+        self.assertEqual(chat_sessions.start_new_conversation(self.storage, ROOTS, provider="claude")["id"], other_provider["id"])
+        self.assertEqual(chat_sessions.start_new_conversation(self.storage, ROOTS, model="some-model")["id"], other_model["id"])
+        self.assertEqual(chat_sessions.start_new_conversation(self.storage, ROOTS, effort="high")["id"], other_effort["id"])
+        self.assertEqual(chat_sessions.start_new_conversation(self.storage, ROOTS + ["/elsewhere"])["id"], other_roots["id"])
+
+    def test_a_used_or_ended_chat_is_never_returned_as_the_empty_duplicate(self):
+        chat_sessions._write_session(self.storage, _session("chat-1-aaaaaaaa", last="2026-10-18T12:00:00Z"))
+        chat_sessions._write_session(self.storage, _session("chat-2-bbbbbbbb", status="ended"))
+        new = chat_sessions.start_new_conversation(self.storage, ROOTS)
+        self.assertNotIn(new["id"], ("chat-1-aaaaaaaa", "chat-2-bbbbbbbb"))
+
+    def test_get_active_session_prefers_the_most_recently_used_over_an_older_empty_chat(self):
+        chat_sessions._write_session(self.storage, _session("chat-1-aaaaaaaa", started="2026-10-18T09:00:00Z", last="2026-10-18T12:00:00Z"))
+        chat_sessions._write_session(self.storage, _session("chat-2-bbbbbbbb", started="2026-10-18T11:00:00Z"))
+        self.assertEqual(chat_sessions.get_active_session(self.storage, ROOTS)["id"], "chat-1-aaaaaaaa")
 
     def test_get_active_session_returns_the_most_recently_used(self):
         chat_sessions._write_session(self.storage, _session("chat-1-aaaaaaaa", started="2026-10-18T09:00:00Z", last="2026-10-18T12:00:00Z"))
