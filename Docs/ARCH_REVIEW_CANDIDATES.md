@@ -2298,3 +2298,29 @@ Benefits:
 Eliminates silent desynchronization between modules. The coupling becomes explicit and can be tested. Future changes to chat_sessions.py's internal representation won't break handoff.py without detection.
 
 NOTE: No flags were applied because the critique found no issues with the draft.
+
+### AC-169 · Extract common HTTP utilities in agent_client.py
+Strength: Moderate
+Files: agent_client.py, test_agent_client.py
+
+Problem:
+The module makes HTTP calls in three places (`list_all`, `_delete_session_from_host`, and `open_events`), each with similar but not identical patterns: token resolution via `agent_hosts.read_token()`, URL construction from `host.url + path`, and error handling for `requests.RequestException` (and sometimes `ValueError`). While the error handling is more consistent than "ad-hoc" (all sites log the exception class and handle failures gracefully), there are real inconsistencies: `open_events` catches only `requests.RequestException` while the others also catch `ValueError`, `open_events` uses a different timeout `(3, 60)` for streaming, and the three call sites have incompatible return contracts (return record vs. return boolean vs. raise error). Additionally, the test patches `agent_client.requests.get` directly, which would need adjustment if any refactoring changes how requests are made.
+
+Solution:
+Extract two focused helpers that capture the commonalities without forcing incompatible contracts into a single abstraction:
+
+1. `_build_request_kwargs(host, path, **overrides)` — constructs the base request parameters: resolves the bearer token from `agent_hosts.read_token(host)`, builds the URL from `host.url + path`, and returns a dict with `url`, `headers`, and any overrides (like `timeout`, `params`, `stream`). This eliminates token resolution and URL construction duplication.
+
+2. `_handle_request_error(host_name, e)` — centralizes the error logging and record creation: logs `type(e).__name__`, returns `{"host": host_name, "reason": type(e).__name__}`. This unifies the error logging pattern.
+
+Refactor the three call sites to use these helpers:
+- `list_all`: uses `_build_request_kwargs` for setup, calls `requests.get`, catches exceptions, uses `_handle_request_error` for failure logging
+- `_delete_session_from_host`: same pattern, returns boolean based on success/failure
+- `open_events`: same pattern, but passes `stream=True` and `timeout=(3, 60)` via overrides; catches only `requests.RequestException` as before (preserving current behavior), wraps in `AgentError` on failure
+
+Update the test in `test_agent_client.py` to patch the new helper `_build_request_kwargs` instead of `agent_client.requests.get`, ensuring the test still validates the actual code path being refactored.
+
+Benefits:
+Extracting just the common setup and logging patterns (without forcing incompatible error contracts into one helper) gives developers two small, focused places to maintain HTTP setup logic. The token resolution and URL construction are now in one place, reducing the risk of inconsistencies when adding new endpoints. The error logging is unified, making it easier to audit. Each caller retains its specific error handling contract (return record, return boolean, or raise error), which is appropriate given their different use cases. The streaming function's special timeout and response object handling remain explicit and clear. The test is updated to patch the actual abstraction boundary, making it more maintainable.
+
+NOTE: The critique's "NO ISSUES FOUND" conclusion appears to be an error given the detailed problems listed; I've addressed all substantive concerns raised in the critique body.
