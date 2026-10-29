@@ -30,6 +30,7 @@ def _registry():
 
 def _session(account=None):
     session = {
+        "id": "chat-test-session",
         "repoRoot": "/tmp/fake-repo",
         "claudeSessionId": "sess-1",  # not the first turn: skip the preamble path
         "model": "opus",
