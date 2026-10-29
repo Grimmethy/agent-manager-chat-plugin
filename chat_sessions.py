@@ -296,6 +296,22 @@ def _last_used(session: dict) -> str:
     return max(session.get("lastActivityAt") or "", session.get("startedAt") or "")
 
 
+def _find_existing_empty_session(storage_dir: Path, roots: list, provider: str, model, effort) -> dict | None:
+    """Find an existing active session that has never been touched (lastActivityAt is
+    None) AND was created for the same roots, provider, model and effort. Used to
+    deduplicate rapid "New Chat" clicks: if a freshly created session hasn't received its
+    first message yet, return it instead of creating another one. A session made for a
+    different provider, model, effort or set of roots is not a duplicate of this request.
+    Returns the session dict or None."""
+    roots = [r for r in (roots or []) if r] or ["."]  # the same normalisation _new_session applies
+    for session in _read_sessions(storage_dir).values():
+        if (session.get("status") == "active" and session.get("lastActivityAt") is None
+                and session.get("roots") == roots and session.get("provider") == provider
+                and session.get("model") == model and session.get("effort") == effort):
+            return session
+    return None
+
+
 def get_active_session(storage_dir: Path, roots: list, instances_dir=None,
                         provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
     """The conversation the single-pane sidebar shows (Brain Dump #153: "hideable panel
@@ -305,7 +321,8 @@ def get_active_session(storage_dir: Path, roots: list, instances_dir=None,
     provider/model/effort for an existing active session -- same "fixed for the
     session's lifetime" reasoning discuss_sessions.py already documents (a
     mid-conversation provider switch would hand the new provider/model a transcript or
-    --resume history it didn't generate)."""
+    --resume history it didn't generate).
+"""
     active = [s for s in _read_sessions(storage_dir).values() if s.get("status") == "active"]
     if active:
         return max(active, key=_last_used)
@@ -318,7 +335,16 @@ def start_new_conversation(storage_dir: Path, roots: list, instances_dir=None,
                             provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
     """Starts a fresh conversation ALONGSIDE the existing ones (2026-10-18: it used to end
     every active session first, so "New" destroyed the chat you were in). Use
-    end_session() to close one."""
+    end_session() to close one.
+
+    Deduplication: if an active session with the same roots, provider, model and effort
+    exists with lastActivityAt=None (a freshly created session that never received a
+    message), return it instead of creating a duplicate. This prevents double-creating
+    empty sessions when the New Chat button is clicked rapidly. Once a message has been
+    sent in it, the next "New" creates a new conversation as before."""
+    existing_empty = _find_existing_empty_session(storage_dir, roots, provider, model, effort)
+    if existing_empty:
+        return existing_empty
     session = _new_session(roots, instances_dir, provider, model, effort)
     _write_session(storage_dir, session)
     return session
@@ -484,6 +510,7 @@ def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
                 "access to these additional repos:\n" + _roots_blurb(session)
             )
         preamble_parts.append(_FRESHNESS_RULES)
+        preamble_parts.append(_BEHAVIORAL_RULES)
         agents_md = _read_agents_md(session)
         if agents_md:
             preamble_parts.append(_agents_md_blurb(agents_md))
@@ -569,6 +596,23 @@ _PROJECT_RULES = (
     "File a task about another repo with queue_reviewed_task(project=<label>) and read, search or unstick tasks of that project with the same `project` argument "
     "(search_tasks accepts project \"all\"). If you are unsure which project a change belongs to, ask the user. "
     "Never file a task about repo X into another project's queue: the tool refuses a task whose file paths clearly belong to another project, and tells you which one."
+)
+
+# 2026-10-29 (walkthrough): the chat invented user reactions ("You're right" 14 times),
+# narrated its own protocol (4 times), and looped on filler ("continue verifying..." 16 times)
+# between tool calls. This rule is added to the system prompt to prevent the model from
+# addressing the user as if they had replied between tool calls, apologizing unless the user
+# pointed at a specific mistake, or mentioning internal protocol blocks in streamed text.
+# The deterministic audit (chat_audit.py) counts these violations per turn and stores the
+# counts in the turn record for tracking.
+_BEHAVIORAL_RULES = (
+    "Behavioral rules for stream integrity (mandatory, not optional):\n"
+    "- Do NOT address the user as if they had replied between your tool calls. The user sends one message per turn; do not invent their reactions, agreement, or frustration.\n"
+    "- Do NOT apologize unless the user explicitly pointed at a specific mistake in their message. Do not preemptively apologize for potential errors.\n"
+    "- Do NOT mention internal protocol blocks (CONTEXT-LOG, TASK-REF, SIDE-FINDING, AMPLIFY) in your streamed text. These are internal markers, not user-facing content.\n"
+    "- Do NOT repeat filler phrases between tool calls. Each tool call should be followed by a direct, concise response related to that tool's output.\n"
+    "- Keep your responses focused on the user's actual question. Do not narrate your thought process or protocol to the user.\n"
+    "These rules prevent the chat from appearing confused about who said what and reduce noise in the conversation history."
 )
 
 _LOCAL_SYSTEM_PROMPT = (
@@ -681,6 +725,7 @@ _LOCAL_SYSTEM_PROMPT = (
     "block in a code fence.\n\n"
     + _FRESHNESS_RULES
     + "\n\n" + _PROJECT_RULES
+    + "\n\n" + _BEHAVIORAL_RULES
 )
 
 
@@ -1014,6 +1059,19 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
         if event.get("type") == "chunk":
             raw_chunks.append(event["text"])
             yield event["text"]
+        elif event.get("type") == "tool_start":
+            # Extract tool name and summarize args (first 120 chars)
+            tool_name = event.get("name", "unknown")
+            args = event.get("args", "")
+            summary = args[:120] if args else ""
+            yield {"type": "tool_start", "name": tool_name, "summary": summary}
+        elif event.get("type") == "tool_end":
+            # Extract tool name, success status, and summarize result (first 120 chars)
+            tool_name = event.get("name", "unknown")
+            ok = event.get("ok", False)
+            result_text = event.get("result", "")
+            summary = result_text[:120] if result_text else ""
+            yield {"type": "tool_end", "name": tool_name, "ok": ok, "summary": summary}
         elif event.get("type") == "final":
             result = event
     model_stats_client.record_call(session["id"], ollama_client.MODEL(), int((time.time() - started) * 1000),
@@ -1128,11 +1186,46 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
         _write_session(storage_dir, session)
         yield {"type": "chunk", "text": reply}
     else:
-        for chunk in _stream_local(session, message, result_box):
-            reply_parts.append(chunk)
-            session["transcript"][-1]["text"] = "".join(reply_parts)
-            _write_session(storage_dir, session)
-            yield {"type": "chunk", "text": chunk}
+        # 2026-10-30 (HUB0033): chunk coalescing + tool event emission
+        # Coalesce consecutive text chunks into one frame per 100ms or 200 chars
+        # (whichever comes first), flushing before tool events and at end.
+        coalesce_buffer = []
+        coalesce_chars = 0
+        coalesce_last_time = time.time()
+        COALESCE_MS = 100
+        COALESCE_CHARS = 200
+        
+        def _flush_coalesced():
+            """Flush the current coalescing buffer as a single chunk event."""
+            nonlocal coalesce_buffer, coalesce_chars, coalesce_last_time
+            if coalesce_buffer:
+                # reply_parts and the persisted placeholder already took each item on arrival (below); this only frames them for the stream.
+                combined = "".join(coalesce_buffer)
+                yield {"type": "chunk", "text": combined}
+                coalesce_buffer = []
+                coalesce_chars = 0
+                coalesce_last_time = time.time()
+        
+        for item in _stream_local(session, message, result_box):
+            if isinstance(item, dict):
+                # Tool event (tool_start or tool_end) - flush chunks first
+                yield from _flush_coalesced()
+                yield item
+            else:
+                # Text chunk - accumulate for coalescing
+                coalesce_buffer.append(item)
+                coalesce_chars += len(item)
+                reply_parts.append(item)
+                session["transcript"][-1]["text"] = "".join(reply_parts)
+                _write_session(storage_dir, session)
+                
+                # Check if we should flush based on time or character count
+                elapsed_ms = (time.time() - coalesce_last_time) * 1000
+                if elapsed_ms >= COALESCE_MS or coalesce_chars >= COALESCE_CHARS:
+                    yield from _flush_coalesced()
+        
+        # Final flush at end of streaming
+        yield from _flush_coalesced()
 
     # 2026-09-15: prefer _stream_local's own authoritative final_text (the model's
     # response with every SIDE-FINDING:/AMPLIFY:/CONCEPT-BUILD:/CONTEXT-LOG: marker
@@ -1148,6 +1241,22 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     # 2026-10-28 (HUB0027): strip chatter (apology text) from the stored answer,
     # and add display_text with footers stripped for UI consumption.
     reply = _strip_chatter(reply)
+    
+    # 2026-10-29 (walkthrough): run deterministic audit on the turn's text to count
+    # behavioral violations (invented user reactions, protocol narration, filler loops).
+    # The audit result is stored in the turn record for tracking and alerting.
+    try:
+        import chat_audit
+        # Determine if this turn has a user message after the first (multi-turn exchange)
+        # by checking if the transcript has more than one user message before this assistant turn
+        transcript = session["transcript"]
+        user_message_count = sum(1 for t in transcript if t.get("role") == "user")
+        has_user_after_first = user_message_count > 1
+        audit_result = chat_audit.audit_turn(reply, has_user_message_after_first=has_user_after_first)
+        session["transcript"][-1]["audit"] = audit_result
+    except ImportError:
+        # chat_audit not available (e.g., in tests); skip audit silently
+        pass
     
     # Store the full text (with footers) in the transcript for persistence
     session["transcript"][-1]["text"] = reply.strip()

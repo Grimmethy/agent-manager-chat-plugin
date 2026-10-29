@@ -10,6 +10,7 @@ need no re-import.
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -81,14 +82,151 @@ def list_all() -> dict:
 def list_sessions() -> list:
     """All configured hosts' session rows. Raises AgentError when no host is
     configured or every configured host failed -- so a single configured host
-    failing behaves exactly as it did before multi-host support."""
+    failing behaves exactly as it did before multi-host support.
+
+    Duplicate empty sessions are collapsed: when the same id appears with both
+    an empty row (lastActivityAt=None, i.e. never received a message) and a
+    non-empty row, the empty one is dropped in favour of the non-empty one.
+    First occurrence is canonical when rows are otherwise equivalent.
+
+    Stale zero-turn sessions (lastActivityAt=None, older than 24 hours) are
+    deleted from each host's storage before the list is returned.
+    """
     hosts = agent_hosts.hosts()
     if not hosts:
         raise AgentError("session agent is not configured")
     result = list_all()
     if result["skipped"] and len(result["skipped"]) == len(hosts):
         raise AgentError("session agent /sessions failed")
-    return result["sessions"]
+    _cleanup_stale_sessions(result["sessions"])
+    return _dedup_empty_sessions(result["sessions"])
+
+
+def _cleanup_stale_sessions(sessions: list) -> None:
+    """Delete sessions with lastActivityAt=null older than 24 hours.
+
+    Iterates over the session rows returned by list_all(), identifies those
+    with no lastActivityAt and a createdAt timestamp older than 24 hours, and
+    sends a DELETE request to each host that owns the session. Sessions with
+    lastActivityAt set (non-null) are never affected.
+
+    Returns:
+        Number of sessions deleted (for logging/observability).
+    """
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+    deleted_count = 0
+
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        if session.get("lastActivityAt") is not None:
+            continue
+
+        created_str = session.get("createdAt", "")
+        if not created_str:
+            continue
+
+        try:
+            created_at = _parse_iso_datetime(created_str)
+        except (ValueError, TypeError):
+            continue
+
+        if created_at >= cutoff_time:
+            continue
+
+        session_id = session.get("id")
+        host_name = session.get("host")
+        if not session_id or not host_name:
+            continue
+
+        if _delete_session_from_host(host_name, session_id):
+            deleted_count += 1
+
+    if deleted_count > 0:
+        logger.info("Deleted %d stale zero-turn sessions", deleted_count)
+
+    return deleted_count
+
+
+def _parse_iso_datetime(iso_str: str) -> datetime:
+    """Parse an ISO 8601 datetime string to a timezone-aware datetime.
+
+    Handles 'Z' suffix (UTC) and standard ISO format with timezone offset.
+    Returns datetime.min (naive) for unparseable strings.
+    """
+    if not iso_str:
+        return datetime.min
+
+    s = iso_str.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return datetime.min
+
+
+def _delete_session_from_host(host_name: str, session_id: str) -> bool:
+    """Send a DELETE request to the named host to delete a specific session.
+
+    Args:
+        host_name: The host name (from agent_hosts.hosts()).
+        session_id: The session ID to delete.
+
+    Returns:
+        True if the delete succeeded, False otherwise.
+    """
+    import agent_hosts
+
+    host = agent_hosts.get_host(host_name)
+    if not host:
+        logger.warning("Cannot delete session %s: host '%s' not found", session_id, host_name)
+        return False
+
+    url = host.url.rstrip("/") + f"/sessions/{session_id}"
+    headers = {}
+    token = agent_hosts.read_token(host_name)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        r = requests.delete(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return True
+    except (requests.RequestException, ValueError) as e:
+        logger.warning("Failed to delete session %s from host '%s': %s",
+                       session_id, host_name, type(e).__name__)
+        return False
+
+
+def _dedup_empty_sessions(sessions: list) -> list:
+    """Drop sessions with no lastActivityAt (zero-turn) and deduplicate by id.
+    Active rows always win over empty ones for the same id; for identical-type
+    duplicates, first occurrence is canonical.
+
+    Single-pass: skip rows without a truthy lastActivityAt, then emit each id
+    only once (first occurrence wins).
+    """
+    out = []
+    seen = set()
+    for row in sessions:
+        if not isinstance(row, dict):
+            continue
+        if not row.get("lastActivityAt"):
+            continue
+        sid = row.get("id")
+        if sid is None:
+            out.append(row)
+            continue
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append(row)
+    return out
 
 
 def _resolve_host(name=None):
