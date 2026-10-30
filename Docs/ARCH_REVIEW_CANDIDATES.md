@@ -2415,3 +2415,32 @@ Extract the common filtering logic into a single helper function that accepts a 
 
 Benefits:
 Reduces code duplication, ensures consistent filtering behavior across both functions, and makes it easier to add new searchable fields without risking inconsistencies between the two filter functions.
+
+### AC-524 · Rename providerLabel export in swap-view.js to swapProviderLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/swap-view.js
+
+Problem:
+swap-view.js exports a function named providerLabel, which collides with the similarly-named providerLabel export in sessions-view.js. This creates ambiguity in chat.js where both modules are imported, and makes the code harder to maintain.
+
+Solution:
+Rename the providerLabel export in swap-view.js to swapProviderLabel. The function body, signature, and behavior remain unchanged — only the exported identifier is renamed.
+
+Benefits:
+Eliminates the naming collision between the two providerLabel exports, makes the import in chat.js self-documenting (swapProviderLabel clearly indicates its origin), and prevents future confusion when developers work with both modules.
+
+### AC-525 · Update chat.js import and usage to use renamed swapProviderLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/chat.js
+Depends-On: AC-524
+
+Problem:
+chat.js imports providerLabel from swap-view.js. After the export is renamed in swap-view.js, this import will break, and the usage in syncSwapHeader() will fail.
+
+Solution:
+Update the import statement in chat.js to import swapProviderLabel (the new name) from swap-view.js instead of providerLabel. Update the call site in syncSwapHeader() to use swapProviderLabel(this.session) instead of providerLabel(this.session).
+
+Benefits:
+Completes the rename refactoring and ensures chat.js continues to work correctly after the swap-view.js export is renamed. The import now uses a self-documenting name that indicates its source module.
