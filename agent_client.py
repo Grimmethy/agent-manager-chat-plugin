@@ -58,7 +58,7 @@ def list_all() -> dict:
             r = requests.get(host.url + "/sessions", headers=headers, timeout=REQUEST_TIMEOUT)
             r.raise_for_status()
             data = r.json()
-        except (requests.RequestException, ValueError) as e:
+        except requests.RequestException as e:
             logger.warning("session agent host '%s' /sessions failed: %s",
                            host.name, type(e).__name__)
             skipped.append({"host": host.name, "reason": type(e).__name__})
