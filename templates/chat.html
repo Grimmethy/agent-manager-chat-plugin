@@ -39,6 +39,11 @@
      this stays proxy-safe the same way the plain relative src= above is. -->
 <script type="module" src="static/chat.js"></script>
 <script src="static/vendor/dockview.js"></script>
+<!-- dockview-grid.js wraps createDockview and defines window.DockviewGrid for
+     static/multi-chat.js's tryRenderDockview(); loaded AFTER the vendored bundle
+     (so globalThis['dockview-core'] is set) and BEFORE multi-chat.js (so the
+     adapter is ready when it runs). -->
+<script src="static/dockview-grid.js"></script>
 <script type="module" src="static/multi-chat.js"></script>
 </body>
 </html>
