@@ -245,6 +245,34 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+# 2026-10-30 (HUB0034): per-turn timing scrub. Core attaches an array like
+# [{turn, modelCallMs, toolExecMs, forcedSummaryMs?}, ...] to the final SSE event.
+# Each entry is small, but we still clip numeric values and bounds to keep the
+# transcript file from growing unbounded across long sessions.
+_TIMINGS_MAX_ENTRIES = 200
+_TIMINGS_MAX_MS = 600_000  # 10 minutes -- anything longer is almost certainly a stall
+
+
+def _clip_timings(timings):
+    """Return a scrubbed copy of the per-turn timings array: bounds clamped,
+    truncated to the most recent N entries. Safe to call with None/empty -- returns [].
+    """
+    if not timings:
+        return []
+    clipped = []
+    for entry in timings[-_TIMINGS_MAX_ENTRIES:]:
+        if not isinstance(entry, dict):
+            continue
+        clean = {"turn": entry.get("turn")}
+        for key in ("modelCallMs", "toolExecMs", "forcedSummaryMs"):
+            val = entry.get(key)
+            if isinstance(val, (int, float)) and val >= 0:
+                clean[key] = min(val, _TIMINGS_MAX_MS)
+        if clean.get("turn") is not None:
+            clipped.append(clean)
+    return clipped
+
+
 def _new_session(roots: list, instances_dir, provider: str, model: str, effort: str) -> dict:
     session_id = f"chat-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     roots = [r for r in (roots or []) if r] or ["."]
@@ -1131,6 +1159,12 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
         result_box["final_text"] = final_text
         result_box["tools"] = tool_log.summarize_tool_calls((result or {}).get("toolCallLog"))
         result_box["proposals"] = (result or {}).get("commandProposals") or []
+        # 2026-10-30 (HUB0034): per-turn wall-clock timing, when the core emits it.
+        # Consumed from the final SSE event's `timings` array (a separate core-side
+        # follow-up task); the plugin reads it as an optional field and degrades
+        # silently if core never attaches one.
+        if result and result.get("timings"):
+            result_box["timings"] = result["timings"]
 
 
 def stream_message(storage_dir: Path, session_id: str, message: str):
@@ -1267,6 +1301,12 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     
     if result_box.get("tools"):
         session["transcript"][-1]["tools"] = result_box["tools"]
+    # 2026-10-30 (HUB0034): persist per-turn timings alongside tools when core
+    # attached them to the final SSE event. Scrubbed via tool_log.summarize_tool_calls
+    # would be overkill here -- the array is already bounded per-turn by core -- but
+    # clip each entry's values to keep the transcript file from growing unbounded.
+    if result_box.get("timings"):
+        session["transcript"][-1]["timings"] = _clip_timings(result_box["timings"])
     if result_box.get("proposals"):
         command_runs.record_proposals(session["transcript"][-1], result_box["proposals"])
     if proposals:

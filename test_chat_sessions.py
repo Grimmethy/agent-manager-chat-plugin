@@ -683,5 +683,160 @@ class ChatRecordCallTest(unittest.TestCase):
         self.assertEqual(patched_run2.call_args[0][1]["taskId"], "chat-MUTATED")
 
 
+class PerTurnTimingExtractionTest(unittest.TestCase):
+    """_stream_local extracts the optional `timings` field from the final SSE event
+    into result_box, and _stream_message_turn persists it on the transcript entry.
+    Both paths degrade silently when core never attaches the field (the core-side
+    timing instrumentation is a separate follow-up task)."""
+
+    def setUp(self):
+        self._stats_patch = mock.patch.object(chat_sessions.model_stats_client, "record_call")
+        self._stats_patch.start()
+        self.addCleanup(self._stats_patch.stop)
+
+    def _run_stream_local(self, events, result_box=None):
+        if result_box is None:
+            result_box = {}
+        with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools",
+                               lambda **kw: iter(events)):
+            "".join(chat_sessions._stream_local(_session(), "hi", result_box=result_box))
+        return result_box
+
+    def _run_stream_message_turn(self, items, tmp):
+        def fake_local(session, message, result_box=None):
+            yield from items
+        with mock.patch.object(chat_sessions, "_stream_local", fake_local):
+            return list(chat_sessions._stream_message_turn(Path(tmp), _session(), "hi"))
+
+    def test_stream_local_extracts_timings_from_final_event(self):
+        """When the final event carries `timings`, result_box gets them."""
+        result_box = {}
+        timings = [
+            {"turn": 0, "modelCallMs": 1200, "toolExecMs": 50},
+            {"turn": 1, "modelCallMs": 800, "toolExecMs": 30},
+        ]
+        self._run_stream_local([
+            {"type": "chunk", "text": "x"},
+            {"type": "final", "response": "x", "turnsUsed": 2, "forcedSummary": False, "timings": timings},
+        ], result_box=result_box)
+        self.assertEqual(result_box.get("timings"), timings)
+
+    def test_stream_local_omits_timings_when_absent(self):
+        """Without a `timings` field on the final event, result_box stays clean -- no crash, no key."""
+        result_box = {}
+        self._run_stream_local([
+            {"type": "chunk", "text": "x"},
+            {"type": "final", "response": "x", "turnsUsed": 1, "forcedSummary": False},
+        ], result_box=result_box)
+        self.assertNotIn("timings", result_box)
+
+    def test_stream_message_turn_persists_timings_on_transcript(self):
+        """_stream_message_turn stores result_box['timings'] on the transcript entry."""
+        import tempfile
+        timings = [
+            {"turn": 0, "modelCallMs": 1200, "toolExecMs": 50},
+            {"turn": 1, "modelCallMs": 800, "toolExecMs": 30},
+        ]
+
+        def fake_local(session, message, result_box=None):
+            # Simulate _stream_local: yield chunks, then populate result_box at end
+            if result_box is not None:
+                result_box["final_text"] = "hi"
+                result_box["tools"] = []
+                result_box["timings"] = timings
+            yield "h"
+            yield "i"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(chat_sessions, "_stream_local", fake_local):
+                out = list(chat_sessions._stream_message_turn(Path(tmp), _session(), "hi"))
+        self.assertEqual(out[-1]["session"]["transcript"][-1]["timings"], timings)
+
+    def test_full_path_timings_flow_through_stream_message(self):
+        """End-to-end: final event timings -> result_box -> transcript entry."""
+        import tempfile
+        timings = [
+            {"turn": 0, "modelCallMs": 1200, "toolExecMs": 50},
+            {"turn": 1, "modelCallMs": 800, "toolExecMs": 30},
+        ]
+
+        def fake_stream(**kwargs):
+            for ch in "hi":
+                yield {"type": "chunk", "text": ch}
+            yield {"type": "final", "response": "hi", "turnsUsed": 1, "forcedSummary": False, "timings": timings}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session_id = _session()["id"]
+            session = _session()
+            session["status"] = "active"
+            chat_sessions._write_sessions(Path(tmp), {session_id: session})
+            with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools", fake_stream):
+                list(chat_sessions.stream_message(Path(tmp), session_id, "hi"))
+            stored = chat_sessions.get_session(Path(tmp), session_id)
+        self.assertEqual(stored["transcript"][-1]["timings"], timings)
+
+    def test_full_path_no_timings_when_core_does_not_emit(self):
+        """When core never attaches `timings`, the transcript entry has no `timings` key."""
+        import tempfile
+
+        def fake_stream(**kwargs):
+            for ch in "hi":
+                yield {"type": "chunk", "text": ch}
+            yield {"type": "final", "response": "hi", "turnsUsed": 1, "forcedSummary": False}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session_id = _session()["id"]
+            session = _session()
+            session["status"] = "active"
+            chat_sessions._write_sessions(Path(tmp), {session_id: session})
+            with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools", fake_stream):
+                list(chat_sessions.stream_message(Path(tmp), session_id, "hi"))
+            stored = chat_sessions.get_session(Path(tmp), session_id)
+        self.assertNotIn("timings", stored["transcript"][-1])
+
+
+class ClipTimingsTest(unittest.TestCase):
+    """_clip_timings scrubs and bounds the per-turn timings array."""
+
+    def test_empty_input_returns_empty_list(self):
+        self.assertEqual(chat_sessions._clip_timings([]), [])
+        self.assertEqual(chat_sessions._clip_timings(None), [])
+
+    def test_clips_oversized_values(self):
+        result = chat_sessions._clip_timings([
+            {"turn": 0, "modelCallMs": 999_999_999, "toolExecMs": 50},
+        ])
+        self.assertEqual(result[0]["modelCallMs"], 600_000)
+        self.assertEqual(result[0]["toolExecMs"], 50)
+
+    def test_truncates_to_max_entries(self):
+        entries = [{"turn": i, "modelCallMs": 100} for i in range(250)]
+        result = chat_sessions._clip_timings(entries)
+        self.assertEqual(len(result), 200)
+        self.assertEqual(result[0]["turn"], 50)  # first kept = 250 - 200
+
+    def test_skips_non_dict_entries(self):
+        result = chat_sessions._clip_timings([{"turn": 0, "modelCallMs": 100}, "garbage", 42])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["turn"], 0)
+
+    def test_drops_entries_without_turn(self):
+        result = chat_sessions._clip_timings([{"modelCallMs": 100}])
+        self.assertEqual(result, [])
+
+    def test_keeps_forced_summary_ms_when_present(self):
+        result = chat_sessions._clip_timings([
+            {"turn": 0, "modelCallMs": 100, "forcedSummaryMs": 50},
+        ])
+        self.assertEqual(result[0]["forcedSummaryMs"], 50)
+
+    def test_negative_values_are_discarded(self):
+        result = chat_sessions._clip_timings([
+            {"turn": 0, "modelCallMs": -5, "toolExecMs": 30},
+        ])
+        self.assertNotIn("modelCallMs", result[0])
+        self.assertEqual(result[0]["toolExecMs"], 30)
+
+
 if __name__ == "__main__":
     unittest.main()
