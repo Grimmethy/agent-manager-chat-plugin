@@ -499,6 +499,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     toolbar.appendChild(layoutBox); // last: the Layout control closes the bar
 
     let strip = null; // the current .multi-chat-flex element, or null (dockview, or nothing drawn)
+    let dockGrid = null; // the live window.DockviewGrid, or null; disposed before every redraw so an old grid stops listening
+    function disposeDockGrid() {
+      if (!dockGrid) return;
+      try { if (typeof dockGrid.dispose === 'function') dockGrid.dispose(); } catch (e) { /* the host was already cleared */ }
+      dockGrid = null;
+    }
     let stripIndex = 0;
     let stripScrollTimer = null;
     const stripPanes = () => (strip ? Array.from(strip.children) : []);
@@ -675,6 +681,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       } catch (e) {
         return false;
       }
+      dockGrid = grid;
       const n = open.length;
       open.forEach((o, i) => {
         let position = { direction: 'first' };
@@ -724,6 +731,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function render() {
+      disposeDockGrid();
       host.innerHTML = ''; // unmounts every previous pane's DOM -- no network
       livePanes = [];
       renderTabs();
@@ -752,6 +760,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // One row of panes: Dockview when available, otherwise the flexbox strip.
       const mountedOpen = open.filter((o) => !o.placeholder);
       if (tryRenderDockview(mountedOpen) && mountedOpen.length === open.length) return;
+      disposeDockGrid();
       if (host.firstChild) host.removeChild(host.firstChild); // remove the abandoned dockview container
 
       // One ChatPane per pane (the spec for the fallback split): mount every open
