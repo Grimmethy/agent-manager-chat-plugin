@@ -1258,6 +1258,25 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
         # chat_audit not available (e.g., in tests); skip audit silently
         pass
     
+    # 2026-10-29 (HUB0032 redo): append deterministic verdict ledger if any
+    # record_branch_verdict calls were made this turn. The ledger is built from
+    # result_box["tools"] which comes from summarize_tool_calls (the real code
+    # path), so it reflects what was actually recorded, not what the model
+    # remembered. If the model's text states counts that disagree, prepend a
+    # "Correction:" line.
+    ledger_block = ""
+    if result_box.get("tools"):
+        ledger = tool_log.VerdictLedger()
+        ledger.build_from_tool_entries(result_box["tools"])
+        ledger_block = ledger.format()
+        if ledger_block:
+            correction = ledger.detect_disagreement(reply)
+            if correction:
+                ledger_block = f"{correction}\n\n{ledger_block}"
+    
+    if ledger_block:
+        reply = f"{reply}\n\n{ledger_block}"
+    
     # Store the full text (with footers) in the transcript for persistence
     session["transcript"][-1]["text"] = reply.strip()
     

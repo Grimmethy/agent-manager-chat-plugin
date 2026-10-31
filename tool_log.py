@@ -37,7 +37,14 @@ def _outcome(result):
 
 
 def summarize_tool_calls(tool_call_log) -> list:
-    """[{name, args, ok, summary}] for the first MAX_TOOLS entries of core's toolCallLog; anything that is not a list gives []."""
+    """[{name, args, ok, summary}] for the first MAX_TOOLS entries of core's toolCallLog; anything that is not a list gives [].
+
+    For `record_branch_verdict` calls, three extra scrubbed fields are preserved
+    BEFORE args are clipped: `branch`, `verdict`, and `project`. These come from
+    the call's `args` (branch, verdict, project) and `result` (project) so the
+    final-text audit can build a deterministic ledger even when the args payload
+    would normally exceed MAX_TEXT and get truncated.
+    """
     if not isinstance(tool_call_log, list):
         return []
     out = []
@@ -45,10 +52,123 @@ def summarize_tool_calls(tool_call_log) -> list:
         if not isinstance(call, dict):
             continue
         ok, summary = _outcome(call.get("result"))
-        out.append({"name": str(call.get("tool") or "tool")[:60], "args": _args_text(call.get("args")), "ok": ok, "summary": summary})
+        entry = {"name": str(call.get("tool") or "tool")[:60], "args": _args_text(call.get("args")), "ok": ok, "summary": summary}
+        # 2026-10-29 (HUB0032 redo): preserve verdict fields for record_branch_verdict
+        # calls BEFORE args are clipped, so the ledger has data even for long args.
+        if str(call.get("tool")) == "record_branch_verdict":
+            args = call.get("args") or {}
+            if isinstance(args, dict):
+                entry["branch"] = str(args.get("branch") or "")[:80]
+                entry["verdict"] = str(args.get("verdict") or "")[:40]
+                entry["project"] = str(args.get("project") or "")[:80]
+            # Fall back to result if project wasn't in args
+            result = call.get("result") or {}
+            if not entry.get("project") and isinstance(result, dict):
+                entry["project"] = str(result.get("project") or "")[:80]
+        out.append(entry)
         if len(out) >= MAX_TOOLS:
             break
     return out
+
+
+class VerdictLedger:
+    """Tracks the LAST recorded verdict per (project, branch) and how many times
+    each branch's verdict was changed during a turn.
+
+    The model in the walkthrough rewrote its own summary from memory; this ledger
+    is the single source of truth for what was actually recorded. The final-text
+    audit compares the model's stated counts against this ledger and prepends a
+    'Correction:' line when they disagree.
+    """
+
+    def __init__(self):
+        self._last_verdicts: dict[tuple[str, str], str] = {}
+        self._change_counts: dict[tuple[str, str], int] = {}
+
+    def record(self, project: str, branch: str, verdict: str) -> None:
+        """Record a verdict for (project, branch). Last call wins; change count increments on overwrite."""
+        key = (project, branch)
+        if key in self._last_verdicts:
+            self._change_counts[key] = self._change_counts.get(key, 0) + 1
+        self._last_verdicts[key] = verdict
+
+    def build_from_tool_entries(self, tool_entries: list) -> None:
+        """Populate from summarize_tool_calls output (the real code path)."""
+        for entry in tool_entries:
+            if entry.get("name") == "record_branch_verdict":
+                project = entry.get("project") or ""
+                branch = entry.get("branch") or ""
+                verdict = entry.get("verdict") or ""
+                if project and branch and verdict:
+                    self.record(project, branch, verdict)
+
+    def format(self) -> str:
+        """Return the deterministic ledger block, or empty string if no verdicts."""
+        if not self._last_verdicts:
+            return ""
+        counts = {"merge": 0, "needs-work": 0, "discard": 0}
+        for v in self._last_verdicts.values():
+            if v in counts:
+                counts[v] += 1
+        lines = ["Verdict Ledger:", f"  merge: {counts['merge']}", f"  needs-work: {counts['needs-work']}", f"  discard: {counts['discard']}"]
+        for (project, branch) in sorted(self._last_verdicts.keys()):
+            v = self._last_verdicts[(project, branch)]
+            n = self._change_counts.get((project, branch), 0)
+            if n:
+                lines.append(f"  {project}/{branch}: {v} (changed {n} time{'s' if n != 1 else ''})")
+            else:
+                lines.append(f"  {project}/{branch}: {v}")
+        return "\n".join(lines)
+
+    def detect_disagreement(self, model_text: str) -> str | None:
+        """Check if model text states counts that disagree with the ledger.
+
+        Returns a 'Correction: ...' string if counts differ, else None.
+        Only checks 'merge' and 'needs-work' counts since discard is implicit.
+        Matches patterns like:
+        - "2 branches approved for merge"
+        - "3 branches merge"
+        - "1 needs-work"
+        - "0 discard"
+        
+        Only flags disagreement if the model text actually states counts
+        (i.e., has at least one match). If the model text has no count patterns,
+        we assume the model is summarizing without stating explicit counts, so
+        no correction is needed.
+        """
+        model_counts = {"merge": 0, "needs-work": 0, "discard": 0}
+        found_any = False
+        
+        # Pattern 1: "N branches (approved for) merge/needs-work/discard"
+        pattern1 = r"(\d+)\s+branches?\s+(?:approved\s+for\s+)?(merge|needs-work|discard)"
+        for match in re.finditer(pattern1, model_text, re.IGNORECASE):
+            found_any = True
+            n = int(match.group(1))
+            verdict = match.group(2).lower()
+            if verdict in model_counts:
+                model_counts[verdict] = n
+        
+        # Pattern 2: "N needs-work" or "N discard" (without "branches" prefix)
+        pattern2 = r"(\d+)\s+(needs-work|discard)"
+        for match in re.finditer(pattern2, model_text, re.IGNORECASE):
+            found_any = True
+            n = int(match.group(1))
+            verdict = match.group(2).lower()
+            if verdict in model_counts:
+                model_counts[verdict] = n
+
+        # If model text has no count patterns, no disagreement to flag
+        if not found_any:
+            return None
+
+        actual = {"merge": 0, "needs-work": 0, "discard": 0}
+        for v in self._last_verdicts.values():
+            if v in actual:
+                actual[v] += 1
+
+        if model_counts["merge"] != actual["merge"] or model_counts["needs-work"] != actual["needs-work"]:
+            return f"Correction: the cards show {actual['merge']} merge, {actual['needs-work']} needs-work, {actual['discard']} discard"
+        return None
 
 
 OUTPUT_MAX = 4000

@@ -683,5 +683,132 @@ class ChatRecordCallTest(unittest.TestCase):
         self.assertEqual(patched_run2.call_args[0][1]["taskId"], "chat-MUTATED")
 
 
+class VerdictLedgerStreamMessageIntegrationTest(unittest.TestCase):
+    """Integration: real streamed turn through stream_message with a fake _stream_local
+    and result_box['tools'] produced by summarize_tool_calls from a realistic core
+    toolCallLog. This exercises the real code path, not hand-built fixtures."""
+
+    def setUp(self):
+        self._stats_patch = mock.patch.object(chat_sessions.model_stats_client, "record_call")
+        self._stats_patch.start()
+        self.addCleanup(self._stats_patch.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.storage_dir = Path(self.tmp.name)
+
+    def _seed_active_session(self):
+        session = _session()
+        session["provider"] = "local"
+        session["status"] = "active"
+        chat_sessions._write_sessions(self.storage_dir, {session["id"]: session})
+        return session["id"]
+
+    def test_turn_with_verdicts_includes_ledger(self):
+        """A turn with record_branch_verdict calls gets a ledger block appended."""
+        session_id = self._seed_active_session()
+        # Realistic toolCallLog with a record_branch_verdict call whose args are
+        # longer than 200 characters (so clipping would normally lose the data).
+        long_branch = "x" * 250
+        tool_call_log = [
+            {"tool": "record_branch_verdict", "args": {"branch": long_branch, "project": "testproj", "verdict": "merge"}, "result": {"project": "testproj"}},
+            {"tool": "run_bash", "args": {"command": "git show abc123 --stat"}, "result": {"error": "not found"}},
+        ]
+        
+        def fake_stream(**kwargs):
+            # Simulate streaming: yield chunks, then final with toolCallLog
+            yield {"type": "chunk", "text": "I checked the branches. "}
+            yield {"type": "chunk", "text": "Found 1 merge."}
+            yield {"type": "final", "response": "I checked the branches. Found 1 merge.", "turnsUsed": 2, "forcedSummary": False, "toolCallLog": tool_call_log}
+
+        with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools", fake_stream):
+            list(chat_sessions.stream_message(self.storage_dir, session_id, "check branches"))
+
+        stored = chat_sessions._read_sessions(self.storage_dir)[session_id]
+        final_text = stored["transcript"][-1]["text"]
+        self.assertIn("Verdict Ledger:", final_text)
+        self.assertIn("merge: 1", final_text)
+        self.assertIn("testproj/", final_text)
+
+    def test_turn_with_disagreement_includes_correction(self):
+        """Model text that claims wrong counts gets a Correction: line."""
+        session_id = self._seed_active_session()
+        tool_call_log = [
+            {"tool": "record_branch_verdict", "args": {"branch": "b1", "project": "p1", "verdict": "merge"}, "result": {"project": "p1"}},
+            {"tool": "record_branch_verdict", "args": {"branch": "b2", "project": "p1", "verdict": "needs-work"}, "result": {"project": "p1"}},
+        ]
+
+        def fake_stream(**kwargs):
+            # Model lies: says 2 merge, 0 needs-work (actual is 1/1)
+            yield {"type": "chunk", "text": "I found 2 branches approved for merge and 0 needs-work."}
+            yield {"type": "final", "response": "I found 2 branches approved for merge and 0 needs-work.", "turnsUsed": 1, "forcedSummary": False, "toolCallLog": tool_call_log}
+
+        with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools", fake_stream):
+            list(chat_sessions.stream_message(self.storage_dir, session_id, "check"))
+
+        stored = chat_sessions._read_sessions(self.storage_dir)[session_id]
+        final_text = stored["transcript"][-1]["text"]
+        self.assertIn("Correction: the cards show", final_text)
+        self.assertIn("merge: 1", final_text)
+        self.assertIn("needs-work: 1", final_text)
+
+    def test_turn_with_no_verdict_calls_gets_no_ledger(self):
+        """A turn with no record_branch_verdict calls gets no ledger block."""
+        session_id = self._seed_active_session()
+        tool_call_log = [
+            {"tool": "run_bash", "args": {"command": "ls"}, "result": "file1"},
+        ]
+
+        def fake_stream(**kwargs):
+            yield {"type": "chunk", "text": "Done."}
+            yield {"type": "final", "response": "Done.", "turnsUsed": 1, "forcedSummary": False, "toolCallLog": tool_call_log}
+
+        with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools", fake_stream):
+            list(chat_sessions.stream_message(self.storage_dir, session_id, "hi"))
+
+        stored = chat_sessions._read_sessions(self.storage_dir)[session_id]
+        final_text = stored["transcript"][-1]["text"]
+        self.assertNotIn("Verdict Ledger:", final_text)
+        self.assertNotIn("Correction:", final_text)
+
+    def test_failed_verdict_call_with_ok_false(self):
+        """A record_branch_verdict call with ok=false (failed) still records if args present."""
+        session_id = self._seed_active_session()
+        tool_call_log = [
+            {"tool": "record_branch_verdict", "args": {"branch": "b1", "project": "p1", "verdict": "merge"}, "result": {"error": "network timeout"}},
+        ]
+
+        def fake_stream(**kwargs):
+            yield {"type": "chunk", "text": "Done."}
+            yield {"type": "final", "response": "Done.", "turnsUsed": 1, "forcedSummary": False, "toolCallLog": tool_call_log}
+
+        with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools", fake_stream):
+            list(chat_sessions.stream_message(self.storage_dir, session_id, "hi"))
+
+        stored = chat_sessions._read_sessions(self.storage_dir)[session_id]
+        final_text = stored["transcript"][-1]["text"]
+        # The ledger should still be built from args even if the call failed
+        self.assertIn("Verdict Ledger:", final_text)
+        self.assertIn("merge: 1", final_text)
+
+    def test_verdict_call_with_no_project_uses_result(self):
+        """If project not in args, fall back to result.project."""
+        session_id = self._seed_active_session()
+        tool_call_log = [
+            {"tool": "record_branch_verdict", "args": {"branch": "b1", "verdict": "discard"}, "result": {"project": "fallback-proj"}},
+        ]
+
+        def fake_stream(**kwargs):
+            yield {"type": "chunk", "text": "Done."}
+            yield {"type": "final", "response": "Done.", "turnsUsed": 1, "forcedSummary": False, "toolCallLog": tool_call_log}
+
+        with mock.patch.object(chat_sessions.local_tool_client, "stream_plan_with_tools", fake_stream):
+            list(chat_sessions.stream_message(self.storage_dir, session_id, "hi"))
+
+        stored = chat_sessions._read_sessions(self.storage_dir)[session_id]
+        final_text = stored["transcript"][-1]["text"]
+        self.assertIn("Verdict Ledger:", final_text)
+        self.assertIn("fallback-proj", final_text)
+
+
 if __name__ == "__main__":
     unittest.main()

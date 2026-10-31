@@ -48,6 +48,89 @@ class SummarizeToolCallsTest(unittest.TestCase):
         self.assertEqual(len(tool_log.summarize_tool_calls([None, 3, {"tool": "t"}])), 1)
 
 
+class VerdictLedgerTest(unittest.TestCase):
+    """VerdictLedger: last-verdict-wins, format, and disagreement detection."""
+
+    def test_format_empty_when_no_verdicts(self):
+        ledger = tool_log.VerdictLedger()
+        self.assertEqual(ledger.format(), "")
+
+    def test_format_counts_and_per_branch(self):
+        ledger = tool_log.VerdictLedger()
+        ledger.record("proj1", "branch-a", "merge")
+        ledger.record("proj2", "branch-b", "needs-work")
+        ledger.record("proj1", "branch-c", "discard")
+        ledger.record("proj2", "branch-d", "merge")
+        out = ledger.format()
+        self.assertIn("Verdict Ledger:", out)
+        self.assertIn("merge: 2", out)
+        self.assertIn("needs-work: 1", out)
+        self.assertIn("discard: 1", out)
+        self.assertIn("proj1/branch-a: merge", out)
+        self.assertIn("proj2/branch-b: needs-work", out)
+        self.assertIn("proj1/branch-c: discard", out)
+        self.assertIn("proj2/branch-d: merge", out)
+
+    def test_last_verdict_wins(self):
+        """Mutation check: record same branch twice, only last counts."""
+        ledger = tool_log.VerdictLedger()
+        ledger.record("proj", "branch", "merge")
+        ledger.record("proj", "branch", "needs-work")
+        out = ledger.format()
+        self.assertIn("merge: 0", out)
+        self.assertIn("needs-work: 1", out)
+        self.assertIn("proj/branch: needs-work", out)
+        self.assertIn("changed 1 time", out)
+
+    def test_detect_disagreement_match_returns_none(self):
+        ledger = tool_log.VerdictLedger()
+        ledger.record("p", "b1", "merge")
+        ledger.record("p", "b2", "merge")
+        ledger.record("p", "b3", "needs-work")
+        self.assertIsNone(ledger.detect_disagreement("I found 2 branches approved for merge and 1 needs-work"))
+
+    def test_detect_disagreement_mismatch_returns_correction(self):
+        ledger = tool_log.VerdictLedger()
+        ledger.record("p", "b1", "merge")
+        ledger.record("p", "b2", "needs-work")
+        result = ledger.detect_disagreement("I found 3 branches approved for merge and 0 needs-work")
+        self.assertIsNotNone(result)
+        self.assertTrue(result.startswith("Correction: the cards show"))
+        self.assertIn("1 merge", result)
+        self.assertIn("1 needs-work", result)
+
+    def test_detect_disagreement_no_counts_in_model_text_returns_none(self):
+        ledger = tool_log.VerdictLedger()
+        ledger.record("p", "b1", "merge")
+        # Model text has no count pattern -> no disagreement detected
+        self.assertIsNone(ledger.detect_disagreement("All branches look good for merge"))
+
+
+class VerdictLedgerIntegrationTest(unittest.TestCase):
+    """End-to-end: summarize_tool_calls preserves verdict fields, ledger builds from them."""
+
+    def test_summarize_preserves_verdict_fields_before_clip(self):
+        """Long args get clipped, but branch/project/verdict are extracted BEFORE clipping."""
+        long_args = {"branch": "x" * 200, "project": "y" * 200, "verdict": "merge"}
+        entries = tool_log.summarize_tool_calls([
+            {"tool": "record_branch_verdict", "args": long_args, "result": {"project": "y"}}
+        ])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["branch"], "x" * 80)  # scrubbed but not clipped to 200
+        self.assertEqual(entries[0]["verdict"], "merge")
+        self.assertEqual(entries[0]["project"], "y" * 80)
+
+    def test_build_from_tool_entries_populates_ledger(self):
+        entries = [
+            {"name": "record_branch_verdict", "branch": "b1", "project": "p1", "verdict": "merge"},
+            {"name": "record_branch_verdict", "branch": "b2", "project": "p1", "verdict": "needs-work"},
+            {"name": "run_bash", "args": "ls"},  # ignored
+        ]
+        ledger = tool_log.VerdictLedger()
+        ledger.build_from_tool_entries(entries)
+        self.assertEqual(ledger.format(), "Verdict Ledger:\n  merge: 1\n  needs-work: 1\n  discard: 0\n  p1/b1: merge\n  p1/b2: needs-work")
+
+
 class StoredOnTheTranscriptTest(unittest.TestCase):
     def setUp(self):
         self._stats_patch = mock.patch.object(chat_sessions.model_stats_client, "record_call")
