@@ -1252,7 +1252,7 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
         transcript = session["transcript"]
         user_message_count = sum(1 for t in transcript if t.get("role") == "user")
         has_user_after_first = user_message_count > 1
-        audit_result = chat_audit.audit_turn(reply, has_user_message_after_first=has_user_after_first)
+        audit_result = chat_audit.audit_turn(reply, has_user_message_after_first=has_user_after_first, user_message=message, tools=result_box.get("tools"))
         session["transcript"][-1]["audit"] = audit_result
     except ImportError:
         # chat_audit not available (e.g., in tests); skip audit silently
