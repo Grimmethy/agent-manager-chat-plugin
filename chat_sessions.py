@@ -1001,6 +1001,27 @@ def _strip_footer(text: str) -> str:
     return text_without
 
 
+def _visible_text(final_text: str) -> str:
+    """Remove the footer block (TASK-REF, CONTEXT-LOG, and any other lines
+    enforce_footer adds) and surrounding whitespace from final_text.
+    
+    Returns the remaining text. If empty (or only whitespace), the turn has
+    no visible reply -- the model produced only a footer or nothing at all.
+    """
+    if not final_text:
+        return ""
+    import re
+    # Check if the text is itself a footer (e.g., "TASK-REF: N/A" without leading newline)
+    stripped = final_text.strip()
+    if re.match(r'^TASK-REF:\s*\S+', stripped):
+        return ""
+    if re.match(r'^CONTEXT-LOG:\s*\S+', stripped):
+        return ""
+    # Try to extract footer (handles leading-newline cases)
+    text_without_footer, _ = _extract_footer(final_text)
+    return text_without_footer.strip()
+
+
 def enforce_footer(answer: str) -> str:
     """Ensure the answer has a proper footer (TASK-REF or CONTEXT-LOG).
 
@@ -1235,6 +1256,36 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     # before ever setting it.
     final_text = result_box.get("final_text")
     reply = (final_text if final_text is not None else "".join(reply_parts)).strip()
+    
+    # 2026-10-30 (HUB0033): if the visible text is empty (model produced only a footer
+    # or nothing at all), retry once with a nudge for local provider. Claude turns are
+    # unchanged.
+    if session["provider"] == PROVIDER_LOCAL:
+        visible = _visible_text(reply)
+        if not visible:
+            tool_count = len(result_box.get("tools", []))
+            if tool_count > 0:
+                # ONE retry with nudge appended
+                nudge = "\n\nYou ran tools but gave no answer. Answer now in plain words from the tool results above, and quote any tool message you were asked to quote."
+                retry_message = message + nudge
+                retry_result_box = {}
+                for item in _stream_local(session, retry_message, retry_result_box):
+                    if isinstance(item, dict):
+                        yield item
+                    else:
+                        reply_parts.append(item)
+                retry_final_text = retry_result_box.get("final_text")
+                if retry_final_text:
+                    retry_visible = _visible_text(retry_final_text)
+                    if retry_visible:
+                        reply = retry_final_text
+                        visible = retry_visible
+            
+            # If still empty after retry (or no tools ran), store as error
+            if not _visible_text(reply):
+                error_text = f"the model produced no reply text (it ran {tool_count} tool(s)); the tool results are listed above."
+                record_turn_error(storage_dir, session["id"], error_text)
+                return
     # SAVE-TEMPLATE blocks become Save-button proposals (template_store.py); never auto-saved.
     reply, proposals = template_store.extract_proposals(reply)
     
