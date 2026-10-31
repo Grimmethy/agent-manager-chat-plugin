@@ -28,6 +28,14 @@ def _args_text(args) -> str:
     return _clip(_scrub(text))
 
 
+_BACKGROUND_CMD = re.compile(r"(?:\bnohup\b|(?<!&)&\s*$)")
+
+
+def is_background_command(command) -> bool:
+    """True for a shell command that starts a background process: it contains nohup or ends with a single & (not &&)."""
+    return isinstance(command, str) and bool(_BACKGROUND_CMD.search(command.strip()))
+
+
 def _outcome(result):
     """(ok, one-line outcome) for a tool result; only an error's text is kept."""
     if isinstance(result, dict) and (result.get("error") or result.get("ok") is False):
@@ -45,7 +53,12 @@ def summarize_tool_calls(tool_call_log) -> list:
         if not isinstance(call, dict):
             continue
         ok, summary = _outcome(call.get("result"))
-        out.append({"name": str(call.get("tool") or "tool")[:60], "args": _args_text(call.get("args")), "ok": ok, "summary": summary})
+        entry = {"name": str(call.get("tool") or "tool")[:60], "args": _args_text(call.get("args")), "ok": ok, "summary": summary}
+        args = call.get("args")
+        # Decided here on the unclipped command: the stored args text is cut at MAX_TEXT, which can hide a trailing &. Only set when true.
+        if entry["name"] == "run_bash" and isinstance(args, dict) and is_background_command(args.get("command")):
+            entry["background"] = True
+        out.append(entry)
         if len(out) >= MAX_TOOLS:
             break
     return out
