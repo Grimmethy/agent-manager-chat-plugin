@@ -1025,6 +1025,26 @@ def enforce_footer(answer: str) -> str:
     return answer + "\n\nTASK-REF: N/A"
 
 
+# Monotonic clock for turn timings; a module attribute so tests can script it.
+_clock = time.monotonic
+
+
+def _turn_timings(started: float, ended: float, first_chunk_at, tool_spans: list) -> dict:
+    """The stored shape of a turn's timings, all whole milliseconds, measured by this plugin from the events it receives (no core support needed):
+    totalMs (wall time of the whole local turn), firstChunkMs (to the first text chunk, None when there was none), toolMs ([{name, ms}] per finished tool
+    call, start to end), toolTotalMs (their sum) and modelMs (total minus tool time, i.e. what is left for model thinking and streaming).
+    The numbers include the time this process spends handling each event before asking for the next, which is small next to a model call."""
+    total = max(0, int(round((ended - started) * 1000)))
+    tool_total = sum(t["ms"] for t in tool_spans)
+    return {
+        "totalMs": total,
+        "firstChunkMs": None if first_chunk_at is None else max(0, int(round((first_chunk_at - started) * 1000))),
+        "toolMs": tool_spans,
+        "toolTotalMs": tool_total,
+        "modelMs": max(0, total - tool_total),
+    }
+
+
 def _stream_local(session: dict, message: str, result_box: dict = None):
     """Yields plain text chunks as the local model generates them (Open WebUI-style live
     streaming, see this module's own recent header note) -- the caller accumulates them
@@ -1047,6 +1067,10 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
     the turn is intentionally unaffected (still raw, unavoidably, for genuine
     token-by-token streaming) -- this only fixes what ends up permanently stored."""
     started = time.time()
+    turn_start = _clock()
+    first_chunk_at = None
+    open_tools = []  # (name, started_at) of tool calls that have started and not ended
+    tool_spans = []
     messages = _build_local_messages(session, message)
     roots = session.get("roots") or [session["repoRoot"]]
     result = None
@@ -1057,17 +1081,25 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
         allow_amplification=True, context_log_session_id=session["id"],
     ):
         if event.get("type") == "chunk":
+            if first_chunk_at is None:
+                first_chunk_at = _clock()
             raw_chunks.append(event["text"])
             yield event["text"]
         elif event.get("type") == "tool_start":
             # Extract tool name and summarize args (first 120 chars)
             tool_name = event.get("name", "unknown")
+            open_tools.append((tool_name, _clock()))
             args = event.get("args", "")
             summary = args[:120] if args else ""
             yield {"type": "tool_start", "name": tool_name, "summary": summary}
         elif event.get("type") == "tool_end":
             # Extract tool name, success status, and summarize result (first 120 chars)
             tool_name = event.get("name", "unknown")
+            for i, (open_name, open_at) in enumerate(open_tools):  # the earliest still-open call of that name
+                if open_name == tool_name:
+                    tool_spans.append({"name": str(tool_name)[:60], "ms": max(0, int(round((_clock() - open_at) * 1000)))})
+                    del open_tools[i]
+                    break
             ok = event.get("ok", False)
             result_text = event.get("result", "")
             summary = result_text[:120] if result_text else ""
@@ -1130,6 +1162,7 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
     if result_box is not None:
         result_box["final_text"] = final_text
         result_box["tools"] = tool_log.summarize_tool_calls((result or {}).get("toolCallLog"))
+        result_box["timings"] = _turn_timings(turn_start, _clock(), first_chunk_at, tool_spans)
         result_box["proposals"] = (result or {}).get("commandProposals") or []
 
 
@@ -1267,6 +1300,8 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     
     if result_box.get("tools"):
         session["transcript"][-1]["tools"] = result_box["tools"]
+    if result_box.get("timings"):
+        session["transcript"][-1]["timings"] = result_box["timings"]
     if result_box.get("proposals"):
         command_runs.record_proposals(session["transcript"][-1], result_box["proposals"])
     if proposals:
