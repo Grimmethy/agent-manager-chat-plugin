@@ -944,14 +944,14 @@ def _extract_footer(text: str) -> tuple:
     import re
     
     # Look for TASK-REF: pattern
-    task_ref_match = re.search(r'\n\s*TASK-REF:\s*(\S+)', text)
+    task_ref_match = re.search(r'(?:^|\n)\s*TASK-REF:\s*(\S+)', text)
     if task_ref_match:
         footer_text = task_ref_match.group(0).strip()
         text_without = text[:task_ref_match.start()].rstrip()
         return text_without, footer_text
     
     # Look for CONTEXT-LOG: pattern
-    context_log_match = re.search(r'\n\s*CONTEXT-LOG:\s*\S+', text)
+    context_log_match = re.search(r'(?:^|\n)\s*CONTEXT-LOG:\s*\S+', text)
     if context_log_match:
         footer_text = context_log_match.group(0).strip()
         text_without = text[:context_log_match.start()].rstrip()
@@ -999,6 +999,33 @@ def _strip_footer(text: str) -> str:
     """Strip footer from text, returning text without footer."""
     text_without, _ = _extract_footer(text)
     return text_without
+
+
+_MARKER_LINE_RE = re.compile(r'^[ \t]*(?:TASK-REF|CONTEXT-LOG):.*$', re.M)
+_PROTOCOL_CUT_RE = re.compile(r'(?:CONTEXT-LOG|TASK-REF|SIDE-FINDING|AMPLIFY|CONCEPT-BUILD):')
+_MIN_RECOVERED_CHARS = 20
+EMPTY_REPLY_NOTICE = (
+    "*(The model ended this turn without writing an answer. Ask again, or narrow the "
+    "question.)*"
+)
+
+
+def _visible_text(text: str) -> str:
+    """The reader-visible part of a reply: `text` with every TASK-REF:/CONTEXT-LOG:
+    line removed, stripped. A reply whose _visible_text is empty is a footer-only (or
+    empty) reply -- it must never be stored as a normal answer."""
+    if not text:
+        return ""
+    return _MARKER_LINE_RE.sub("", text).strip()
+
+
+def _recover_from_stream(raw: str) -> str:
+    """The answer text out of raw streamed chunks: everything before the first protocol
+    marker (the markers always trail the answer), stripped. May be empty."""
+    if not raw:
+        return ""
+    m = _PROTOCOL_CUT_RE.search(raw)
+    return (raw[:m.start()] if m else raw).strip()
 
 
 def enforce_footer(answer: str) -> str:
@@ -1075,6 +1102,7 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
     roots = session.get("roots") or [session["repoRoot"]]
     result = None
     raw_chunks = []
+    since_tool = []  # chunks streamed after the most recent tool event (the closing answer)
     for event in local_tool_client.stream_plan_with_tools(
         messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
         primary_root=roots[0], extra_roots=roots[1:], force_summary_on_cap=True,
@@ -1084,10 +1112,12 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
             if first_chunk_at is None:
                 first_chunk_at = _clock()
             raw_chunks.append(event["text"])
+            since_tool.append(event["text"])
             yield event["text"]
         elif event.get("type") == "tool_start":
             # Extract tool name and summarize args (first 120 chars)
             tool_name = event.get("name", "unknown")
+            since_tool.clear()
             open_tools.append((tool_name, _clock()))
             args = event.get("args", "")
             summary = args[:120] if args else ""
@@ -1100,6 +1130,7 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
                     tool_spans.append({"name": str(tool_name)[:60], "ms": max(0, int(round((_clock() - open_at) * 1000)))})
                     del open_tools[i]
                     break
+            since_tool.clear()
             ok = event.get("ok", False)
             result_text = event.get("result", "")
             summary = result_text[:120] if result_text else ""
@@ -1112,6 +1143,24 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
     final_text = (result or {}).get("response")
     if final_text is None:
         final_text = "".join(raw_chunks)
+    # Footer-only / empty authoritative reply: the model streamed its answer but its LAST
+    # message was only the TASK-REF/CONTEXT-LOG footer, so the marker-stripped final text
+    # is just the footer (seen live 2026-11-01: 102 streamed chunks, stored reply
+    # 'TASK-REF: HUB0293'). Deterministic recovery, no second model call (so no write
+    # tool can re-run): prefer the text streamed since the last tool event, else all
+    # streamed text, each cut at its first protocol marker; if still nothing, store an
+    # explicit notice instead of a bare footer. The turn is flagged either way.
+    recovered = None
+    if not _visible_text(final_text):
+        kept_footer = "\n\n".join(m.group(0).strip() for m in _MARKER_LINE_RE.finditer(final_text or ""))
+        body = (_recover_from_stream("".join(since_tool))
+                if len(_recover_from_stream("".join(since_tool))) >= _MIN_RECOVERED_CHARS
+                else _recover_from_stream("".join(raw_chunks)))
+        if len(body) >= _MIN_RECOVERED_CHARS:
+            recovered = "stream"
+        else:
+            body, recovered = EMPTY_REPLY_NOTICE, "empty"
+        final_text = body + ("\n\n" + kept_footer if kept_footer else "")
     # 2026-09-05, Grimmethy: force_summary_on_cap=True is now passed above, so a
     # turn-cap hit, a context-budget hit, AND a voluntary early stop with no RESOLUTION:
     # line (see local-tool-client.js's own RESERVED_RESPONSE_TOKENS/
@@ -1161,6 +1210,7 @@ def _stream_local(session: dict, message: str, result_box: dict = None):
         final_text = enforce_footer(final_text)
     if result_box is not None:
         result_box["final_text"] = final_text
+        result_box["recovered"] = recovered
         result_box["tools"] = tool_log.summarize_tool_calls((result or {}).get("toolCallLog"))
         result_box["timings"] = _turn_timings(turn_start, _clock(), first_chunk_at, tool_spans)
         result_box["proposals"] = (result or {}).get("commandProposals") or []
@@ -1298,6 +1348,10 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     display_text = _strip_footer(reply)
     session["transcript"][-1]["display_text"] = display_text.strip()
     
+    if result_box.get("recovered"):
+        # 'stream' = answer recovered from the streamed text; 'empty' = nothing to recover
+        # (the reply is an explicit notice). Never a normal reply: the manager/UI can see it.
+        session["transcript"][-1]["recovered_reply"] = result_box["recovered"]
     if result_box.get("tools"):
         session["transcript"][-1]["tools"] = result_box["tools"]
     if result_box.get("timings"):
