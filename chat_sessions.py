@@ -1291,6 +1291,71 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
         # chat_audit not available (e.g., in tests); skip audit silently
         pass
     
+    # 2026-10-30 (HUB0032 redo): deterministic verdict ledger. The model's
+    # own summary of its recorded verdicts often contradicts the cards
+    # (wrong counts, branches listed under two headings, etc.) because it
+    # writes the summary from memory of a long turn. Instead of trusting the
+    # model, we rebuild the ledger from the tool entries that *actually*
+    # recorded each verdict, and append a deterministic block to the reply
+    # that the model cannot dispute. If the model's text states counts that
+    # disagree with the ledger, the block opens with "Correction: the cards
+    # show ..." so the user sees the discrepancy immediately.
+    _VERDICT_HEADING_RE = re.compile(
+        r"\b(\d+)\s+branches?\s+(approved\s+for\s+merge|merge|needs\s*[- ]?work|discard)\b",
+        re.IGNORECASE,
+    )
+    _VERDICT_LEDGER_RE = re.compile(
+        r"\b(\d+)\s+(?:merge|needs\s*[- ]?work|discard)\b",
+        re.IGNORECASE,
+    )
+    verdict_block = None
+    try:
+        import chat_audit as _ca
+        ledger = _ca.build_verdict_ledger(result_box.get("tools"))
+        if ledger["total"] > 0:
+            counts = ledger["counts"]
+            lines = []
+            lines.append("Verdict ledger (one per branch, last recorded value):")
+            for project, branch, verdict, changes in ledger["branches"]:
+                changed_note = "" if changes == 0 else f" (changed {changes} time{'s' if changes > 1 else ''} during this turn)"
+                lines.append(f"- {project}/{branch}: {verdict}{changed_note}")
+            block_text = "\n".join(lines)
+            # Check if the model's own text states counts that disagree.
+            model_counts = {}
+            for m in _VERDICT_HEADING_RE.finditer(reply):
+                n = int(m.group(1))
+                phrase = m.group(2).lower()
+                if "merge" in phrase:
+                    model_counts["merge"] = n
+                elif "needs" in phrase or "work" in phrase:
+                    model_counts["needs-work"] = n
+                elif "discard" in phrase:
+                    model_counts["discard"] = n
+            ledger_merge = counts.get("merge", 0)
+            ledger_nw = counts.get("needs-work", 0)
+            ledger_discard = counts.get("discard", 0)
+            disagree = (
+                model_counts.get("merge", 0) != ledger_merge or
+                model_counts.get("needs-work", 0) != ledger_nw or
+                model_counts.get("discard", 0) != ledger_discard
+            )
+            if disagree:
+                correction = (
+                    f"Correction: the cards show {ledger_merge} merge, "
+                    f"{ledger_nw} needs-work, {ledger_discard} discard "
+                    f"(your summary said {model_counts.get('merge', '?')} merge, "
+                    f"{model_counts.get('needs-work', '?')} needs-work, "
+                    f"{model_counts.get('discard', '?')} discard -- "
+                    f"the ledger is built from the actual record_branch_verdict "
+                    f"results, not from memory)."
+                )
+                block_text = correction + "\n\n" + block_text
+            verdict_block = block_text
+    except ImportError:
+        pass
+    if verdict_block:
+        reply = reply + "\n\n" + verdict_block
+    
     # Store the full text (with footers) in the transcript for persistence
     session["transcript"][-1]["text"] = reply.strip()
     

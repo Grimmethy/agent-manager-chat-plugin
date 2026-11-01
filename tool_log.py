@@ -45,7 +45,16 @@ def _outcome(result):
 
 
 def summarize_tool_calls(tool_call_log) -> list:
-    """[{name, args, ok, summary}] for the first MAX_TOOLS entries of core's toolCallLog; anything that is not a list gives []."""
+    """[{name, args, ok, summary}] for the first MAX_TOOLS entries of core's toolCallLog; anything that is not a list gives [].
+
+    For ``record_branch_verdict`` calls the entry also carries three extra
+    scrubbed fields -- ``branch``, ``verdict``, ``project`` -- taken from the
+    raw core toolCallLog entry BEFORE args are clipped. These let the post-
+    turn audit (chat_audit.build_verdict_ledger) rebuild the per-branch
+    verdict state without re-parsing the full argument blob, and without
+    losing fields that were truncated by MAX_TEXT. The fields are scrubbed
+    with the same secret rules as the args text itself.
+    """
     if not isinstance(tool_call_log, list):
         return []
     out = []
@@ -58,6 +67,30 @@ def summarize_tool_calls(tool_call_log) -> list:
         # Decided here on the unclipped command: the stored args text is cut at MAX_TEXT, which can hide a trailing &. Only set when true.
         if entry["name"] == "run_bash" and isinstance(args, dict) and is_background_command(args.get("command")):
             entry["background"] = True
+        # 2026-10-30: for record_branch_verdict, keep three extra fields from
+        # the raw call (before args clipping) so the post-turn audit can
+        # rebuild the verdict ledger without re-parsing the clipped blob.
+        if entry["name"] == "record_branch_verdict" and isinstance(args, dict):
+            branch = args.get("branch")
+            if isinstance(branch, str) and branch:
+                entry["branch"] = _scrub(str(branch))[:MAX_TEXT]
+            verdict = args.get("verdict")
+            if isinstance(verdict, str) and verdict:
+                entry["verdict"] = _scrub(str(verdict))[:MAX_TEXT]
+            # project may come from args or from the result; take whichever is
+            # present and non-empty. Scrubbed with the same rules as args.
+            project = args.get("project")
+            if project is None:
+                result = call.get("result")
+                if isinstance(result, dict):
+                    project = result.get("project")
+            if isinstance(project, str) and project:
+                entry["project"] = _scrub(str(project))[:MAX_TEXT]
+            else:
+                # Derive project from the first path segment of the branch
+                # name (e.g. "tokenfold/agent/foo" -> "tokenfold").
+                if isinstance(branch, str) and "/" in branch:
+                    entry["project"] = branch.split("/", 1)[0]
         out.append(entry)
         if len(out) >= MAX_TOOLS:
             break
