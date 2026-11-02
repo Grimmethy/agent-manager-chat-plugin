@@ -708,14 +708,15 @@ class ChatPane {
 
   renderProjectRow() {
     // Alphabetical, case-insensitive, so the selector is easy to scan (the server sorts too).
-    const opts = [...(this.projectOptions || [])].sort((a, b) =>
-      String(a.label).localeCompare(String(b.label), undefined, { sensitivity: 'base' }));
+    const cmp = (x, y) => String(x).localeCompare(String(y), undefined, { sensitivity: 'base' });
+    const tagOf = (o) => o.tag || 'Other';
+    const opts = [...(this.projectOptions || [])].sort((a, b) => cmp(tagOf(a), tagOf(b)) || cmp(a.label, b.label));
     if (!opts.length) { this.projectRow.hidden = true; return; }
     this.projectRow.hidden = false;
     const chosen = this.session && this.session.chosen_project;
     const current = chosen || this.projectActiveLabel || opts[0].label;
     this.projectSelect.innerHTML = opts.map(o =>
-      `<option value="${escapeHtml(o.label)}"${o.label === current ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+      `<option value="${escapeHtml(o.label)}"${o.label === current ? ' selected' : ''}>${escapeHtml(tagOf(o) + ' \u00b7 ' + o.label)}</option>`
     ).join('');
     this.projectLabelEl.textContent = `Acting on: ${current}${chosen ? ' (chosen)' : ' (active)'}`;
   }

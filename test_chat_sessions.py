@@ -10,6 +10,7 @@ Run: .venv/bin/python -m unittest test_chat_sessions -v
 import inspect
 import sys
 import tempfile
+import json
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -560,18 +561,40 @@ class ChosenProjectRouteTest(unittest.TestCase):
                          ["agent-manager", "agent-manager-chat-plugin-am"])
         self.assertEqual(body["active"], "agent-manager")
 
-    def test_projects_endpoint_is_alphabetical_case_insensitive(self):
+    def test_projects_endpoint_groups_by_tag_then_alphabetical_case_insensitive(self):
         self.options[:] = [
             {"label": "questforge", "root": "/r/q", "active": False},
             {"label": "TaxHarvest", "root": "/r/t", "active": False},
             {"label": "agent-manager", "root": "/r/am", "active": True},
-            {"label": "Inventory", "root": "/r/i", "active": False},
+            {"label": "zeta-new-project", "root": "/r/z", "active": False},
+            {"label": "Alpha-new-project", "root": "/r/a", "active": False},
+            {"label": "sceneforge", "root": "/r/s", "active": False},
+            {"label": "adforge", "root": "/r/af", "active": False},
             {"label": "pf-admin-ui", "root": "/r/p", "active": False},
         ]
         body = self.client.get("/api/chat/projects").get_json()
-        self.assertEqual([p["label"] for p in body["projects"]],
-                         ["agent-manager", "Inventory", "pf-admin-ui", "questforge", "TaxHarvest"])
+        got = [(p["tag"], p["label"]) for p in body["projects"]]
+        self.assertEqual(got, [
+            ("AM", "agent-manager"),
+            ("Client", "pf-admin-ui"),
+            ("Client", "TaxHarvest"),
+            ("Forge", "adforge"),
+            ("Forge", "sceneforge"),
+            ("Game", "questforge"),
+            ("Other", "Alpha-new-project"),
+            ("Other", "zeta-new-project"),
+        ])
         self.assertEqual(body["active"], "agent-manager")
+
+    def test_every_tagged_label_is_listed_once_and_tags_are_not_underscored(self):
+        import routes.chat as chat_routes
+        tags = chat_routes._project_tags()
+        self.assertEqual(tags["sceneforge"], "Forge")
+        self.assertEqual(tags["TaxHarvest-Cowork"], "Client")
+        self.assertNotIn("_comment", tags)
+        raw = json.loads((Path(chat_routes.__file__).resolve().parent.parent / "project_tags.json").read_text())
+        labels = [l for k, v in raw.items() if not k.startswith("_") for l in v]
+        self.assertEqual(len(labels), len(set(labels)), "a label is tagged under two categories")
 
 
 class ProjectOptionsDedupeTest(unittest.TestCase):
