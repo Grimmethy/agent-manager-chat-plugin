@@ -29,6 +29,23 @@ import agent_hosts
 chat_bp = Blueprint("chat-bp", __name__)
 
 
+def _project_tags():
+    """label -> category tag from project_tags.json next to the plugin (display only; the
+    label stays the project's identity everywhere). Never raises; unlisted = 'Other'."""
+    try:
+        raw = json.loads((Path(__file__).resolve().parent.parent / "project_tags.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    out = {}
+    if isinstance(raw, dict):
+        for tag, labels in raw.items():
+            if tag.startswith("_") or not isinstance(labels, list):
+                continue
+            for lab in labels:
+                out.setdefault(str(lab), str(tag))
+    return out
+
+
 def _project_options():
     """2026-10-25 (walkthrough): the project list for the chat panel's "Acting on:"
     selector -- the SAME registry the core dashboard's list_projects tool reads
@@ -103,9 +120,11 @@ def api_chat_projects():
     """The "Acting on:" selector's options (2026-10-25 walkthrough): the same
     project registry the core dashboard's list_projects tool reads, tagged with
     which one the dashboard currently has active. See _project_options()."""
-    # Alphabetical (case-insensitive) so a long registry is findable; the registry's own
+    # Grouped by category tag, then alphabetical (case-insensitive), so a long registry is findable; the registry's own
     # order is arbitrary (insertion order). Sorting here keeps every consumer consistent.
-    options = sorted(_project_options(), key=lambda o: (str(o["label"]).casefold(), str(o["label"])))
+    tags = _project_tags()
+    options = [dict(o, tag=tags.get(str(o["label"]), "Other")) for o in _project_options()]
+    options.sort(key=lambda o: (o["tag"].casefold(), str(o["label"]).casefold(), str(o["label"])))
     active = next((o["label"] for o in options if o["active"]), None)
     return jsonify({"projects": options, "active": active})
 

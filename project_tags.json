@@ -1,0 +1,9 @@
+{
+  "_comment": "Category tag per project label for the chat panel's Acting on: selector (display only; the label stays the identity). Unlisted projects show as Other.",
+  "AM": ["agent-manager", "agent-manager-chat-plugin-am", "agent-manager-gpu-broker", "agent-manager-hardware-goatmon-plugin", "agent-manager-hardware-plugin", "agent-manager-hub-tasks", "agent-manager-hygiene", "cloud-providers", "llm-tuner", "tokenfold", "gemma-agent-comp"],
+  "Business": ["books", "buildboard", "credit-manager-plugin", "crm-plugin", "crosslister", "inventory-plugin", "lead-call-desk", "mailroom", "skiptracege", "trade-calculator"],
+  "Client": ["PF-Client-Portal", "pf-admin-ui", "pf-backend", "pf-lessons", "TaxHarvest", "TaxHarvest-Cowork", "taxharvest-scrapers"],
+  "Forge": ["adforge", "annieforge", "characterforge", "cutforge", "intakereel", "journalforge", "postforge", "promptforge", "recipeforge", "sceneforge", "scriptforge", "sparforge", "storyforge", "uiforge", "uxforge", "videoforge", "voiceforge"],
+  "Game": ["questforge", "romance-plugin"],
+  "Knowledge": ["wikiforge"]
+}
