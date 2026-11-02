@@ -87,6 +87,109 @@ _interrupt_reasons = {}
 _interrupt_reason_lock = threading.Lock()
 
 
+def _set_interrupt_reason(session_id: str, reason: str) -> None:
+    """Store the interrupt reason for a session. Overwrites any prior reason."""
+    with _interrupt_reason_lock:
+        _interrupt_reasons[session_id] = reason
+
+
+def _pop_interrupt_reason(session_id: str, default: str = '') -> str:
+    """Retrieve and REMOVE the interrupt reason for a session. One-shot read."""
+    with _interrupt_reason_lock:
+        return _interrupt_reasons.pop(session_id, default)
+
+
+# 2026-10-30 (HUB0048 / adhoc-chat-stop-status-and-keep-the-text): stop event registry.
+# Each live turn registers a threading.Event; the UI calls stop_session() to set it.
+# The turn loop checks event.is_set() between yielded frames and exits cleanly when set.
+_stop_events: dict[str, threading.Event] = {}
+_stop_events_lock = threading.Lock()
+
+
+def _register_stop_event(session_id: str) -> threading.Event:
+    """Register (or return existing) stop event for a session. Called at turn start."""
+    with _stop_events_lock:
+        if session_id not in _stop_events:
+            _stop_events[session_id] = threading.Event()
+        return _stop_events[session_id]
+
+
+def _clear_stop_event(session_id: str) -> None:
+    """Remove the stop event for a session. Called in finally block after turn ends."""
+    with _stop_events_lock:
+        _stop_events.pop(session_id, None)
+
+
+def stop_session(session_id: str) -> bool:
+    """Signal a live turn to stop. Returns True if a turn was actually running."""
+    event = _stop_events.get(session_id)
+    if event is None:
+        return False
+    event.set()
+    return True
+
+
+# 2026-10-30 (HUB0048 / adhoc-chat-stop-status-and-keep-the-text): once-per-phase
+# status tracker. next_frame(code) returns a {'type': 'status', 'message': code} dict
+# only when code differs from the last emitted frame; returns None on repeat.
+class _StatusTracker:
+    def __init__(self):
+        self._last_code = None
+
+    def next_frame(self, code: str) -> dict | None:
+        if code == self._last_code:
+            return None
+        self._last_code = code
+        return {'type': 'status', 'message': code}
+
+
+# 2026-10-30 (HUB0048 / adhoc-chat-stop-status-and-keep-the-text): mark the LAST
+# assistant entry as partial with a reason, persisting the session. Returns True when
+# it actually marked something (non-empty text, last entry is assistant, has streaming).
+def _mark_partial_checkpoint(storage_dir: Path, session: dict, reason: str) -> bool:
+    if reason not in INTERRUPT_REASONS:
+        raise ValueError(f"invalid interrupt reason: {reason!r}")
+    messages = session.get('messages', [])
+    if not messages:
+        return False
+    last_entry = messages[-1]
+    if last_entry.get('role') != 'assistant':
+        return False
+    if not last_entry.get('text', '').strip():
+        return False
+    if not last_entry.get('streaming'):
+        return False
+    last_entry['partial'] = True
+    last_entry['reason'] = reason
+    last_entry.pop('streaming', None)
+    _write_session(storage_dir, session)
+    return True
+
+
+# 2026-10-30 (HUB0048 / adhoc-chat-stop-status-and-keep-the-text): recover a session
+# that was interrupted by restart. Marks a last assistant entry with streaming:true as
+# partial with reason 'restart' when session is not in _busy_sessions. Returns True
+# when it changed anything.
+def _recover_interrupted(storage_dir: Path, session: dict) -> bool:
+    if session['id'] in _busy_sessions:
+        return False
+    messages = session.get('messages', [])
+    if not messages:
+        return False
+    last_entry = messages[-1]
+    if last_entry.get('role') != 'assistant':
+        return False
+    if not last_entry.get('streaming'):
+        return False
+    if not last_entry.get('text', '').strip():
+        return False
+    last_entry['partial'] = True
+    last_entry['reason'] = 'restart'
+    last_entry.pop('streaming', None)
+    _write_session(storage_dir, session)
+    return True
+
+
 # 2026-10-18 (multi-chat workspace, Phase 1): one JSON file PER SESSION instead of one
 # file holding every session. The old single file was read and rewritten whole on every
 # streamed chunk, so a turn in session A held a stale copy of session B and erased B's
@@ -1314,16 +1417,40 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
     provider.
 
     Persists only THIS session's file (2026-10-18), and marks the session busy in
-    list_sessions() for exactly the life of the generator."""
+    list_sessions() for exactly the life of the generator.
+
+    2026-10-30 (HUB0048): stop event is registered after busy-set add, cleared in
+    finally (never after the try block -- an early return would leak it). The inner
+    generator runs as a sub-generator; we check event.is_set() between yielded frames
+    and yield {'type': 'stopped'} when set. GeneratorExit (browser disconnect) sets
+    the interrupt reason to 'disconnect'. Busy-set and stop event are cleared in ONE
+    finally block that runs on every exit path."""
     session = _read_session(storage_dir, session_id)
     if not session or session["status"] != "active":
         yield {"type": "final", "session": session}
         return
     with _busy_lock:
         _busy_sessions.add(session_id)
+    stop_event = _register_stop_event(session_id)
+    inner_gen = _stream_message_turn(storage_dir, session, message)
     try:
-        yield from _stream_message_turn(storage_dir, session, message)
+        while True:
+            try:
+                evt = next(inner_gen)
+            except StopIteration:
+                break
+            yield evt
+            if stop_event.is_set():
+                _set_interrupt_reason(session_id, 'stopped')
+                yield {'type': 'stopped'}
+                inner_gen.close()
+                break
+    except GeneratorExit:
+        _set_interrupt_reason(session_id, 'disconnect')
+        inner_gen.close()
+        raise
     finally:
+        _clear_stop_event(session_id)
         with _busy_lock:
             _busy_sessions.discard(session_id)
 
@@ -1352,10 +1479,21 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     _touch(session)
     _write_session(storage_dir, session)
 
+    # 2026-10-30 (HUB0048): one status tracker per turn. next_frame(code) returns a
+    # {'type': 'status', 'message': code} dict only when code differs from the last
+    # emitted frame; returns None on repeat. Status frames come ONLY from this tracker
+    # (one place), so 'model-running' is sent once before the first model event, again
+    # after a tool_end, and 'tool-running' on tool_start.
+    _status_tracker = _StatusTracker()
+
     reply_parts = []
     result_box = {}
     try:
         if session["provider"] == PROVIDER_CLAUDE:
+            # 2026-10-30 (HUB0048): send 'model-running' once before the blocking call.
+            status_frame = _status_tracker.next_frame('model-running')
+            if status_frame:
+                yield status_frame
             reply = _send_claude(session, message, storage_dir)
             reply_parts.append(reply)
             session["transcript"][-1]["text"] = reply
@@ -1365,11 +1503,15 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
             # 2026-10-30 (HUB0033): chunk coalescing + tool event emission
             # Coalesce consecutive text chunks into one frame per 100ms or 200 chars
             # (whichever comes first), flushing before tool events and at end.
+            # 2026-10-30 (HUB0048): status tracker emits 'model-running' once before
+            # first model event, 'tool-running' on tool_start, 'model-running' again
+            # after tool_end. All through _status_tracker.next_frame() (one place).
             coalesce_buffer = []
             coalesce_chars = 0
             coalesce_last_time = time.time()
             COALESCE_MS = 100
             COALESCE_CHARS = 200
+            model_started = False
             
             def _flush_coalesced():
                 """Flush the current coalescing buffer as a single chunk event."""
@@ -1386,6 +1528,15 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
                 if isinstance(item, dict):
                     # Tool event (tool_start or tool_end) - flush chunks first
                     yield from _flush_coalesced()
+                    if item.get("type") == "tool_start":
+                        status_frame = _status_tracker.next_frame('tool-running')
+                        if status_frame:
+                            yield status_frame
+                    elif item.get("type") == "tool_end":
+                        # After tool_end, model is running again
+                        status_frame = _status_tracker.next_frame('model-running')
+                        if status_frame:
+                            yield status_frame
                     yield item
                 else:
                     # Text chunk - accumulate for coalescing
@@ -1394,6 +1545,15 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
                     reply_parts.append(item)
                     session["transcript"][-1]["text"] = "".join(reply_parts)
                     _write_session(storage_dir, session)
+                    
+                    # 2026-10-30 (HUB0048): send 'model-running' once before first
+                    # model event (first text chunk). The tracker de-duplicates, so
+                    # subsequent calls with the same code are no-ops.
+                    if not model_started:
+                        status_frame = _status_tracker.next_frame('model-running')
+                        if status_frame:
+                            yield status_frame
+                        model_started = True
                     
                     # Check if we should flush based on time or character count
                     elapsed_ms = (time.time() - coalesce_last_time) * 1000
