@@ -707,7 +707,9 @@ class ChatPane {
   }
 
   renderProjectRow() {
-    const opts = this.projectOptions || [];
+    // Alphabetical, case-insensitive, so the selector is easy to scan (the server sorts too).
+    const opts = [...(this.projectOptions || [])].sort((a, b) =>
+      String(a.label).localeCompare(String(b.label), undefined, { sensitivity: 'base' }));
     if (!opts.length) { this.projectRow.hidden = true; return; }
     this.projectRow.hidden = false;
     const chosen = this.session && this.session.chosen_project;

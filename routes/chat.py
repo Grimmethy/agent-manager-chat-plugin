@@ -95,7 +95,9 @@ def api_chat_projects():
     """The "Acting on:" selector's options (2026-10-25 walkthrough): the same
     project registry the core dashboard's list_projects tool reads, tagged with
     which one the dashboard currently has active. See _project_options()."""
-    options = _project_options()
+    # Alphabetical (case-insensitive) so a long registry is findable; the registry's own
+    # order is arbitrary (insertion order). Sorting here keeps every consumer consistent.
+    options = sorted(_project_options(), key=lambda o: (str(o["label"]).casefold(), str(o["label"])))
     active = next((o["label"] for o in options if o["active"]), None)
     return jsonify({"projects": options, "active": active})
 
