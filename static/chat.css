@@ -8,7 +8,20 @@
 :root {
   --bg: #0f1115; --panel: #171a21; --border: #2a3358; --text: #e6e8eb; --muted: #8a90a0;
   --accent: #5b9dff; --ok: #4caf7d; --warn: #e0a940; --bad: #e0575c;
+  /* Scrollbar thumb and hairlines: 3:1 against --bg and --panel (the host dashboard's --border-strong). */
+  --border-strong: #5668a0;
 }
+
+/* Scrollbars (owner request 2026-11-02, same look as the host dashboard's index.html): slim, fully rounded, blue. The thumb is --border-strong and --accent on
+   hover over a faint blue track; the transparent border inset makes it a floating pill. Chrome, Edge and Safari take the ::-webkit-scrollbar rules; browsers
+   without them (Firefox) get the standard thin scrollbar in the same colours. Elements that hide their scrollbar on purpose (scrollbar-width: none and the
+   ::-webkit-scrollbar { display: none } rules below) keep doing so. */
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track { background: rgba(91, 157, 255, .06); border-radius: 999px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); background-clip: padding-box; border: 3px solid transparent; border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+@supports not selector(::-webkit-scrollbar) { * { scrollbar-width: thin; scrollbar-color: var(--border-strong) rgba(91, 157, 255, .06); } }
 
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
