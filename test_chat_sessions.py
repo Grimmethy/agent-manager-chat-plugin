@@ -560,6 +560,19 @@ class ChosenProjectRouteTest(unittest.TestCase):
                          ["agent-manager", "agent-manager-chat-plugin-am"])
         self.assertEqual(body["active"], "agent-manager")
 
+    def test_projects_endpoint_is_alphabetical_case_insensitive(self):
+        self.options[:] = [
+            {"label": "questforge", "root": "/r/q", "active": False},
+            {"label": "TaxHarvest", "root": "/r/t", "active": False},
+            {"label": "agent-manager", "root": "/r/am", "active": True},
+            {"label": "Inventory", "root": "/r/i", "active": False},
+            {"label": "pf-admin-ui", "root": "/r/p", "active": False},
+        ]
+        body = self.client.get("/api/chat/projects").get_json()
+        self.assertEqual([p["label"] for p in body["projects"]],
+                         ["agent-manager", "Inventory", "pf-admin-ui", "questforge", "TaxHarvest"])
+        self.assertEqual(body["active"], "agent-manager")
+
 
 class EnforceFooterTest(unittest.TestCase):
     """Tests for the new enforce_footer() function (HUB0027): retry logic that
