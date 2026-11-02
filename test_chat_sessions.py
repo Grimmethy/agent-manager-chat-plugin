@@ -574,6 +574,39 @@ class ChosenProjectRouteTest(unittest.TestCase):
         self.assertEqual(body["active"], "agent-manager")
 
 
+class ProjectOptionsDedupeTest(unittest.TestCase):
+    """_project_options() collapses a registry that lists one label under two roots
+    (agent-manager and promptforge were each shown twice in the Acting on: selector)."""
+
+    def _options(self, registry, active_root=None):
+        import json as _json
+        import routes.chat as chat_routes
+        d = Path(tempfile.mkdtemp())
+        (d / "projects.json").write_text(_json.dumps(registry), encoding="utf-8")
+        with mock.patch.object(app, "CORE_REPO_ROOT", str(d)), \
+             mock.patch.object(app, "_active_project_setting", return_value=active_root):
+            return chat_routes._project_options()
+
+    def test_duplicate_labels_collapse_to_one_entry_keeping_the_first_root(self):
+        opts = self._options([
+            {"label": "agent-manager", "root": "/media/model-cache/github/agent-manager"},
+            {"label": "promptforge", "root": "/media/model-cache/github/promptforge"},
+            {"label": "agent-manager", "root": "/media/wok/model-cache/agent-manager"},
+            {"label": "promptforge", "root": "/media/wok/model-cache/promptforge"},
+            {"label": "questforge", "root": "/media/model-cache/github/questforge"},
+        ])
+        self.assertEqual([o["label"] for o in opts], ["agent-manager", "promptforge", "questforge"])
+        self.assertEqual(opts[0]["root"], "/media/model-cache/github/agent-manager")
+
+    def test_a_duplicate_that_is_the_active_root_marks_the_entry_active(self):
+        opts = self._options([
+            {"label": "agent-manager", "root": "/r/one"},
+            {"label": "agent-manager", "root": "/r/two"},
+        ], active_root="/r/two")
+        self.assertEqual(len(opts), 1)
+        self.assertTrue(opts[0]["active"])
+
+
 class EnforceFooterTest(unittest.TestCase):
     """Tests for the new enforce_footer() function (HUB0027): retry logic that
     APPENDS instead of replaces, with deterministic fallback."""

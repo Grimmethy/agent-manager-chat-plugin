@@ -73,6 +73,14 @@ def _project_options():
             active = label == active_label or (
                 active_root is not None and root is not None
                 and os.path.realpath(str(root)) == active_root)
+            # The registry can list one project twice under different roots (e.g. the
+            # same checkout reached via /media/wok/... and /media/...). The label is the
+            # selector's identity (PATCH validates by label), so keep one entry per label;
+            # it is active if any duplicate is.
+            seen = next((o for o in options if o["label"] == label), None)
+            if seen is not None:
+                seen["active"] = seen["active"] or bool(active)
+                continue
             options.append({"label": label, "root": root, "active": bool(active)})
     if options:
         return options
