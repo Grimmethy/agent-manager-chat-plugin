@@ -73,6 +73,19 @@ CHAT_CLAUDE_MAX_TURNS = 30
 # matching wall-clock headroom this needed too -- that value MUST scale with this one.
 CHAT_LOCAL_MAX_TURNS = 100
 
+# 2026-10-30 (HUB0048 / adhoc-chat-stop-status-and-keep-the-text): the only valid
+# interrupt reasons. _mark_partial_checkpoint raises ValueError for anything outside
+# this tuple so a typo in a caller (or a future add without updating the UI) is loud.
+INTERRUPT_REASONS = ('stopped', 'disconnect', 'timeout', 'error', 'restart')
+
+# 2026-10-30 (HUB0048 / adhoc-chat-stop-status-and-keep-the-text): module-level dict
+# that pairs each active session id with the reason that stopped it. Guarded by
+# _interrupt_reason_lock so a multi-threaded stop path (e.g. a browser disconnect
+# racing with a user click) cannot clobber the stored reason with the wrong one.
+# _set_interrupt_reason writes, _pop_interrupt_reason reads and REMOVES (one-shot).
+_interrupt_reasons = {}
+_interrupt_reason_lock = threading.Lock()
+
 
 # 2026-10-18 (multi-chat workspace, Phase 1): one JSON file PER SESSION instead of one
 # file holding every session. The old single file was read and rewritten whole on every
@@ -243,6 +256,75 @@ def _touch(session: dict):
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# 2026-10-30 (HUB0048 / adhoc-chat-stop-status-and-keep-the-text): persist the stored
+# interrupt reason for a session. The caller (stop_session, the exception handler in
+# _stream_message_turn) writes once at stop time; the exception handler reads it back
+# via _pop_interrupt_reason to decide the actual reason (a stored 'stopped' wins over
+# a GeneratorExit, so a user-initiated stop is never mislabelled 'disconnect').
+def _set_interrupt_reason(session_id: str, reason: str):
+    if reason not in INTERRUPT_REASONS:
+        raise ValueError(f"invalid interrupt reason: {reason!r}; must be one of {INTERRUPT_REASONS}")
+    with _interrupt_reason_lock:
+        _interrupt_reasons[session_id] = reason
+
+
+def _pop_interrupt_reason(session_id: str, default: str) -> str:
+    with _interrupt_reason_lock:
+        return _interrupt_reasons.pop(session_id, default)
+
+
+# 2026-10-30 (HUB0048 / adhoc-chat-stop-status-and-keep-the-text): mark the trailing
+# assistant entry as partial and persist. Returns True only when it actually marked
+# something (i.e. the last assistant entry had non-empty text). Used by stop_session
+# and the exception handler in _stream_message_turn to keep the reply text the model
+# already produced visible in the transcript.
+def _mark_partial_checkpoint(storage_dir: Path, session: dict, reason: str) -> bool:
+    if reason not in INTERRUPT_REASONS:
+        raise ValueError(f"invalid interrupt reason: {reason!r}; must be one of {INTERRUPT_REASONS}")
+    transcript = session.get("transcript") or []
+    last = None
+    for entry in reversed(transcript):
+        if isinstance(entry, dict) and entry.get("role") == "assistant":
+            last = entry
+            break
+    if last is None:
+        return False
+    if not (last.get("text") or "").strip():
+        return False
+    last["partial"] = True
+    last["reason"] = reason
+    _write_session(storage_dir, session)
+    return True
+
+
+# 2026-10-30 (HUB0048 / adhoc-chat-stop-status-and-keep-the-text): recover a reply
+# that was left streaming after a restart. Looks at the last assistant entry with
+# streaming=True; if the session is no longer live (not in _busy_sessions) it marks
+# it partial with reason='restart', removes streaming, and persists. Returns True
+# only when it changed something. Called from get_session() so the very first read
+# after a restart surfaces the interrupted reply to the user.
+def _recover_interrupted(storage_dir: Path, session: dict) -> bool:
+    if session["id"] in _busy_sessions:
+        return False
+    transcript = session.get("transcript") or []
+    last = None
+    for entry in reversed(transcript):
+        if isinstance(entry, dict) and entry.get("role") == "assistant" and entry.get("streaming"):
+            last = entry
+            break
+    if last is None:
+        return False
+    if not (last.get("text") or "").strip():
+        last.pop("streaming", None)
+        _write_session(storage_dir, session)
+        return False
+    last["partial"] = True
+    last["reason"] = "restart"
+    last.pop("streaming", None)
+    _write_session(storage_dir, session)
+    return True
 
 
 def _new_session(roots: list, instances_dir, provider: str, model: str, effort: str) -> dict:
@@ -832,7 +914,13 @@ def _build_local_messages(session: dict, message: str) -> list:
             # "marker" has no marker key and is replayed normally.
             continue
         role = "assistant" if turn["role"] == "assistant" else "user"
-        messages.append({"role": role, "content": turn["text"] + command_runs.context_note(turn)})
+        content = turn["text"] + command_runs.context_note(turn)
+        # 2026-10-30 (HUB0048): tell the model the reply was interrupted so it
+        # knows not to repeat itself. Only applied to partial entries (ones that
+        # still carry a 'reason' key); complete entries are never modified.
+        if turn.get("partial") and turn.get("reason"):
+            content = content + f" [this reply was interrupted: {turn['reason']}]"
+        messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": message})
     return messages
 
@@ -1256,59 +1344,85 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     # whatever hadn't streamed yet. Any interruption now loses at most the last unwritten
     # chunk, regardless of cause (a reloader restart, a crash, a dropped connection) --
     # the whole point is not depending on reaching a specific line of code at the end.
-    session["transcript"].append({"role": "assistant", "text": "", "timestamp": _now_iso()})
+    # 2026-10-30 (HUB0048): "streaming": true marks this entry as live so
+    # _recover_interrupted can find it after a restart; the normal path deletes it in
+    # the final write (below). Never serialises as a real reply field -- only present
+    # while the turn is actually running.
+    session["transcript"].append({"role": "assistant", "text": "", "timestamp": _now_iso(), "streaming": True})
     _touch(session)
     _write_session(storage_dir, session)
 
     reply_parts = []
     result_box = {}
-    if session["provider"] == PROVIDER_CLAUDE:
-        reply = _send_claude(session, message, storage_dir)
-        reply_parts.append(reply)
-        session["transcript"][-1]["text"] = reply
-        _write_session(storage_dir, session)
-        yield {"type": "chunk", "text": reply}
-    else:
-        # 2026-10-30 (HUB0033): chunk coalescing + tool event emission
-        # Coalesce consecutive text chunks into one frame per 100ms or 200 chars
-        # (whichever comes first), flushing before tool events and at end.
-        coalesce_buffer = []
-        coalesce_chars = 0
-        coalesce_last_time = time.time()
-        COALESCE_MS = 100
-        COALESCE_CHARS = 200
-        
-        def _flush_coalesced():
-            """Flush the current coalescing buffer as a single chunk event."""
-            nonlocal coalesce_buffer, coalesce_chars, coalesce_last_time
-            if coalesce_buffer:
-                # reply_parts and the persisted placeholder already took each item on arrival (below); this only frames them for the stream.
-                combined = "".join(coalesce_buffer)
-                yield {"type": "chunk", "text": combined}
-                coalesce_buffer = []
-                coalesce_chars = 0
-                coalesce_last_time = time.time()
-        
-        for item in _stream_local(session, message, result_box):
-            if isinstance(item, dict):
-                # Tool event (tool_start or tool_end) - flush chunks first
-                yield from _flush_coalesced()
-                yield item
-            else:
-                # Text chunk - accumulate for coalescing
-                coalesce_buffer.append(item)
-                coalesce_chars += len(item)
-                reply_parts.append(item)
-                session["transcript"][-1]["text"] = "".join(reply_parts)
-                _write_session(storage_dir, session)
-                
-                # Check if we should flush based on time or character count
-                elapsed_ms = (time.time() - coalesce_last_time) * 1000
-                if elapsed_ms >= COALESCE_MS or coalesce_chars >= COALESCE_CHARS:
+    try:
+        if session["provider"] == PROVIDER_CLAUDE:
+            reply = _send_claude(session, message, storage_dir)
+            reply_parts.append(reply)
+            session["transcript"][-1]["text"] = reply
+            _write_session(storage_dir, session)
+            yield {"type": "chunk", "text": reply}
+        else:
+            # 2026-10-30 (HUB0033): chunk coalescing + tool event emission
+            # Coalesce consecutive text chunks into one frame per 100ms or 200 chars
+            # (whichever comes first), flushing before tool events and at end.
+            coalesce_buffer = []
+            coalesce_chars = 0
+            coalesce_last_time = time.time()
+            COALESCE_MS = 100
+            COALESCE_CHARS = 200
+            
+            def _flush_coalesced():
+                """Flush the current coalescing buffer as a single chunk event."""
+                nonlocal coalesce_buffer, coalesce_chars, coalesce_last_time
+                if coalesce_buffer:
+                    # reply_parts and the persisted placeholder already took each item on arrival (below); this only frames them for the stream.
+                    combined = "".join(coalesce_buffer)
+                    yield {"type": "chunk", "text": combined}
+                    coalesce_buffer = []
+                    coalesce_chars = 0
+                    coalesce_last_time = time.time()
+            
+            for item in _stream_local(session, message, result_box):
+                if isinstance(item, dict):
+                    # Tool event (tool_start or tool_end) - flush chunks first
                     yield from _flush_coalesced()
-        
-        # Final flush at end of streaming
-        yield from _flush_coalesced()
+                    yield item
+                else:
+                    # Text chunk - accumulate for coalescing
+                    coalesce_buffer.append(item)
+                    coalesce_chars += len(item)
+                    reply_parts.append(item)
+                    session["transcript"][-1]["text"] = "".join(reply_parts)
+                    _write_session(storage_dir, session)
+                    
+                    # Check if we should flush based on time or character count
+                    elapsed_ms = (time.time() - coalesce_last_time) * 1000
+                    if elapsed_ms >= COALESCE_MS or coalesce_chars >= COALESCE_CHARS:
+                        yield from _flush_coalesced()
+            
+            # Final flush at end of streaming
+            yield from _flush_coalesced()
+    except BaseException:
+        # 2026-10-30 (HUB0048): any exception during streaming (a model timeout,
+        # a browser disconnect, a SystemExit from a reload) must keep whatever text
+        # the model already produced and mark the entry partial with a reason. The
+        # reason comes from _pop_interrupt_reason first (a stored 'stopped' wins
+        # over the exception type -- a user click must not be relabelled 'disconnect'
+        # by a GeneratorExit that follows); only if nothing was stored do we fall
+        # back to a default derived from the exception type.
+        default_reason = {
+            TimeoutError: 'timeout',
+            SystemExit: 'restart',
+            GeneratorExit: 'disconnect',
+        }.get(type(sys.exc_info()[1]), 'error')
+        reason = _pop_interrupt_reason(session["id"], default=default_reason)
+        _mark_partial_checkpoint(storage_dir, session, reason)
+        raise
+    else:
+        # Normal path: drop the streaming flag now that the reply is final. A
+        # complete entry never carries "streaming" or "partial" -- the UI reads
+        # those to decide whether to render the interruption note.
+        session["transcript"][-1].pop("streaming", None)
 
     # 2026-09-15: prefer _stream_local's own authoritative final_text (the model's
     # response with every SIDE-FINDING:/AMPLIFY:/CONCEPT-BUILD:/CONTEXT-LOG: marker
@@ -1365,7 +1479,15 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
 
 
 def get_session(storage_dir: Path, session_id: str):
-    return _read_session(storage_dir, session_id)
+    # 2026-10-30 (HUB0048): recover a reply that was interrupted by a restart
+    # before the dashboard had a chance to notice. _recover_interrupted only
+    # touches a session that is no longer live (not in _busy_sessions) and only
+    # when the last assistant entry still has "streaming": true with non-empty
+    # text -- a complete reply or a truly empty placeholder is left alone.
+    session = _read_session(storage_dir, session_id)
+    if session:
+        _recover_interrupted(storage_dir, session)
+    return session
 
 
 def inject_user_message(storage_dir: Path, session_id: str, text: str):
@@ -1404,6 +1526,13 @@ def record_turn_error(storage_dir: Path, session_id: str, error_text: str):
         partial = (last.get("text") or "").strip()
         last["text"] = f"{partial}\n\n{text}" if partial else text
         last["error"] = True
+        # 2026-10-30 (HUB0048): an error that arrives while the model already
+        # produced text must also mark that text partial with reason 'error' so
+        # the transcript keeps the partial reply visible (the UI renders the
+        # same interruption note as for a stop/timeout).
+        if partial:
+            last["partial"] = True
+            last["reason"] = "error"
     else:
         transcript.append({"role": "assistant", "text": text, "timestamp": _now_iso(), "error": True})
     _touch(session)
