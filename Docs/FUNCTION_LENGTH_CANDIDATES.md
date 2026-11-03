@@ -148,3 +148,230 @@ Decomposition isolates responsibilities, enabling unit tests for each concern wi
 
 VERDICT CONSTRAINT:
 Genuine
+
+### AC-2 · Decompose Boot Monolith
+Strength: Strong
+Files: static/multi-chat.js
+Symbol: boot
+Snippet:
+```
+  }
+
+  function boot() {
+    const root =
+      document.getElementById('multi-chat-root') ||
+      document.getElementById('chat-panel') ||
+      document.body;
+
+    injectStyles();
+    let state = restoreLayout();
+    let activeId = firstOpenPane(state);
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'multi-chat-toolbar';
+    const host = document.createElement('div');
+    host.className = 'multi-chat-host';
+    root.appendChild(toolbar);
+    root.appendChild(host);
+
+    // --- toolbar: the open chats as a row of buttons (one per pane, the active one highlighted) and a "+" new-chat button ----------------
+    const tabsBox = document.createElement('div');
+    tabsBox.className = 'multi-chat-tabs';
+    tabsBox.setAttribute('role', 'tablist');
+    tabsBox.setAttribute('aria-label', 'Open chats');
+    toolbar.appendChild(tabsBox);
+    const newTabBtn = document.createElement('button');
+    newTabBtn.type = 'button';
+    newTabBtn.className = 'secondary multi-chat-new-btn';
+    newTabBtn.textContent = '+';
+    newTabBtn.title = 'New chat';
+    newTabBtn.setAttribute('aria-label', 'New chat');
+    newTabBtn.onclick = () => openNewChat();
+    toolbar.appendChild(newTabBtn);
+
+    // --- toolbar: the session switcher, now the "All chats" list (built once chat.js has loaded) -----
+    const switcherSlot = document.createElement('div');
+    switcherSlot.className = 'multi-chat-switcher';
+    toolbar.appendChild(switcherSlot);
+    let switcher = null;
+    const refreshSwitcher = () => { if (switcher) switcher.refresh().then(renderTabs, () => {}); renderTabs(); };
+    function renderTabs() {
+      const titles = {};
+      if (switcher && Array.isArray(switcher.rows)) for (const r of switcher.rows) if (r && typeof r.id === 'string') titles[r.id] = r.title;
+      for (const p of livePanes) if (p.sessionId && typeof titles[p.sessionId] === 'string') p.setTitle(titles[p.sessionId]); // pane headers carry the same real title as the buttons
+      tabsBox.innerHTML = '';
+      for (const tab of chatTabs(state, titles, activeId)) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'secondary multi-chat-tab';
+        btn.textContent = tab.title;
+        btn.title = tab.title;
+        btn.setAttribute('role', 'tab');
+        btn.setAttribute('aria-selected', String(tab.active));
+        if (tab.active) btn.setAttribute('aria-current', 'true');
+        btn.onclick = () => selectChat(tab.id);
+        tabsBox.appendChild(btn);
+      }
+    }
+
+    // --- toolbar: one "Layout" control at the end of the bar; the presets and the templates live in its popover ----------------
+    const layoutBox = document.createElement('div');
+    layoutBox.className = 'multi-chat-layout';
+    const layoutBtn = document.createElement('button');
+    layoutBtn.type = 'button';
+    layoutBtn.className = 'secondary multi-chat-layout-btn';
+    layoutBtn.textContent = 'Layout \u25BE';
+    layoutBtn.setAttribute('aria-haspopup', 'true');
+    layoutBtn.setAttribute('aria-expanded', 'false');
+    const layoutMenu = document.createElement('div');
+    layoutMenu.className = 'multi-chat-layout-menu';
+    layoutMenu.hidden = true;
+    const presetRow = document.createElement('div');
+    presetRow.className = 'multi-chat-presets';
+    layoutMenu.appendChild(presetRow);
+    layoutBox.appendChild(layoutBtn);
+    layoutBox.appendChild(layoutMenu);
+    function setLayoutOpen(open) {
+      layoutMenu.hidden = !open;
+      layoutBtn.setAttribute('aria-expanded', String(open));
+    }
+    layoutBtn.onclick = (e) => { e.stopPropagation(); setLayoutOpen(layoutMenu.hidden); };
+    document.addEventListener('click', (e) => { if (!layoutMenu.hidden && !layoutBox.contains(e.target)) setLayoutOpen(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !layoutMenu.hidden) setLayoutOpen(false); });
+
+    const presetButtons = {};
+    const PRESET_LABELS = { '1': 'Single', '2col': 'Two columns', '2x2': 'Grid 2x2' };
+    for (const preset of PRESETS) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'secondary multi-chat-preset-btn';
+      btn.textContent = PRESET_LABELS[preset];
+      btn.setAttribute('aria-pressed', 'false');
+      btn.onclick = () => {
+        state = applyPreset(state, preset);
+        activeId = firstOpenPane(state) || activeId;
+        saveLayout(state);
+        setLayoutOpen(false);
+        render();
+      };
+      presetRow.appendChild(btn);
+      presetButtons[preset] = btn;
+    }
+    function markPreset() {
+      for (const p of PRESETS) presetButtons[p].setAttribute('aria-pressed', String(state.preset === p));
+    }
+
+    // --- toolbar: templates menu + inline "save current as" (no window.prompt) ---
+    let templates = loadTemplates();
+    const tplBox = document.createElement('div');
+    tplBox.className = 'multi-chat-templates';
+    const tplSelect = document.createElement('select');
+    tplSelect.className = 'multi-chat-template-select';
+    tplSelect.setAttribute('aria-label', 'Layout templates');
+    const tplSaveBtn = document.createElement('button');
+    tplSaveBtn.type = 'button';
+    tplSaveBtn.className = 'secondary multi-chat-template-save-btn';
+    tplSaveBtn.textContent = 'Save current as…';
+    const tplSaveRow = document.createElement('span');
+    tplSaveRow.className = 'multi-chat-template-save';
+    tplSaveRow.hidden = true;
+    const tplName = document.createElement('input');
+    tplName.type = 'text';
+    tplName.className = 'multi-chat-template-name';
+    tplName.maxLength = TEMPLATE_NAME_MAX;
+    tplName.placeholder = 'Template name';
+    tplName.setAttribute('aria-label', 'Template name');
+    const tplOk = document.createElement('button');
+    tplOk.type = 'button';
+    tplOk.className = 'multi-chat-template-ok';
+    tplOk.textContent = 'Save';
+    tplSaveRow.appendChild(tplName);
+    tplSaveRow.appendChild(tplOk);
+    tplBox.appendChild(tplSelect);
+    tplBox.appendChild(tplSaveBtn);
+    tplBox.appendChild(tplSaveRow);
+    layoutMenu.appendChild(tplBox);
+
+    // --- toolbar: previous / next buttons and the position label for the pane strip ----------------
+    // The strip (.multi-chat-flex, one snap row) scrolls natively by touch swipe or mouse; these buttons, the label and the arrow keys are the other ways to move.
+    const nav = document.createElement('div');
+    nav.className = 'multi-chat-strip-nav';
+    nav.hidden = true;
+    const prevBtn = document.createElement('button');
+    prevBtn.type = 'button';
+    prevBtn.className = 'secondary multi-chat-strip-btn';
+    prevBtn.textContent = '\u25C0';
+    prevBtn.title = 'Previous chat';
+    prevBtn.setAttribute('aria-label', 'Previous chat');
+    const stripLabelEl = document.createElement('span');
+    stripLabelEl.className = 'multi-chat-strip-label';
+    stripLabelEl.setAttribute('aria-live', 'polite');
+    const nextBtn = document.createElement('button');
+    nextBtn.type = 'button';
+    nextBtn.className = 'secondary multi-chat-strip-btn';
+    nextBtn.textContent = '\u25B6';
+    nextBtn.title = 'Next chat';
+    nextBtn.setAttribute('aria-label', 'Next chat');
+    nav.appendChild(prevBtn);
+    nav.appendChild(stripLabelEl);
+    nav.appendChild(nextBtn);
+    toolbar.appendChild(nav);
+    toolbar.appendChild(layoutBox); // last: the Layout control closes the bar
+
+    let strip = null; // the current .multi-chat-flex element, or null (dockview, or nothing drawn)
+    let stripIndex = 0;
+    let stripScrollTimer = null;
+    const stripPanes = () => (strip ? Array.from(strip.children) : []);
+    const stripLefts = () => stripPanes().map((p) => p.offsetLeft - strip.offsetLeft);
+    function updateStripNav() {
+      const count = stripPanes().length;
+      nav.hidden = !strip || count < 2;
+      if (nav.hidden) return;
+      const visible = stripVisibleCount(window.innerWidth || 1024);
+      stripIndex = clampStripIndex(stripIndex, count, visible);
+      stripLabelEl.textContent = stripLabel(stripIndex, count, visible);
+      const b = stripButtons(stripIndex, count, visible);
+      prevBtn.disabled = !b.canPrev;
+      nextBtn.disabled = !b.canNext;
+    }
+    function scrollStripTo(i, smooth) {
+      const pane = stripPanes()[i];
+      if (!strip || !pane) return;
+      strip.scrollTo({ left: pane.offsetLeft - strip.offsetLeft, behavior: smooth ? 'smooth' : 'auto' });
+    }
+    function stepStripBy(delta) {
+      const count = stripPanes().length;
+      const next = stepStrip(stripIndex, delta, count, stripVisibleCount(window.innerWidth || 1024));
+      if (!strip || next === stripIndex) return false;
+      stripIndex = next;
+      scrollStripTo(next, true);
+      const landed = state.panes[next];
+      if (typeof landed === 'string') activeId = landed; // the highlighted chat follows the strip
+      renderTabs();
+      updateStripNav();
+      return true;
+    }
+    // Called with each freshly built strip: keep the position across a re-render, follow the user's own scrolling and swiping (debounced 80 ms).
+    function attachStrip(flex) {
+      strip = flex;
+      scrollStripTo(clampStripIndex(stripIndex, stripPanes().length, stripVisibleCount(window.innerWidth || 1024)), false);
+      updateStripNav();
+      flex.addEventListener('scroll', () => {
+// ... [truncated for review: this function continues for 372 more line(s) not shown]
+```
+
+Problem:
+The `boot()` function orchestrates the entire UI initialization of a multi-chat interface, mixing DOM creation, state management, event listeners, rendering logic, and side effects. This violates the Single Responsibility Principle, making it hard to test, debug, or extend — a real maintainability hazard that scales with the project’s growth.
+
+Solution:
+Extract the function into 10 named, single-responsibility functions: `initUI()`, `initToolbar()`, `initLayoutControls()`, `initNavigation()`, `initState()`, `attachEventListeners()`, `renderTabs()`, `updateStripNav()`, `attachStrip()`, and `render()`. Each handles one logical concern — e.g., `initToolbar()` creates and configures the toolbar container — with no cross-cutting logic. These can be unit-tested independently and modified without touching the monolith.
+
+Benefits:
+Decomposing this function improves readability, testability, and reviewability. Developers can reason about one piece at a time, add new components without modifying the core boot logic, and fix bugs in isolation — reducing risk and increasing team velocity.
+
+VERDICT CONSTRAINT (mandatory for this task):
+- The function snippet IS provided above in this prompt; you do not need to request it or assume it is missing.
+- You MUST render exactly one verdict: GENUINE or FALSE POSITIVE.
+- Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.
+
+VERDICT: GENUINE
