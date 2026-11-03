@@ -32,6 +32,8 @@ import { fullTitle, orderSessions, nextSelectionAfterClose, formatRow,
 import { providerLabel, swapOptions, offerText, swapBody } from "./swap-view.js";
 // The tools an assistant turn ran (stored by tool_log.py), shown as a collapsed list under its reply.
 import { renderToolsHtml } from "./tools-view.js";
+// Caps how often the switcher hits the network (2026-11-02 request storm); see refresh-gate.js.
+import { createRefreshGate } from "./refresh-gate.js";
 // Proposed write commands (Confirm / Deny) and the results of the ones that ran (command_runs.py stores them on the assistant entry).
 import { renderCommandsHtml } from "./commands-view.js";
 // Piece 2/10: the pure "needs you" attention logic (which rows newly became waiting,
@@ -856,6 +858,9 @@ class SessionSwitcher {
     document.addEventListener('click', (e) => { if (this.open && !this.slot.contains(e.target)) this.setOpen(false); });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.open) this.setOpen(false); });
     document.addEventListener('keydown', (e) => this.onJumpKey(e));
+    // refresh() is called from the 5 s timer, every pane change and every multi-chat render; a stack of callers used to
+    // become a stack of request pairs (22/s seen). The gate coalesces them: one run in flight, at most one per second.
+    this.refresh = createRefreshGate(() => this._refreshNow(), { minGapMs: 1000 });
     this.renderButton();
   }
 
@@ -960,7 +965,7 @@ class SessionSwitcher {
     }
   }
 
-  async refresh() {
+  async _refreshNow() {
     try {
       this.rows = orderSessions(await fetchJson('api/chat/sessions'));
     } catch (e) {
