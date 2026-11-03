@@ -47,7 +47,7 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
              temperature: float = None, num_predict: int = None,
              cwd: str = None, allowed_tools: str = None, max_turns: int = None,
              resume: str = None, add_dirs: list = None, allow_amplification: bool = False,
-             token_file: str = None) -> dict:
+             token_file: str = None, timeout_s: float = None) -> dict:
     """Same return shape as ollama_client.generate(): {"response": str, "thinking": str}.
     `think`/`temperature`/`num_predict` are accepted but ignored -- they're Ollama sampling
     knobs with no Claude Code CLI equivalent; kept in the signature only so callers built
@@ -100,6 +100,13 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
         request["addDirs"] = list(add_dirs)
     if allow_amplification:
         request["allowAmplification"] = True
+    # timeout_s (2026-11-03): for long agentic callers such as a Chat turn. The Node side kills the
+    # claude process after its own 300 s default unless the request carries timeoutMs, and this
+    # wrapper bounds the node process 30 s beyond that. None keeps today's 330 s behaviour exactly.
+    subprocess_timeout = SUBPROCESS_TIMEOUT_S
+    if timeout_s:
+        request["timeoutMs"] = int(timeout_s * 1000)
+        subprocess_timeout = timeout_s + 30
 
     # HUB0008 2/11: optional per-call Claude account. Read at call time and injected
     # into the CHILD env only -- never os.environ, never the request JSON (already
@@ -122,7 +129,7 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
     try:
         tmp_path.write_text(json.dumps(request), encoding="utf-8")
         try:
-            _run_kwargs = {"capture_output": True, "text": True, "timeout": SUBPROCESS_TIMEOUT_S}
+            _run_kwargs = {"capture_output": True, "text": True, "timeout": subprocess_timeout}
             if child_env is not None:
                 _run_kwargs["env"] = child_env
             result = subprocess.run(
@@ -140,7 +147,7 @@ def generate(prompt: str, model: str = None, effort: str = None, think: bool = F
             # ClaudeClientError below; a hang past SUBPROCESS_TIMEOUT_S is just as much
             # this module's own failure mode as a non-zero exit or bad JSON, and belongs
             # in the same one exception type callers already know to catch.
-            raise ClaudeClientError(f"claude -p (via claude-client.js) did not respond within {SUBPROCESS_TIMEOUT_S}s") from e
+            raise ClaudeClientError(f"claude -p (via claude-client.js) did not respond within {subprocess_timeout:g}s") from e
     finally:
         try:
             tmp_path.unlink()
