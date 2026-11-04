@@ -57,6 +57,24 @@ PROVIDER_CLAUDE = "claude"
 # header on the trust model this mirrors (this actual terminal session).
 CHAT_CLAUDE_ALLOWED_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
 CHAT_CLAUDE_MAX_TURNS = 30
+# 2026-11-03: a Chat turn is an agentic session (tools, up to CHAT_CLAUDE_MAX_TURNS turns), not a single
+# completion, but claude -p was killed at the 300 s default ("spawnSync claude ETIMEDOUT" on a repo-trial
+# request). 20 minutes; AGENT_MANAGER_CHAT_CLAUDE_TIMEOUT_S overrides it (a number above 0, else the default).
+CHAT_CLAUDE_TIMEOUT_S_DEFAULT = 1200
+
+
+def chat_claude_timeout_s(env=None):
+    raw = (os.environ if env is None else env).get("AGENT_MANAGER_CHAT_CLAUDE_TIMEOUT_S")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return CHAT_CLAUDE_TIMEOUT_S_DEFAULT
+    if not value > 0 or value == float("inf"):
+        return CHAT_CLAUDE_TIMEOUT_S_DEFAULT
+    return int(value) if value == int(value) else value
+
+
+CHAT_CLAUDE_TIMEOUT_S = chat_claude_timeout_s()
 # 2026-08-26, Grimmethy: "Seems like qwen got hung up" -- root-caused live, not actually
 # hung: model-stats.db showed 4 real completed calls (65s/16s/75s/102s), zero errors, zero
 # degenerate flags. It genuinely ran out of its 5-turn budget mid-investigation ("look at
@@ -566,7 +584,7 @@ def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
         cwd=session["repoRoot"], allowed_tools=CHAT_CLAUDE_ALLOWED_TOOLS,
         max_turns=CHAT_CLAUDE_MAX_TURNS, resume=session.get("claudeSessionId"),
         add_dirs=roots[1:], allow_amplification=True,
-        token_file=token_file,
+        token_file=token_file, timeout_s=CHAT_CLAUDE_TIMEOUT_S,
     )
     if result.get("sessionId"):
         session["claudeSessionId"] = result["sessionId"]
