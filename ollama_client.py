@@ -19,6 +19,24 @@ def MODEL():
     return os.environ.get("LOCAL_MODEL")
 
 
+# 2026-11-06 (owner: never unload, never swap a model). Ollama restarts its runner -- a full reload of the 21 GB model -- whenever a request's num_ctx
+# differs from the loaded one, and a per-request keep_alive overrides the server's OLLAMA_KEEP_ALIVE. This client used to send num_ctx 8192 and no
+# keep_alive while every pipeline caller pins 49152 (agent-manager src/gpu-capacity.js laneNumCtx / DEFAULT_PINNED_NUM_CTX), so each chat call could
+# evict and reload the model. Mirror the pipeline: AGENT_MANAGER_LANE_NUM_CTX, else 49152; and the long-duration form of "never expire" (the string
+# "-1" is rejected by Ollama with HTTP 400; same value as agent-manager src/keep-alive.js).
+DEFAULT_PINNED_NUM_CTX = 49152
+KEEP_ALIVE = "8760h"
+
+
+def pinned_num_ctx() -> int:
+    """The num_ctx every request must carry, read per call from the same env the pipeline lanes use."""
+    try:
+        n = int(os.environ.get("AGENT_MANAGER_LANE_NUM_CTX", ""))
+    except ValueError:
+        return DEFAULT_PINNED_NUM_CTX
+    return n if n > 0 else DEFAULT_PINNED_NUM_CTX
+
+
 def generate(prompt: str, think: bool = False, temperature: float = 0.4, num_predict: int = 900) -> dict:
     """POSTs to Ollama's /api/generate. Returns {"response": str, "thinking": str}."""
     body = {
@@ -26,7 +44,8 @@ def generate(prompt: str, think: bool = False, temperature: float = 0.4, num_pre
         "prompt": prompt,
         "think": think,
         "stream": False,
-        "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": 8192},
+        "keep_alive": KEEP_ALIVE,
+        "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": pinned_num_ctx()},
     }
     req = urllib.request.Request(
         f"{OLLAMA_URL}/api/generate",
