@@ -2,6 +2,15 @@
 server on loopback fed by the synthetic fixtures (no mocks of the HTTP layer).
 
 Run: python -m unittest test_agent_client -v
+
+KNOWN FRAGILITY:
+The class-level setUp in this module starts a real session_agent HTTP server
+on 127.0.0.1 (loopback). On hosts where the loopback interface is unavailable
+or restricted, every test in this file fails at setUp. This coupling to a
+live server is tracked FOR REMOVAL in Docs/ARCH_REVIEW_CANDIDATES.md
+(candidates AC-5, AC-20, AC-21); the plan is to extract the
+server-dependent tests into a dedicated integration file so this module
+no longer requires a running server.
 """
 import json
 import os

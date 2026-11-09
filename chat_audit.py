@@ -43,6 +43,78 @@ _PROHIBITIONS = (
 _TASK_WORDS = re.compile(r"\b(?:file|filed|filing|queue|queued|task|tasks|requeue|withdraw|retire)\b", re.I)
 _BACKGROUND_WORDS = re.compile(r"\b(?:background|nohup|in\s+the\s+background)\b", re.I)
 
+# Verdict vocabulary: the only values record_branch_verdict accepts.
+_VERDICT_VOCAB = frozenset({"merge", "needs-work", "discard"})
+
+
+def build_verdict_ledger(tools: list) -> dict:
+    """Build a deterministic ledger of the LAST verdict recorded per branch in this turn.
+
+    Reads the ``tools`` list produced by ``tool_log.summarize_tool_calls`` --
+    each entry is ``{name, args, ok, summary}`` plus, for
+    ``record_branch_verdict`` calls, the extra scrubbed fields
+    ``branch``, ``verdict``, ``project`` that ``summarize_tool_calls``
+    attaches from the raw core ``toolCallLog`` entry.
+
+    **Only entries with ``ok == True`` count.** A failed ``record_branch_verdict``
+    (e.g. ``{ok: False, error: 'the branch head moved; nothing was recorded'}``)
+    is skipped entirely -- it never produced a recorded verdict, so claiming
+    one in the summary would be false.
+
+    Last-wins per ``(project, branch)``: if the model recorded the same branch
+    twice in one turn, only the final value is kept. The ledger also tracks
+    how many times a branch's verdict was *changed* (number of prior
+    ``record_branch_verdict`` calls for that key before the last one).
+
+    Returns:
+        ``{
+            "counts": {"merge": N, "needs-work": N, "discard": N},
+            "branches": [(project, branch, verdict, changes), ...],
+            "total": int,
+        }``
+        ``counts`` only includes verdicts that appear in the ledger; missing
+        keys have zero count. ``branches`` is in insertion order (first
+        branch seen first); ties broken by last-wins position. ``changes`` is
+        the number of times that branch's verdict was overwritten during the
+        turn (0 if never changed).
+    """
+    counts = {}
+    # (project, branch) -> (verdict, changes_count)
+    ledger = {}
+    order = []  # track insertion order of (project, branch)
+    for entry in tools or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("name") != "record_branch_verdict":
+            continue
+        # CRITICAL: skip failed recordings. An ok=false entry never produced
+        # a recorded verdict; counting it would make the ledger lie about
+        # what the cards actually show.
+        if not entry.get("ok"):
+            continue
+        branch = entry.get("branch")
+        verdict = entry.get("verdict")
+        project = entry.get("project")
+        if not branch or not verdict or not project:
+            continue
+        if verdict not in _VERDICT_VOCAB:
+            continue
+        key = (project, branch)
+        if key in ledger:
+            _, changes = ledger[key]
+            ledger[key] = (verdict, changes + 1)
+        else:
+            ledger[key] = (verdict, 0)
+            order.append(key)
+    for k, (v, _) in ledger.items():
+        counts[v] = counts.get(v, 0) + 1
+    branches = [(proj, br, verd, ch) for (proj, br), (verd, ch) in [(k, ledger[k]) for k in order]]
+    return {
+        "counts": counts,
+        "branches": branches,
+        "total": len(ledger),
+    }
+
 
 def unrequested_writes(user_message: str, tools) -> list:
     """Names of the tool calls in `tools` ({name, ...} entries as tool_log stores them) that the USER's message did not ask for.
