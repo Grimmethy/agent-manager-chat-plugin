@@ -195,9 +195,9 @@ class PreemptLimiter:
 
 
 def default_generate_stream(payload):
-    """The model part is not wired in yet: the real generator replaces this one."""
-    raise NotImplementedError("the Cletus model stream is not available")
-    yield  # pragma: no cover -- makes this a generator
+    """The real model stream (cletus_model), imported when first used so this module stays free of the model client."""
+    import cletus_model
+    return (yield from cletus_model.generate_stream(payload))
 
 
 def stream_answer(payload, generate_stream):
