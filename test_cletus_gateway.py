@@ -357,9 +357,11 @@ class StreamAnswerTest(unittest.TestCase):
         with self.assertRaises(gw.Napping):
             list(gw.stream_answer({}, gen))
 
-    def test_the_default_generator_says_the_model_is_not_available(self):
-        with self.assertRaises(NotImplementedError):
-            list(gw.stream_answer({}, gw.default_generate_stream))
+    def test_the_default_generator_is_the_model_stream_and_says_napping_when_no_model_is_set(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LOCAL_MODEL", None)
+            with self.assertRaises(gw.Napping):
+                list(gw.stream_answer({}, gw.default_generate_stream))
 
 
 class RouteDefaultsTest(unittest.TestCase):
@@ -569,11 +571,12 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(self.logs, ["[cletus] model stream failed (ValueError)"])
         self.assertEqual(route.queue.enter().ahead, 0)
 
-    def test_the_default_model_stream_answers_napping(self):
+    def test_the_default_model_stream_answers_napping_when_no_model_is_set(self):
+        os.environ.pop("LOCAL_MODEL", None)
         with mock.patch.object(route, "generate_stream", gw.default_generate_stream):
             frames = self.frames(self.post())
         self.assertEqual(frames, [{"type": "error", "code": "napping"}])
-        self.assertEqual(self.logs, ["[cletus] model stream failed (NotImplementedError)"])
+        self.assertEqual(self.logs, [])
 
     def test_a_client_who_leaves_mid_answer_hands_the_turn_on(self):
         def long(payload):
