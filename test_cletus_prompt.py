@@ -120,6 +120,77 @@ class SystemMessageTests(unittest.TestCase):
         self.assertNotIn("Cap rate is income", build[0]["content"])
 
 
+class DealRulesTests(unittest.TestCase):
+    """Repair of the live-run findings: the provided cap rate, no verdicts, guidelines only from lessons, no internal words."""
+
+    def setUp(self):
+        self.text = cp.system_message()["content"]
+
+    def test_the_four_deal_rules_are_in_the_system_message_after_the_hard_rules_and_before_the_soft_ones(self):
+        for rule in cp.deal_rules:
+            self.assertIn(rule, self.text)
+        self.assertEqual(len(cp.deal_rules), 4)
+        self.assertLess(self.text.index(cp.hard_rules[-1]), self.text.index("HOW TO TALK ABOUT DEALS AND DATA:"))
+        self.assertLess(self.text.index(cp.deal_rules[-1]), self.text.index("SOFT RULES:"))
+
+    def test_the_cap_rate_is_read_as_given_and_never_computed(self):
+        rule = cp.deal_rules[0]
+        for words in ("capRate", "exactly as given", "never work one out yourself", "I don't have that", "priceBasis", "HUD rent estimate", "net of tax and operating costs"):
+            self.assertIn(words, rule)
+
+    def test_no_verdict_words_are_listed_as_never_to_be_said(self):
+        rule = cp.deal_rules[1]
+        for words in ("NO VERDICTS", "good, bad, solid, great, hot, a deal or worth buying", "buy it", "never recommend an action", "the decision is the client's", "disclaimer line"):
+            self.assertIn(words, rule)
+
+    def test_a_guideline_is_stated_only_if_a_lesson_states_it(self):
+        rule = cp.deal_rules[2]
+        for words in ("only if a lesson in the DATA block states it", "name that lesson by its title", "disclaimer line", "you do not have a guideline", "only go by what the lessons say"):
+            self.assertIn(words, rule)
+
+    def test_no_figure_is_hard_coded_as_a_guideline(self):
+        import re
+        self.assertIsNone(re.search(r"\d\s*(%|percent)", self.text))
+        self.assertIsNone(re.search(r"\bover \d|\bat least \d|\bminimum of \d", self.text))
+
+    def test_internal_words_are_forbidden_in_the_answer(self):
+        rule = cp.deal_rules[3]
+        for words in ("PLAIN WORDS ONLY", "lesson: or property: ids", "section ids", "H1 to H7", "DATA block", "system prompt", "hard rules", "Name a lesson by its title", "your screen", "the property details", "final SOURCES line"):
+            self.assertIn(words, rule)
+
+    def test_the_hard_rules_and_the_disclaimer_are_unchanged(self):
+        for rule in cp.hard_rules:
+            self.assertIn(rule, self.text)
+        self.assertEqual(len(cp.hard_rules), 7)
+        self.assertEqual(cp.disclaimer_line, DISCLAIMER)
+        self.assertIn(DISCLAIMER, self.text)
+
+    def test_the_rules_are_part_of_every_request(self):
+        messages = cp.build_messages({"question": "Is this a good deal?", "context": {"page": {"view": "x"}}})
+        self.assertEqual(messages[0]["content"], self.text)
+        self.assertIn("NO VERDICTS", messages[0]["content"])
+
+
+class MissingPartsTests(unittest.TestCase):
+    """A context with parts missing still builds a prompt (these defaults were untested)."""
+
+    def test_a_context_without_page_or_kb_builds(self):
+        block = cp.data_block({"property": {"id": "p-1", "fields": {"capRate": 9.7}}})
+        self.assertIn("PAGE: view=None", block)
+        self.assertIn("LESSON SECTIONS: none matched", block)
+        self.assertIn("- capRate: 9.7", block)
+
+    def test_a_property_without_fields_lists_none(self):
+        block = cp.data_block({"page": {"view": "x"}, "property": {"id": "p-1"}})
+        self.assertIn("PROPERTY (id p-1):", block)
+        self.assertNotIn("\n- ", block)
+
+    def test_a_payload_without_context_builds(self):
+        messages = cp.build_messages({"question": "hi"})
+        self.assertIn("PROPERTY: none is open", messages[-1]["content"])
+        self.assertTrue(messages[-1]["content"].endswith("Question: hi"))
+
+
 class BuildMessagesTests(unittest.TestCase):
     def test_shape_is_system_history_then_one_user_message(self):
         hist = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
