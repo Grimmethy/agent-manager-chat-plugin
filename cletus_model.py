@@ -17,6 +17,7 @@ import re
 import urllib.error
 import urllib.request
 
+import cletus_figures
 import cletus_gateway as gw
 import cletus_prompt
 import ollama_client
@@ -245,16 +246,11 @@ def _default_post(body):
                 yield json.loads(line)
 
 
-def generate_stream(payload, post=None):
-    model = ollama_client.MODEL()
-    if not model:
-        raise gw.Napping()
-    body = request_body(payload, model)
-    send = post or _default_post
+def _filtered(send, body):
+    """One model call through the three filters. Yields the cleaned text; RETURNS the withheld SOURCES line (or None)."""
     flt = SourcesFilter()
     ids = IdFilter()
     phrases = PhraseFilter()
-    emitted = []
     try:
         for part in send(body):
             if not isinstance(part, dict):
@@ -265,7 +261,6 @@ def generate_stream(payload, post=None):
             if text:
                 out = phrases.feed(ids.feed(flt.feed(text)))
                 if out:
-                    emitted.append(out)
                     yield out
             if part.get("done"):
                 break
@@ -275,8 +270,94 @@ def generate_stream(payload, post=None):
         raise gw.Napping() from e
     tail = phrases.feed(ids.feed(flt.finish()) + ids.finish()) + phrases.finish()
     if tail:
-        emitted.append(tail)
         yield tail
-    found = parse_sources(flt.sources_line, payload) if flt.sources_line else []
+    return flt.sources_line
+
+
+# What the guard has done since the process started: answers checked, answers asked for again, answers replaced. Counts only, no text.
+guard_stats = {"checked": 0, "retried": 0, "fallback": 0}
+
+
+def _fixed(v):
+    return "not available" if v is None else cletus_prompt.neutralise(v)
+
+
+def fallback_ranking_answer(context):
+    """The county answer built from the supplied ranking alone, used when the model twice states a figure that was not supplied."""
+    rankings = (context or {}).get("rankings") or {}
+    lines = ["According to our records, the three counties with the highest median cap rate among the counties we can rank are:"]
+    for c in rankings.get("top") or []:
+        where = cletus_prompt.neutralise(c.get("county")) + (f", {cletus_prompt.neutralise(c['state'])}" if c.get("state") else "")
+        share = c.get("mailablePct")
+        owners = ("none have an owner name we can write to (0%)" if share == 0 else f"{_fixed(share)}% have an owner name we can write to") if share is not None else "the share with an owner name is not available"
+        lines.append(f"- {where}: cap rate {_fixed(c.get('capRate'))}% over {_fixed(c.get('capRateN'))} properties; "
+                     f"{_fixed(c.get('properties'))} multifamily properties in the county; {owners}.")
+    lines.append("The Area Screener and Market Reports let you change the filters.")
+    lines.append(cletus_prompt.disclaimer_line)
+    return "\n".join(lines)
+
+
+def _ask_again(body, bad):
+    """The same request with one corrective line added to the last user message, naming the figure that was not supplied."""
+    messages = [dict(m) for m in body["messages"]]
+    messages[-1]["content"] += (f"\n\n(Your last answer stated {bad[0]}, which is not in the COUNTY RANKING. "
+                                "Answer again using only the figures written in the COUNTY RANKING.)")
+    return dict(body, messages=messages)
+
+
+def generate_stream(payload, post=None):
+    model = ollama_client.MODEL()
+    if not model:
+        raise gw.Napping()
+    body = request_body(payload, model)
+    send = post or _default_post
+    context = payload.get("context") or {}
+    if (context.get("rankings") or {}).get("top"):
+        return (yield from _guarded(payload, body, send, context))
+    emitted = []
+    gen = _filtered(send, body)
+    while True:
+        try:
+            out = next(gen)
+        except StopIteration as stop:
+            sources_line = stop.value
+            break
+        emitted.append(out)
+        yield out
     text = "".join(emitted)
+    found = parse_sources(sources_line, payload) if sources_line else []
+    return (found or infer_sources(text, payload)) + county_sources(text, payload)
+
+
+def _collect(send, body):
+    """Run one filtered model call to the end without streaming it: (text, sources line)."""
+    parts = []
+    gen = _filtered(send, body)
+    while True:
+        try:
+            parts.append(next(gen))
+        except StopIteration as stop:
+            return "".join(parts), stop.value
+
+
+def _guarded(payload, body, send, context):
+    """A county-ranking answer is held back until its figures are checked against the ranking, so a figure the model made up is never shown.
+
+    Every percentage and every count of properties must be one the ranking, a lesson section or a property field supplies. If one is not, the
+    model is asked once more with the figure named; if the second answer is also wrong the answer is built from the ranking itself. The
+    answer is then sent in one piece. Nothing here records the question or the answer.
+    """
+    guard_stats["checked"] += 1
+    text, sources_line = _collect(send, body)
+    bad = cletus_figures.unsupplied_figures(text, context)
+    if bad:
+        guard_stats["retried"] += 1
+        text, sources_line = _collect(send, _ask_again(body, bad))
+        bad = cletus_figures.unsupplied_figures(text, context)
+    if bad:
+        guard_stats["fallback"] += 1
+        text, sources_line = fallback_ranking_answer(context), None
+    if text:
+        yield text
+    found = parse_sources(sources_line, payload) if sources_line else []
     return (found or infer_sources(text, payload)) + county_sources(text, payload)
