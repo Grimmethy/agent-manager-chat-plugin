@@ -19,6 +19,21 @@ disclaimer_line = "Public-record data, verify independently. Not legal, tax or i
 history_cap = 10
 history_content_cap = 2000
 
+FORBIDDEN_WORDS = [
+    "data block",
+    "for that question only",
+    "I can't say whether that is allowed. Check the do-not-call and calling-hour rules where you call, and ask a licensed attorney.",
+]
+
+
+def _forbidden_check(text):
+    """Return the first forbidden phrase found in text, or None."""
+    for phrase in FORBIDDEN_WORDS:
+        if phrase in text:
+            return phrase
+    return None
+
+
 hard_rules = [
     "H1. Never state or guess data that is not in the DATA block: nothing about other clients, nothing that is not on the client's screen.",
     "H2. Never give legal, tax or investment advice as advice.",
