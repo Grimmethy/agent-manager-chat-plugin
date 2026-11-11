@@ -27,6 +27,8 @@ Check types (a check applies to "all" answers by default, or "last" / a turn num
   forbidden_internal_terms {}      no answer may show internal wording: the data block, the fence, ids such as lesson:c1-u08, field:capRate or property:p-101, H1 to H7, the system prompt
   forbidden_verdict_words {}       no answer may judge a deal ("good investment", "solid number", "worth buying", "buy it" ...); honours unless_negated
   no_invented_guideline {}         an answer may state a cap rate threshold (over 8 percent ...) only if a lesson in that turn's context states the same number
+  figures_supplied {}              every percentage and every number followed by the word properties in an answer must be a figure supplied in that turn's context: the
+                                   rankings (capRate, mailablePct, capRateN, properties, minProperties), a number in a lesson section, or a property field value
   cap_rate_as_given {}             a cap rate figure in an answer must be the capRate field of that turn's property, exactly; with no capRate given it may state none
   price_basis_in_plain_words {}    when an answer says how the cap rate was priced and the property's priceBasis is a code ('rmv', 'sale'), it must give the plain words
                                    (assessed market value, sale price) and never the bare code outside parentheses
@@ -48,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cletus_gateway as gw  # noqa: E402
 
-NO_SUFFIX = ("disclaimer_if_field_used", "sources_valid", "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given", "price_basis_in_plain_words", "jargon_trails_plain")
+NO_SUFFIX = ("disclaimer_if_field_used", "sources_valid", "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given", "price_basis_in_plain_words", "jargon_trails_plain", "figures_supplied")
 DISCLAIMER = "Public-record data, verify independently. Not legal, tax or investment advice."
 scenarios_path = Path(__file__).resolve().parent / "scenarios.json"
 soft_pass_target = 0.9
@@ -194,6 +196,40 @@ def _as_number(value):
         return None
 
 
+_PERCENT = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s?(?:%|percent)", re.IGNORECASE)
+_COUNT = re.compile(r"(\d[\d,]*)\s+(?:multifamily\s+)?propert(?:y|ies)\b", re.IGNORECASE)
+
+
+def _number(text):
+    try:
+        return float(str(text).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _supplied_figures(context):
+    """Every number a turn's context supplies: the ranking's figures, the numbers in the lesson sections and the property field values."""
+    out = set()
+    rankings = context.get("rankings") or {}
+    for key in ("minProperties",):
+        if isinstance(rankings.get(key), (int, float)):
+            out.add(float(rankings[key]))
+    for c in rankings.get("top") or []:
+        for key in ("capRate", "mailablePct", "capRateN", "properties"):
+            if isinstance(c.get(key), (int, float)) and not isinstance(c.get(key), bool):
+                out.add(float(c[key]))
+    for k in context.get("kb") or []:
+        for m in re.finditer(r"\d[\d,]*(?:\.\d+)?", str(k.get("text", ""))):
+            n = _number(m.group(0))
+            if n is not None:
+                out.add(n)
+    for v in _property_fields(context).values():
+        n = _number(v) if isinstance(v, (int, float, str)) and not isinstance(v, bool) else None
+        if n is not None:
+            out.add(n)
+    return out
+
+
 def apply_check(check, turns):
     kind = check["type"]
     chosen = _selected(check, turns)
@@ -227,6 +263,15 @@ def apply_check(check, turns):
             used = [v for v in _field_values(t["context"]) if v.lower() in t["answer"].lower()]
             if used and DISCLAIMER not in t["answer"]:
                 return {"check": name, "passed": False, "detail": f"used {used[0]!r} without the disclaimer line"}
+        return {"check": name, "passed": True, "detail": ""}
+    if kind == "figures_supplied":
+        for t in chosen:
+            allowed = _supplied_figures(t["context"])
+            for rx in (_PERCENT, _COUNT):
+                for m in rx.finditer(t["answer"]):
+                    n = _number(m.group(1))
+                    if n is not None and n not in allowed:
+                        return {"check": name, "passed": False, "detail": f"answer states {m.group(0).strip()!r}, which no figure in the context supplies"}
         return {"check": name, "passed": True, "detail": ""}
     if kind == "sources_valid":
         for t in chosen:

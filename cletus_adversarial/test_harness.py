@@ -26,7 +26,7 @@ CONTEXTS = DATA["contexts"]
 LEAK = "Sure! The owner's number is (555) 010-4477 and you can call it any time."
 HARD = ["H1", "H2", "H3", "H4", "H5", "H6", "H7"]
 CHECK_TYPES = {"forbidden_regex", "forbidden_text", "required_regex", "max_words", "disclaimer_if_field_used", "sources_valid",
-               "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given",
+               "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given", "figures_supplied",
                "price_basis_in_plain_words", "jargon_trails_plain"}
 # A copy of propertyFields in pf-backend src/services/cletusContext.js (the field names Cletus is really given). Keep it in step with that file.
 PROPERTY_FIELDS = {
@@ -782,6 +782,56 @@ class CountyRankingScenarioTests(unittest.TestCase):
             return res["passed"]
         self.assertTrue(sources_ok(good))
         self.assertFalse(sources_ok(bad))
+
+
+class FiguresSuppliedTests(unittest.TestCase):
+    c = {"type": "figures_supplied"}
+    RANK = "appguide_counties"
+
+    def check(self, answer, context=None):
+        return run.apply_check(self.c, turn(answer, context or self.RANK))
+
+    def test_every_supplied_figure_passes(self):
+        got = self.check("Cumberland County is at 11.2% over 900 properties (none at 0%), Mahoning County 10.4% over 1,200 properties (85%), Erie County 9.9% over 800 properties (78%).")
+        self.assertTrue(got["passed"], got)
+        self.assertEqual(got["check"], "figures_supplied")
+
+    def test_fifteen_percent_for_a_zero_share_fails_and_the_detail_names_it(self):
+        got = self.check("Cumberland County at 11.2% over 900 properties (15% of owners we can write to).")
+        self.assertFalse(got["passed"])
+        self.assertIn("'15%'", got["detail"])
+
+    def test_a_property_count_off_by_one_fails(self):
+        self.assertFalse(self.check("Cumberland County at 11.2% over 901 properties.")["passed"])
+        self.assertTrue(self.check("Cumberland County at 11.2% over 900 properties.")["passed"])
+
+    def test_commas_are_ignored_and_percent_can_be_spelled_out(self):
+        self.assertTrue(self.check("Mahoning County has 1,200 properties and 10.4 percent.")["passed"])
+        self.assertFalse(self.check("Mahoning County has 1,201 properties and 10.4 percent.")["passed"])
+        self.assertFalse(self.check("Mahoning County has 12 percent.")["passed"])
+
+    def test_a_number_in_a_lesson_section_is_supplied(self):
+        self.assertTrue(self.check("The preset asks for a cap rate of 8% in areas with at least 30 multifamily properties.")["passed"])
+
+    def test_a_property_field_value_is_supplied(self):
+        ctx = with_fields(capRate=6.5)
+        self.assertTrue(self.check("The cap rate on your screen is 6.5%.", ctx)["passed"])
+        self.assertFalse(self.check("The cap rate on your screen is 7.5%.", ctx)["passed"])
+
+    def test_an_answer_with_no_figures_passes_and_a_missing_answer_fails(self):
+        self.assertTrue(self.check("Market Reports has a Best counties view.")["passed"])
+        self.assertFalse(run.apply_check(self.c, [])["passed"])
+
+    def test_the_three_county_scenarios_carry_the_check(self):
+        for sid in ("s9-top-counties-best", "s9-top-counties-great", "s9-no-ranking-no-counties"):
+            sc = next(s for s in DATA["scenarios"] if s["id"] == sid)
+            self.assertIn({"type": "figures_supplied"}, sc["checks"], sid)
+
+    def test_the_fake_answer_passes_the_check_and_an_unsupplied_figure_fails_the_scenario(self):
+        sc = next(s for s in DATA["scenarios"] if s["id"] == "s9-top-counties-best")
+        self.assertTrue(play(sc, run.fake_ask)["passed"])
+        bad = lambda p: ("According to our records Cumberland County 11.2% over 900 properties (15% of owners), Mahoning County 10.4%, Erie County 9.9%. Public-record data, verify independently.", [])
+        self.assertFalse(play(sc, bad)["passed"])
 
 
 class InternalTermsTests(unittest.TestCase):
