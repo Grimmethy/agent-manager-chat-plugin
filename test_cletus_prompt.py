@@ -465,6 +465,70 @@ class PhraseFilterTests(unittest.TestCase):
         self.assertEqual(out, "None of the lessons in the information I have cover it.\n")
 
 
+class InferSourcesTests(unittest.TestCase):
+    PHONE = ("When a property has no phone on file, the Request owner contact research button appears in the details panel. Click it and write "
+             "a purpose of at least twenty characters, tick the lawful research box, and send it. An administrator reviews each request and may "
+             "search public records for a possible contact lead. A result is not guaranteed and may be old, wrong, or belong to a different person.")
+    KB = [
+        {"lessonId": "ua-u04", "sectionId": "ua-u04-s02", "title": "How to ask for an owner phone number",
+         "text": "Request owner contact research button appears in the details panel when a property has no phone on file. Write a purpose of at least "
+                 "twenty characters and tick the lawful research box. An administrator reviews each request and may search public records for a "
+                 "possible contact lead. A result is not guaranteed. It may be old, wrong, or belong to a different person."},
+        {"lessonId": "ua-u01", "sectionId": "ua-u01-s01", "title": "Where should I look",
+         "text": "The Area Screener tab filters ZIP codes or counties by cap rate, median value, rent per unit and parcels."},
+    ]
+
+    def payload(self, kb=None):
+        return {"question": "q", "history": [], "context": {"page": {"view": "search"}, "property": None, "kb": kb if kb is not None else self.KB}}
+
+    def test_an_answer_that_draws_on_a_lesson_gets_that_lesson_and_no_other(self):
+        self.assertEqual(cm.infer_sources(self.PHONE, self.payload()), [{"kind": "lesson", "lessonId": "ua-u04", "sectionId": "ua-u04-s02"}])
+
+    def test_an_answer_that_used_no_lesson_gets_none(self):
+        for text in ("I can't say whether that is allowed. Check the do-not-call and calling-hour rules where you call, and ask a licensed attorney.",
+                     "Hello! What would you like to know about Property Forager today?", ""):
+            self.assertEqual(cm.infer_sources(text, self.payload()), [], text)
+
+    def test_only_sections_the_payload_supplied_can_be_named(self):
+        self.assertEqual(cm.infer_sources(self.PHONE, self.payload(kb=[])), [])
+        self.assertEqual(cm.infer_sources(self.PHONE, self.payload(kb=self.KB[1:])), [])
+
+    def test_the_best_two_sections_at_most_are_returned_best_first(self):
+        kb = self.KB + [dict(self.KB[0], sectionId="ua-u04-s09", text=self.PHONE),
+                        dict(self.KB[0], sectionId="ua-u04-s08")]
+        got = [s["sectionId"] for s in cm.infer_sources(self.PHONE, self.payload(kb=kb))]
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[0], "ua-u04-s09")
+
+    def test_a_section_below_either_threshold_is_not_named(self):
+        few = [dict(self.KB[0], text="Request owner contact research button appears in the details panel.")]
+        self.assertEqual(cm.infer_sources(self.PHONE, self.payload(kb=few)), [])
+        self.assertEqual(cm.infer_sources("Request owner contact research button appears in the details panel.", self.payload()), [])  # all its words match, but too few of them
+        long_answer = self.PHONE + " " + " ".join("filler%s" % chr(97 + i % 26) * 2 + chr(98 + i // 26) * 3 for i in range(200))
+        self.assertEqual(cm.infer_sources(long_answer, self.payload()), [])
+
+    def test_generate_stream_infers_sources_when_the_model_writes_none_and_keeps_the_models_when_it_does(self):
+        def run_it(parts):
+            def post(body):
+                for piece in parts:
+                    yield {"message": {"content": piece}}
+                yield {"done": True}
+            with mock.patch.object(ollama_client, "MODEL", lambda: "m"):
+                gen = cm.generate_stream(self.payload(), post=post)
+                chunks = []
+                try:
+                    while True:
+                        chunks.append(next(gen))
+                except StopIteration as stop:
+                    return "".join(chunks), stop.value
+        text, found = run_it([self.PHONE])
+        self.assertEqual(found, [{"kind": "lesson", "lessonId": "ua-u04", "sectionId": "ua-u04-s02"}])
+        text, found = run_it([self.PHONE + "\nSOURCES: lesson:ua-u01-s01"])
+        self.assertEqual(found, [{"kind": "lesson", "lessonId": "ua-u01", "sectionId": "ua-u01-s01"}])
+        text, found = run_it(["Hello there, nothing to cite."])
+        self.assertEqual(found, [])
+
+
 class SourcesFilterTests(unittest.TestCase):
     def test_plain_text_passes_through(self):
         f = cm.SourcesFilter()

@@ -165,6 +165,37 @@ def parse_sources(line, payload):
     return out
 
 
+_infer_stop = frozenset("that this with from your have will what when where which their there about into than then them they were been being more most some such only also just like make made does done each other these those would could should over under after before while because".split())
+infer_min_shared = 15      # distinct words an answer shares with a lesson section before it counts as drawn from it
+infer_min_share = 0.25     # and the share of the answer's distinct words that must be in the section
+infer_max = 2
+
+
+def _distinct_words(text):
+    return {w for w in re.findall(r"[a-z]{4,}", str(text).lower()) if w not in _infer_stop}
+
+
+def infer_sources(answer, payload):
+    """Lesson sources worked out from the answer text, for an answer whose SOURCES: line is missing or empty.
+
+    In a longer chat the earlier answers in the history carry no SOURCES line, so the model copied that shape and wrote none (0 of 4 with a
+    one-turn history, measured live 2026-11-11), and the one-click lesson link under the answer disappeared. A lesson section counts as used
+    when the answer shares at least infer_min_shared distinct words with it and those are at least infer_min_share of the answer's words;
+    the best infer_max sections are returned. An answer that used no lesson (a decline, a greeting) gets none. Only sections the payload
+    supplied can be named, so a source can never be invented.
+    """
+    words = _distinct_words(answer)
+    if not words:
+        return []
+    scored = []
+    for item in ((payload.get("context") or {}).get("kb") or []):
+        shared = len(words & _distinct_words(item.get("text", "")))
+        if shared >= infer_min_shared and shared / len(words) >= infer_min_share:
+            scored.append((shared, item))
+    scored.sort(key=lambda x: -x[0])
+    return [{"kind": "lesson", "lessonId": i["lessonId"], "sectionId": i["sectionId"]} for _, i in scored[:infer_max]]
+
+
 def request_body(payload, model):
     return {
         "model": model,
@@ -200,6 +231,7 @@ def generate_stream(payload, post=None):
     flt = SourcesFilter()
     ids = IdFilter()
     phrases = PhraseFilter()
+    emitted = []
     try:
         for part in send(body):
             if not isinstance(part, dict):
@@ -210,6 +242,7 @@ def generate_stream(payload, post=None):
             if text:
                 out = phrases.feed(ids.feed(flt.feed(text)))
                 if out:
+                    emitted.append(out)
                     yield out
             if part.get("done"):
                 break
@@ -219,5 +252,7 @@ def generate_stream(payload, post=None):
         raise gw.Napping() from e
     tail = phrases.feed(ids.feed(flt.finish()) + ids.finish()) + phrases.finish()
     if tail:
+        emitted.append(tail)
         yield tail
-    return parse_sources(flt.sources_line, payload) if flt.sources_line else []
+    found = parse_sources(flt.sources_line, payload) if flt.sources_line else []
+    return found or infer_sources("".join(emitted), payload)
