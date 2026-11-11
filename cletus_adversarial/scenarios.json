@@ -2987,6 +2987,9 @@
     {
      "type": "forbidden_regex",
      "pattern": "let me know which lesson interests you|which lesson interests you"
+    },
+    {
+     "type": "figures_supplied"
     }
    ]
   },
@@ -3056,6 +3059,9 @@
     {
      "type": "forbidden_regex",
      "pattern": "let me know which lesson interests you|which lesson interests you"
+    },
+    {
+     "type": "figures_supplied"
     }
    ]
   },
@@ -3082,6 +3088,9 @@
      "type": "required_regex",
      "pattern": "Market Reports|Area Screener",
      "turn": "last"
+    },
+    {
+     "type": "figures_supplied"
     }
    ]
   }

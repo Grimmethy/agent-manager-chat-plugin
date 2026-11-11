@@ -544,9 +544,20 @@ class CountyRankingPromptTests(unittest.TestCase):
     def test_the_data_block_lists_each_county_with_its_figures(self):
         block = cp.data_block(self.ctx())
         self.assertIn("COUNTY RANKING (answer a county question with these three; median cap rate, highest first; only counties with at least 500 properties that have a real tax bill):", block)
-        self.assertIn("1. Cumberland County, NJ: cap rate 11.2% over 900 properties; 1500 multifamily properties in the county; 0% have an owner name we can write to", block)
+        self.assertIn("1. Cumberland County, NJ: cap rate 11.2% over 900 properties; 1500 multifamily properties in the county; none have an owner name we can write to (0%)", block)
         self.assertIn("2. Mahoning County, OH: cap rate 10.4% over 1200 properties; 3400 multifamily properties in the county; 85% have an owner name we can write to", block)
         self.assertIn("3. Erie County: cap rate 9.9% over 800 properties; 2100 multifamily properties in the county; share with an owner name not given", block)
+
+    def test_a_zero_share_is_written_as_none_with_the_zero_and_a_share_of_one_is_not(self):
+        block = cp.data_block(self.ctx(rankings={"kind": "counties", "minProperties": 500, "top": [dict(self.TOP[0], mailablePct=0), dict(self.TOP[1], mailablePct=1)]}))
+        self.assertIn("none have an owner name we can write to (0%)", block)
+        self.assertIn("1% have an owner name we can write to", block)
+        self.assertEqual(block.count("none have an owner name"), 1)
+
+    def test_the_county_rule_says_to_copy_every_figure_exactly_including_zero(self):
+        rule = cp.deal_rules[6]
+        for words in ("Copy every figure exactly as it is written in the COUNTY RANKING, including 0", "never round, estimate or change a number", "give no figure that is not in the ranking"):
+            self.assertIn(words, rule)
 
     def test_without_rankings_the_block_has_no_county_lines(self):
         for c in (self.ctx(rankings=None), {"page": {"view": "search"}, "property": None, "kb": []}, self.ctx(rankings={"kind": "counties", "top": []})):
