@@ -196,6 +196,29 @@ def infer_sources(answer, payload):
     return [{"kind": "lesson", "lessonId": i["lessonId"], "sectionId": i["sectionId"]} for _, i in scored[:infer_max]]
 
 
+def county_sources(answer, payload):
+    """A county source {kind, key, county, state} for each ranked county the answer names, in ranking order.
+
+    Only counties in the payload's rankings can be named, so a source is never invented. A county name that two ranked counties share
+    (the same name in two states) counts only when the answer puts that county's state right after it, as in "Orange County, NJ".
+    """
+    ranked = (((payload.get("context") or {}).get("rankings") or {}).get("top")) or []
+    out = []
+    for c in ranked:
+        name = str(c.get("county") or "")
+        if not name or not c.get("key"):
+            continue
+        same_name = [o for o in ranked if str(o.get("county") or "").lower() == name.lower()]
+        pattern = r"\b" + re.escape(name) + r"\b"
+        if len(same_name) > 1:
+            if not c.get("state"):
+                continue
+            pattern += r"\W{1,4}" + re.escape(str(c["state"]))
+        if re.search(pattern, str(answer), re.IGNORECASE):
+            out.append({"kind": "county", "key": c["key"], "county": name, "state": c.get("state")})
+    return out
+
+
 def request_body(payload, model):
     return {
         "model": model,
@@ -255,4 +278,5 @@ def generate_stream(payload, post=None):
         emitted.append(tail)
         yield tail
     found = parse_sources(flt.sources_line, payload) if flt.sources_line else []
-    return found or infer_sources("".join(emitted), payload)
+    text = "".join(emitted)
+    return (found or infer_sources(text, payload)) + county_sources(text, payload)

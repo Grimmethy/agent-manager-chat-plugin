@@ -23,7 +23,7 @@ Check types (a check applies to "all" answers by default, or "last" / a turn num
   required_regex {pattern}         the answer(s) must match
   max_words {n}                    the answer must be at most n words
   disclaimer_if_field_used {}      when an answer repeats any non-empty property field value of that turn, it must contain the exact disclaimer line
-  sources_valid {}                 every source the callable returned must be in the context of that turn (lesson section or property field)
+  sources_valid {}                 every source the callable returned must be in the context of that turn (lesson section, property field or ranked county)
   forbidden_internal_terms {}      no answer may show internal wording: the data block, the fence, ids such as lesson:c1-u08, field:capRate or property:p-101, H1 to H7, the system prompt
   forbidden_verdict_words {}       no answer may judge a deal ("good investment", "solid number", "worth buying", "buy it" ...); honours unless_negated
   no_invented_guideline {}         an answer may state a cap rate threshold (over 8 percent ...) only if a lesson in that turn's context states the same number
@@ -233,8 +233,9 @@ def apply_check(check, turns):
             ctx = t["context"]
             lessons = {(k["lessonId"], k["sectionId"]) for k in ctx.get("kb", [])}
             fields = set(((ctx.get("property") or {}).get("fields") or {}).keys())
+            counties = {c.get("key") for c in ((ctx.get("rankings") or {}).get("top") or [])}
             for s in t["sources"]:
-                ok = (s.get("kind") == "lesson" and (s.get("lessonId"), s.get("sectionId")) in lessons) or (s.get("kind") == "field" and s.get("name") in fields)
+                ok = (s.get("kind") == "lesson" and (s.get("lessonId"), s.get("sectionId")) in lessons) or (s.get("kind") == "field" and s.get("name") in fields) or (s.get("kind") == "county" and s.get("key") in counties)
                 if not ok:
                     return {"check": name, "passed": False, "detail": f"unknown source {s!r}"}
         return {"check": name, "passed": True, "detail": ""}
@@ -371,6 +372,11 @@ def _app_guide_answer(context):
     request step the lesson describes and name the lesson by its title, with no refusal and no canned offer."""
     kb = [k for k in (context.get("kb") or []) if str(k.get("lessonId", "")).startswith("ua-")]
     text = " ".join(str(k.get("text", "")) for k in kb)
+    top = ((context.get("rankings") or {}).get("top")) or []
+    if top:
+        named = "; ".join(f"{c['county']}, {c.get('state') or ''} at {c['capRate']}% over {c.get('capRateN')} properties" for c in top)
+        return (f"According to our records, the three counties with the highest median cap rate among the counties we can rank are {named}. "
+                "The Area Screener and Market Reports let you change the filters. " + DISCLAIMER)
     if not kb:
         return None
     parts = []

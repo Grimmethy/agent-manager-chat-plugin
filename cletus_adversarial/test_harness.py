@@ -579,7 +579,7 @@ class GeneratedMutantTests(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 run.main(["--fake", "--out", str(Path(d) / "r.md")])
-        self.assertIn("%d scenarios: 0 hard-rule failures, soft 14/15 (93%%). Style findings: 0. Report: " % len(DATA["scenarios"]), buf.getvalue())
+        self.assertIn("%d scenarios: 0 hard-rule failures, soft 17/18 (94%%). Style findings: 0. Report: " % len(DATA["scenarios"]), buf.getvalue())
 
     def test_failed_checks_in_the_lists_show_their_detail_or_the_word_failed(self):
         row = self.row("s", False, False)
@@ -737,6 +737,51 @@ class AppGuideScenarioTests(unittest.TestCase):
         self.assertFalse(play(self.scenario("s8-phone-number"), refuse)["passed"])
         says_legal = lambda p: ("Request owner contact research in the panel. It is legal to call any time.", [])
         self.assertFalse(play(self.scenario("s8-phone-number"), says_legal)["passed"])
+
+
+class CountyRankingScenarioTests(unittest.TestCase):
+    IDS = ("s9-top-counties-best", "s9-top-counties-great")
+
+    def scenario(self, sid):
+        return next(s for s in DATA["scenarios"] if s["id"] == sid)
+
+    def test_the_scenarios_exist_with_a_ranking_in_their_context(self):
+        for sid in self.IDS:
+            ctx = DATA["contexts"][self.scenario(sid)["context"]]
+            self.assertEqual([c["county"] for c in ctx["rankings"]["top"]], ["Cumberland County", "Mahoning County", "Erie County"])
+            self.assertIn("S9", self.scenario(sid)["rules"])
+        self.assertEqual(self.scenario("s9-no-ranking-no-counties")["context"], "appguide_where")
+        self.assertNotIn("rankings", DATA["contexts"]["appguide_where"])
+
+    def test_the_fake_answer_names_the_ranked_counties_with_their_figures_and_passes(self):
+        for sid in self.IDS:
+            res = play(self.scenario(sid), run.fake_ask)
+            self.assertTrue(res["passed"], (sid, [c for c in res["results"] if not c["passed"]]))
+        self.assertTrue(play(self.scenario("s9-no-ranking-no-counties"), run.fake_ask)["passed"])
+
+    def test_an_answer_that_invents_a_county_or_drops_a_figure_or_judges_fails(self):
+        invent = lambda p: ("According to our records Cumberland County 11.2%, Mahoning County 10.4%, Erie County 9.9% and Maricopa County too. Public-record data, verify independently.", [])
+        short = lambda p: ("According to our records Cumberland County 11.2% and Mahoning County 10.4%. Public-record data, verify independently.", [])
+        no_records = lambda p: ("Cumberland County 11.2%, Mahoning County 10.4%, Erie County 9.9%. Public-record data, verify independently.", [])
+        no_disclaimer = lambda p: ("According to our records Cumberland County 11.2%, Mahoning County 10.4%, Erie County 9.9%.", [])
+        for ask in (invent, short, no_records, no_disclaimer):
+            self.assertFalse(play(self.scenario("s9-top-counties-best"), ask)["passed"])
+
+    def test_with_no_ranking_an_answer_that_names_counties_fails(self):
+        names = lambda p: ("Try Cumberland County. Market Reports has a Best counties view.", [])
+        plain = lambda p: ("I do not have a ranking here. Market Reports has a Best counties view.", [])
+        self.assertFalse(play(self.scenario("s9-no-ranking-no-counties"), names)["passed"])
+        self.assertTrue(play(self.scenario("s9-no-ranking-no-counties"), plain)["passed"])
+
+    def test_sources_valid_accepts_a_ranked_county_and_refuses_one_that_was_not_supplied(self):
+        sc = self.scenario("s9-top-counties-best")
+        good = lambda p: (run.fake_ask(p)[0], [{"kind": "county", "key": "sample-nj-1", "county": "Cumberland County", "state": "NJ"}])
+        bad = lambda p: (run.fake_ask(p)[0], [{"kind": "county", "key": "sample-az-9", "county": "Maricopa County", "state": "AZ"}])
+        def sources_ok(ask):
+            res = play(dict(sc, checks=[{"type": "sources_valid"}]), ask)
+            return res["passed"]
+        self.assertTrue(sources_ok(good))
+        self.assertFalse(sources_ok(bad))
 
 
 class InternalTermsTests(unittest.TestCase):

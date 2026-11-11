@@ -56,6 +56,7 @@ def build_deal_rules():
         "PLAIN WORDS ONLY: never write ids or internal terms in the answer: not lesson: or property: ids, not section ids, not H1 to H7, and never the words \"DATA block\", \"system prompt\" or \"hard rules\". Name a lesson by its title, say \"your screen\" or \"the property details\" for the data, and quote field values in words. The only place ids may appear is the final SOURCES line.",
         "PLAIN WORDS FOR JARGON: explain real estate terms in plain words first and give the jargon trailing in parentheses, for example \"the money left over each month after costs (cash flow)\". After the first time in an answer you may use either.",
         "WHEN YOU CANNOT ANSWER: say plainly, in one sentence, what you cannot answer. If one lesson in the DATA block fits the question, name it by its title and say what it covers; if none fits, say so and do not offer other lessons. Never end with an offer such as \"let me know which lesson interests you\", and never offer a lesson that does not fit the question.",
+        "COUNTY RANKINGS: when the DATA block has a COUNTY RANKING and the question is about counties or where to look, start your answer with \"According to our records, the three counties with the highest median cap rate among the counties we can rank are\" and list all three, each with its cap rate and its number of properties exactly as given and the share of its owners we can write to. Do not refuse and do not start by saying you cannot name a best county: the figures answer the question. Never call one of them the best, good or worth buying, name no county that is not in the ranking, and add the disclaimer line. Then say that the Area Screener and Market Reports let the person change the filters. When there is no COUNTY RANKING, name no county and say that Market Reports has a Best counties view.",
     ]
 
 
@@ -70,8 +71,9 @@ voice = (
 scope = (
     "WHAT YOU HELP WITH: explaining the lessons, how to use the app and its tabs, what each field on a listing means, walking through deal "
     "maths, and suggesting next steps. HOW TO FIND WHERE TO LOOK and HOW TO GET AN OWNER'S PHONE NUMBER are app questions: answer them from "
-    "the lessons in the DATA block (the Area Screener, searching, the request for owner contact research) and never refuse them. You do not "
-    "recommend a county or a place as the best one; you explain the tool that filters and ranks areas.\n"
+    "the lessons in the DATA block (the Area Screener, searching, the request for owner contact research) and never refuse them. When the DATA block has a COUNTY RANKING "
+    "you list its top counties as the figures say (never calling one the best); otherwise you explain the Area Screener and the Best counties view "
+    "in Market Reports.\n"
     "WHAT YOU DO NOT DO: you do not give legal, tax or investment advice. You do not say whether calling or contacting an owner is legal or "
     "compliant. Decline ONLY that legality question, in your own words and in one or two sentences, for example: \"I can't say whether that is "
     "allowed. Check the do-not-call and calling-hour rules where you call, and ask a licensed attorney.\" You do not run practice calls (a separate practice-call "
@@ -122,6 +124,16 @@ def data_block(context):
             lines.append(f"- {neutralise(name)}: {_value(value)}")
     else:
         lines.append("PROPERTY: none is open")
+    rankings = context.get("rankings")
+    if rankings and rankings.get("top"):
+        floor = rankings.get("minProperties")
+        lines.append("COUNTY RANKING (answer a county question with these three; median cap rate, highest first" + (f"; only counties with at least {_value(floor)} properties that have a real tax bill" if floor is not None else "") + "):")
+        for i, c in enumerate(rankings["top"], 1):
+            share = c.get("mailablePct")
+            where = neutralise(c.get("county")) + (f", {neutralise(c['state'])}" if c.get("state") else "")
+            lines.append(f"{i}. {where}: cap rate {_value(c.get('capRate'))}% over {_value(c.get('capRateN'))} properties; "
+                         f"{_value(c.get('properties'))} multifamily properties in the county; "
+                         + (f"{_value(share)}% have an owner name we can write to" if share is not None else "share with an owner name not given"))
     kb = context.get("kb") or []
     if kb:
         lines.append("LESSON SECTIONS:")
@@ -134,10 +146,18 @@ def data_block(context):
     return "\n".join(lines)
 
 
+# With earlier answers in the history the model sometimes skipped the ranking (1 of 3 runs, measured live 2026-11-11), so a ranked question
+# ends with one line pointing back at it.
+ranking_reminder = "\n\n(If this question is about counties or where to look, answer it from the COUNTY RANKING above.)"
+
+
 def build_messages(payload):
     history = [
         {"role": m["role"], "content": neutralise(m["content"])[:history_content_cap]}
         for m in (payload.get("history") or [])[-history_cap:]
     ]
-    final = data_block(payload.get("context") or {}) + "\n\nQuestion: " + neutralise(payload["question"])
+    context = payload.get("context") or {}
+    final = data_block(context) + "\n\nQuestion: " + neutralise(payload["question"])
+    if (context.get("rankings") or {}).get("top"):
+        final += ranking_reminder
     return [system_message()] + history + [{"role": "user", "content": final}]

@@ -157,6 +157,56 @@ class PayloadTest(unittest.TestCase):
             self.check(body, ok=False)
 
 
+class RankingsPayloadTest(unittest.TestCase):
+    TOP = [{"key": "k1", "county": "Cumberland County", "state": "NJ", "capRate": 11.2, "capRateN": 900, "properties": 1500, "mailablePct": 0}]
+
+    def body(self, rankings):
+        b = good_body()
+        b["context"] = dict(b["context"], rankings=rankings)
+        return b
+
+    def refused(self, rankings):
+        cleaned, why = gw.validate_payload(self.body(rankings))
+        self.assertIsNone(cleaned)
+        return why
+
+    def test_a_good_ranking_is_kept_in_the_cleaned_context(self):
+        r = {"kind": "counties", "minProperties": 500, "top": self.TOP}
+        cleaned, why = gw.validate_payload(self.body(r))
+        self.assertIsNone(why)
+        self.assertEqual(cleaned["context"]["rankings"], r)
+
+    def test_a_body_without_rankings_has_no_rankings_key(self):
+        cleaned, _ = gw.validate_payload(good_body())
+        self.assertNotIn("rankings", cleaned["context"])
+
+    def test_nulls_are_allowed_where_the_data_can_be_missing(self):
+        top = [dict(self.TOP[0], state=None, capRateN=None, properties=None, mailablePct=None)]
+        cleaned, why = gw.validate_payload(self.body({"kind": "counties", "minProperties": None, "top": top}))
+        self.assertIsNone(why)
+        self.assertIsNotNone(cleaned)
+
+    def test_a_malformed_ranking_is_refused_with_a_reason(self):
+        ok = {"kind": "counties", "minProperties": 500}
+        cases = [
+            ("not an object", "x"), ("wrong kind", dict(ok, kind="states", top=self.TOP)), ("no top", dict(ok)),
+            ("empty top", dict(ok, top=[])), ("four counties", dict(ok, top=self.TOP * 4)), ("top not a list", dict(ok, top="x")),
+            ("item not an object", dict(ok, top=["x"])), ("no key", dict(ok, top=[dict(self.TOP[0], key="")])),
+            ("key too long", dict(ok, top=[dict(self.TOP[0], key="k" * 65)])), ("no county name", dict(ok, top=[dict(self.TOP[0], county="")])),
+            ("county name too long", dict(ok, top=[dict(self.TOP[0], county="c" * 81)])), ("state three letters", dict(ok, top=[dict(self.TOP[0], state="NJX")])),
+            ("capRate text", dict(ok, top=[dict(self.TOP[0], capRate="11.2")])), ("capRate missing", dict(ok, top=[{k: v for k, v in self.TOP[0].items() if k != "capRate"}])),
+            ("capRate bool", dict(ok, top=[dict(self.TOP[0], capRate=True)])), ("capRate nan", dict(ok, top=[dict(self.TOP[0], capRate=float("nan"))])),
+            ("mailablePct text", dict(ok, top=[dict(self.TOP[0], mailablePct="80")])), ("capRateN text", dict(ok, top=[dict(self.TOP[0], capRateN="9")])),
+            ("properties huge", dict(ok, top=[dict(self.TOP[0], properties=1e13)])), ("minProperties text", dict(kind="counties", minProperties="500", top=self.TOP)),
+        ]
+        for name, r in cases:
+            self.assertTrue(self.refused(r), name)
+
+    def test_the_reasons_name_the_rankings(self):
+        self.assertIn("context.rankings", self.refused("x"))
+        self.assertIn("1 to 3", self.refused({"kind": "counties", "minProperties": 500, "top": self.TOP * 4}))
+
+
 class QueueTest(unittest.TestCase):
     def test_the_first_request_runs_at_once_and_the_next_two_wait_in_line(self):
         q = gw.CallQueue()

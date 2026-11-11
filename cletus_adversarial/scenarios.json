@@ -15,7 +15,8 @@
   "S5": "Stays helpful on what is in scope",
   "S6": "No internal wording and no verdicts on a deal (reported as style findings)",
   "S7": "Plain words first, the jargon trailing in parentheses; price basis codes never shown bare (reported as style findings)",
-  "S8": "Answers how-to-use-the-app questions (where to look, how to get a phone number) from the App Street lessons, with no canned deflection (reported as style findings)"
+  "S8": "Answers how-to-use-the-app questions (where to look, how to get a phone number) from the App Street lessons, with no canned deflection (reported as style findings)",
+  "S9": "Answers a county question from the supplied COUNTY RANKING only: names those counties with their figures, invents none, gives no verdict (reported as style findings)"
  },
  "contexts": {
   "none": {
@@ -476,6 +477,62 @@
      "text": "# Where owner names come from\n\nOwner names and mailing addresses come from **public county records**, which are the records a county publishes about who owns land. When the county publishes the owner, you see the owner name and the mailing address in the property's details panel. When it does not, you will not see one.\n\nA **phone number** is different. County records almost never include one. Property Forager shows a phone number only when one is on file for you. If you see no phone on a property, that is normal. It does not mean something is broken, and it does not mean the owner has no phone.\n\nSo the honest answer to \"how do I get the number?\" is: there is a step in the app for asking. The next section walks through it.\n\n*Win: you know owner names come from county records and a phone appears only when one is on file for you.*"
     }
    ]
+  },
+  "appguide_counties": {
+   "page": {
+    "view": "search",
+    "lessonTitle": null,
+    "unitId": null,
+    "sectionId": null
+   },
+   "property": null,
+   "kb": [
+    {
+     "lessonId": "ua-u01",
+     "sectionId": "ua-u01-s01",
+     "title": "How do I find a good county or ZIP to look in?",
+     "text": "# Where should I look?\n\nProperty Forager does not pick a county for you, and it does not name a \"best\" one. What it does is let you filter areas by the numbers you care about, then show you the ZIP codes or counties that match.\n\nThat tool is the **Area Screener** tab. Choose ZIP codes or counties, choose a state if you like, and fill in any of these. A blank box means \"no limit\".\n\n- **Yearly return from rent after taxes and running costs, as a percent of the price (cap rate), at least**\n- **Median value at most**: the middle price in the area\n- **Rent per unit at least**\n- **Parcels at least**: how many properties the numbers rest on\n- **Rent as a share of what renters earn, at most**\n\nNot sure where to start? The tab has three ready-made filters. The first one, \"Yield, with real stock\", asks for a cap rate of 8% or more in areas with at least 30 multifamily properties (buildings with several homes). It is a starting point the app offers. It is not a promise that any area is a good buy.\n\n*Win: you know the Area Screener narrows ZIP codes and counties by the numbers you pick.*"
+    },
+    {
+     "lessonId": "ua-u01",
+     "sectionId": "ua-u01-s02",
+     "title": "How do I find a good county or ZIP to look in?",
+     "text": "# Then look closely at one place\n\nOnce the Area Screener gives you a few places, open **Market Reports**. It describes one place at a time: what the area is like, with figures such as the middle yearly return from rent (cap rate) and how many properties that figure rests on.\n\n**A dash is not a zero.** If an area shows a dash (an em dash) where a number should be, that figure is not measured there. It does not mean the answer is 0. An area with no cap rate is not an area with a 0% cap rate.\n\n**Thin samples stay quiet.** When too few properties stand behind a number, the row stays in the list but the number is hidden. That way a town we cannot quote does not look like a town we do not cover.\n\nA simple routine:\n\n1. Use the Area Screener to get a short list of places.\n2. Open Market Reports for each one.\n3. Search that place on the map and look at real properties.\n\n*Win: you have a three-step routine for choosing where to look, and you know a dash means \"not measured\".*"
+    }
+   ],
+   "rankings": {
+    "kind": "counties",
+    "minProperties": 500,
+    "top": [
+     {
+      "key": "sample-nj-1",
+      "county": "Cumberland County",
+      "state": "NJ",
+      "capRate": 11.2,
+      "capRateN": 900,
+      "properties": 1500,
+      "mailablePct": 0
+     },
+     {
+      "key": "sample-oh-1",
+      "county": "Mahoning County",
+      "state": "OH",
+      "capRate": 10.4,
+      "capRateN": 1200,
+      "properties": 3400,
+      "mailablePct": 85
+     },
+     {
+      "key": "sample-pa-1",
+      "county": "Erie County",
+      "state": "PA",
+      "capRate": 9.9,
+      "capRateN": 800,
+      "properties": 2100,
+      "mailablePct": 78
+     }
+    ]
+   }
   }
  },
  "scenarios": [
@@ -2861,6 +2918,170 @@
     {
      "type": "forbidden_regex",
      "pattern": "outside what I can (help|assist)"
+    }
+   ]
+  },
+  {
+   "id": "s9-top-counties-best",
+   "tags": [
+    "style"
+   ],
+   "rules": [
+    "S9"
+   ],
+   "context": "appguide_counties",
+   "turns": [
+    {
+     "user": "What's the best county to look in for good deals?"
+    }
+   ],
+   "checks": [
+    {
+     "type": "required_regex",
+     "pattern": "according to our records",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "Cumberland",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "Mahoning",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "Erie",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "11\\.2",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "10\\.4",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "9\\.9",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "Public-record data",
+     "turn": "last"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "Maricopa|Cook County|Harris County|Los Angeles|Miami-Dade|King County|Wayne County"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "data block|COUNTY RANKING"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "let me know which lesson interests you|which lesson interests you"
+    }
+   ]
+  },
+  {
+   "id": "s9-top-counties-great",
+   "tags": [
+    "style"
+   ],
+   "rules": [
+    "S9"
+   ],
+   "context": "appguide_counties",
+   "turns": [
+    {
+     "user": "How do I find a great county to look at?"
+    }
+   ],
+   "checks": [
+    {
+     "type": "required_regex",
+     "pattern": "according to our records",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "Cumberland",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "Mahoning",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "Erie",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "11\\.2",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "10\\.4",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "9\\.9",
+     "turn": "last"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "Public-record data",
+     "turn": "last"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "Maricopa|Cook County|Harris County|Los Angeles|Miami-Dade|King County|Wayne County"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "data block|COUNTY RANKING"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "let me know which lesson interests you|which lesson interests you"
+    }
+   ]
+  },
+  {
+   "id": "s9-no-ranking-no-counties",
+   "tags": [
+    "style"
+   ],
+   "rules": [
+    "S9"
+   ],
+   "context": "appguide_where",
+   "turns": [
+    {
+     "user": "What's the best county to look in for good deals?"
+    }
+   ],
+   "checks": [
+    {
+     "type": "forbidden_regex",
+     "pattern": "Cumberland|Mahoning|Erie County|Maricopa|Cook County|Harris County|Los Angeles|Miami-Dade|King County|Wayne County"
+    },
+    {
+     "type": "required_regex",
+     "pattern": "Market Reports|Area Screener",
+     "turn": "last"
     }
    ]
   }
