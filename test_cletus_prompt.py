@@ -17,7 +17,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import cletus_figures  # noqa: E402
 import cletus_gateway as gw  # noqa: E402
+from cletus_figures import unsupplied_figures as cletus_figures_unsupplied  # noqa: E402
 import cletus_model as cm  # noqa: E402
 import cletus_prompt as cp  # noqa: E402
 import ollama_client  # noqa: E402
@@ -652,6 +654,145 @@ class CountySourcesTests(unittest.TestCase):
             except StopIteration as stop:
                 found = stop.value
         self.assertEqual(found, [{"kind": "lesson", "lessonId": "ua-u01", "sectionId": "ua-u01-s01"}, {"kind": "county", "key": "k1", "county": "Cumberland County", "state": "NJ"}])
+
+
+class FigureGuardTests(unittest.TestCase):
+    """A county answer is checked against the ranking before it is shown; a wrong figure is asked for again, then replaced."""
+    TOP = [
+        {"key": "k1", "county": "Cumberland County", "state": "NJ", "capRate": 11.2, "capRateN": 900, "properties": 1500, "mailablePct": 0},
+        {"key": "k2", "county": "Mahoning County", "state": "OH", "capRate": 10.4, "capRateN": 1200, "properties": 3400, "mailablePct": 85},
+        {"key": "k3", "county": "Erie County", "state": None, "capRate": 9.9, "capRateN": 800, "properties": 2100, "mailablePct": None},
+    ]
+    GOOD = ("According to our records, the three counties are Cumberland County, NJ at 11.2% over 900 properties, none with an owner name (0%), "
+            "Mahoning County, OH at 10.4% with 85% mailable, and Erie County at 9.9% over 800 properties.")
+    BAD = "According to our records Cumberland County, NJ is at 11.2% over 900 properties and 15% have an owner name we can write to."
+
+    def pay(self, ranked=True):
+        ctx = {"page": {"view": "search"}, "property": None, "kb": []}
+        if ranked:
+            ctx["rankings"] = {"kind": "counties", "minProperties": 500, "top": self.TOP}
+        return {"question": "Which counties have the best cap rate?", "history": [], "context": ctx}
+
+    def drive(self, answers, ranked=True):
+        """Run generate_stream with one fake model answer per call. Returns (chunks, sources, bodies sent)."""
+        bodies = []
+        queue = list(answers)
+
+        def post(body):
+            bodies.append(body)
+            yield {"message": {"content": queue.pop(0)}}
+            yield {"done": True}
+        gen = cm.generate_stream(self.pay(ranked), post=post)
+        chunks = []
+        try:
+            while True:
+                chunks.append(next(gen))
+        except StopIteration as stop:
+            return chunks, stop.value, bodies
+
+    def setUp(self):
+        for k in cm.guard_stats:
+            cm.guard_stats[k] = 0
+
+    def test_a_good_answer_is_shown_whole_after_one_model_call(self):
+        chunks, sources, bodies = self.drive([self.GOOD])
+        self.assertEqual("".join(chunks), self.GOOD)
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual([s["key"] for s in sources], ["k1", "k2", "k3"])
+        self.assertEqual(cm.guard_stats, {"checked": 1, "retried": 0, "fallback": 0})
+
+    def test_a_wrong_figure_is_asked_for_again_and_the_wrong_text_is_never_shown(self):
+        chunks, sources, bodies = self.drive([self.BAD, self.GOOD])
+        self.assertEqual("".join(chunks), self.GOOD)
+        self.assertNotIn("15%", "".join(chunks))
+        self.assertEqual(len(bodies), 2)
+        self.assertIn("stated 15%", bodies[1]["messages"][-1]["content"])
+        self.assertNotIn("stated", bodies[0]["messages"][-1]["content"])
+        self.assertEqual(cm.guard_stats, {"checked": 1, "retried": 1, "fallback": 0})
+
+    def test_two_wrong_answers_give_the_answer_built_from_the_ranking(self):
+        chunks, sources, bodies = self.drive([self.BAD, "Erie County has 77 properties."])
+        text = "".join(chunks)
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(text, cm.fallback_ranking_answer(self.pay()["context"]))
+        self.assertEqual(cletus_figures_unsupplied(text, self.pay()["context"]), [])
+        self.assertEqual([s["key"] for s in sources], ["k1", "k2", "k3"])
+        self.assertEqual(cm.guard_stats, {"checked": 1, "retried": 1, "fallback": 1})
+
+    def test_the_fallback_text_uses_the_given_figures_and_the_fixed_wording(self):
+        text = cm.fallback_ranking_answer(self.pay()["context"])
+        lines = text.split("\n")
+        self.assertTrue(lines[0].startswith("According to our records, the three counties with the highest median cap rate"))
+        self.assertEqual(lines[1], "- Cumberland County, NJ: cap rate 11.2% over 900 properties; 1500 multifamily properties in the county; none have an owner name we can write to (0%).")
+        self.assertEqual(lines[2], "- Mahoning County, OH: cap rate 10.4% over 1200 properties; 3400 multifamily properties in the county; 85% have an owner name we can write to.")
+        self.assertEqual(lines[3], "- Erie County: cap rate 9.9% over 800 properties; 2100 multifamily properties in the county; the share with an owner name is not available.")
+        self.assertEqual(lines[-2], "The Area Screener and Market Reports let you change the filters.")
+        self.assertEqual(lines[-1], DISCLAIMER)
+        self.assertEqual(len(lines), 6)
+
+    def test_an_answer_without_rankings_streams_as_before_and_is_not_checked(self):
+        chunks, sources, bodies = self.drive(["It is 15% here, 77 properties."], ranked=False)
+        self.assertEqual("".join(chunks), "It is 15% here, 77 properties.")
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(cm.guard_stats["checked"], 0)
+
+    def test_an_answer_without_rankings_arrives_in_pieces(self):
+        def post(body):
+            for piece in ("one ", "two ", "three"):
+                yield {"message": {"content": piece}}
+            yield {"done": True}
+        gen = cm.generate_stream(self.pay(ranked=False), post=post)
+        self.assertEqual("".join([next(gen), next(gen)]), "one two")
+
+    def test_a_model_error_on_the_second_call_is_a_napping(self):
+        calls = []
+
+        def post(body):
+            calls.append(1)
+            if len(calls) == 2:
+                raise urllib.error.URLError("down")
+            yield {"message": {"content": self.BAD}}
+            yield {"done": True}
+        with self.assertRaises(gw.Napping):
+            list(cm.generate_stream(self.pay(), post=post))
+
+    def test_the_sources_line_is_still_withheld_and_read_on_a_guarded_answer(self):
+        chunks, sources, bodies = self.drive([self.GOOD + "\nSOURCES: field:capRate"])
+        self.assertNotIn("SOURCES", "".join(chunks))
+
+    def test_a_count_and_a_percentage_from_a_lesson_are_allowed(self):
+        pay = self.pay()
+        pay["context"]["kb"] = [{"lessonId": "m", "sectionId": "m-s1", "title": "Rule", "text": "Aim for 8% or more across 12 properties."}]
+        def post(body):
+            yield {"message": {"content": self.GOOD + " One lesson says 8% or more."}}
+            yield {"done": True}
+        self.assertIn("8% or more", "".join(cm.generate_stream(pay, post=post)))
+        self.assertEqual(cm.guard_stats["retried"], 0)
+
+
+class FiguresModuleTests(unittest.TestCase):
+    CTX = {"rankings": {"minProperties": 500, "top": [{"capRate": 11.2, "capRateN": 900, "properties": 1500, "mailablePct": 0}]},
+           "kb": [{"text": "Aim for 8% or more."}], "property": {"fields": {"capRate": 6.5, "units": "12"}}}
+
+    def test_every_supplied_figure_is_allowed(self):
+        f = cletus_figures.supplied_figures(self.CTX)
+        for n in (500, 11.2, 900, 1500, 0, 8, 6.5, 12):
+            self.assertIn(float(n), f)
+
+    def test_the_minimum_property_count_may_be_stated(self):
+        self.assertEqual(cletus_figures.unsupplied_figures("Only counties with at least 500 properties are ranked.", self.CTX), [])
+
+    def test_unsupplied_figures_come_back_in_the_order_stated(self):
+        self.assertEqual(cletus_figures.unsupplied_figures("It has 41 properties, 15% and 22%.", self.CTX), ["41 properties", "15%", "22%"])
+
+    def test_commas_and_a_percent_word_are_handled(self):
+        self.assertEqual(cletus_figures.unsupplied_figures("1,500 properties and 11.2 percent", self.CTX), [])
+        self.assertEqual(cletus_figures.unsupplied_figures("1,501 properties", self.CTX), ["1,501 properties"])
+
+    def test_no_context_and_no_answer_are_safe(self):
+        self.assertEqual(cletus_figures.unsupplied_figures("", self.CTX), [])
+        self.assertEqual(cletus_figures.unsupplied_figures(None, None), [])
+        self.assertEqual(cletus_figures.unsupplied_figures("5%", None), ["5%"])
 
 
 class SourcesFilterTests(unittest.TestCase):

@@ -48,6 +48,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import cletus_figures  # noqa: E402
 import cletus_gateway as gw  # noqa: E402
 
 NO_SUFFIX = ("disclaimer_if_field_used", "sources_valid", "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given", "price_basis_in_plain_words", "jargon_trails_plain", "figures_supplied")
@@ -196,40 +197,6 @@ def _as_number(value):
         return None
 
 
-_PERCENT = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s?(?:%|percent)", re.IGNORECASE)
-_COUNT = re.compile(r"(\d[\d,]*)\s+(?:multifamily\s+)?propert(?:y|ies)\b", re.IGNORECASE)
-
-
-def _number(text):
-    try:
-        return float(str(text).replace(",", ""))
-    except ValueError:
-        return None
-
-
-def _supplied_figures(context):
-    """Every number a turn's context supplies: the ranking's figures, the numbers in the lesson sections and the property field values."""
-    out = set()
-    rankings = context.get("rankings") or {}
-    for key in ("minProperties",):
-        if isinstance(rankings.get(key), (int, float)):
-            out.add(float(rankings[key]))
-    for c in rankings.get("top") or []:
-        for key in ("capRate", "mailablePct", "capRateN", "properties"):
-            if isinstance(c.get(key), (int, float)) and not isinstance(c.get(key), bool):
-                out.add(float(c[key]))
-    for k in context.get("kb") or []:
-        for m in re.finditer(r"\d[\d,]*(?:\.\d+)?", str(k.get("text", ""))):
-            n = _number(m.group(0))
-            if n is not None:
-                out.add(n)
-    for v in _property_fields(context).values():
-        n = _number(v) if isinstance(v, (int, float, str)) and not isinstance(v, bool) else None
-        if n is not None:
-            out.add(n)
-    return out
-
-
 def apply_check(check, turns):
     kind = check["type"]
     chosen = _selected(check, turns)
@@ -266,12 +233,9 @@ def apply_check(check, turns):
         return {"check": name, "passed": True, "detail": ""}
     if kind == "figures_supplied":
         for t in chosen:
-            allowed = _supplied_figures(t["context"])
-            for rx in (_PERCENT, _COUNT):
-                for m in rx.finditer(t["answer"]):
-                    n = _number(m.group(1))
-                    if n is not None and n not in allowed:
-                        return {"check": name, "passed": False, "detail": f"answer states {m.group(0).strip()!r}, which no figure in the context supplies"}
+            bad = cletus_figures.unsupplied_figures(t["answer"], t["context"])
+            if bad:
+                return {"check": name, "passed": False, "detail": f"answer states {bad[0]!r}, which no figure in the context supplies"}
         return {"check": name, "passed": True, "detail": ""}
     if kind == "sources_valid":
         for t in chosen:
