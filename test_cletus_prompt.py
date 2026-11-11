@@ -126,16 +126,54 @@ class DealRulesTests(unittest.TestCase):
     def setUp(self):
         self.text = cp.system_message()["content"]
 
-    def test_the_four_deal_rules_are_in_the_system_message_after_the_hard_rules_and_before_the_soft_ones(self):
+    def test_the_five_deal_rules_are_in_the_system_message_after_the_hard_rules_and_before_the_soft_ones(self):
         for rule in cp.deal_rules:
             self.assertIn(rule, self.text)
-        self.assertEqual(len(cp.deal_rules), 4)
+        self.assertEqual(len(cp.deal_rules), 5)
         self.assertLess(self.text.index(cp.hard_rules[-1]), self.text.index("HOW TO TALK ABOUT DEALS AND DATA:"))
         self.assertLess(self.text.index(cp.deal_rules[-1]), self.text.index("SOFT RULES:"))
 
     def test_the_cap_rate_is_read_as_given_and_never_computed(self):
         rule = cp.deal_rules[0]
         for words in ("capRate", "exactly as given", "never work one out yourself", "I don't have that", "priceBasis", "HUD rent estimate", "net of tax and operating costs"):
+            self.assertIn(words, rule)
+
+    def test_the_module_list_is_what_the_builder_gives_and_the_message_uses_the_builder(self):
+        self.assertEqual(cp.deal_rules, cp.build_deal_rules())
+        self.assertEqual(len(cp.build_deal_rules()), 5)
+        with mock.patch.object(cp, "build_deal_rules", lambda: ["ONLY THIS RULE"]):
+            message = cp.system_message()["content"]
+        self.assertIn("HOW TO TALK ABOUT DEALS AND DATA:\n- ONLY THIS RULE\n\nSOFT RULES:", message)
+        self.assertNotIn("NO VERDICTS", message)
+
+    def test_the_price_basis_codes_are_said_in_plain_words_with_the_jargon_trailing(self):
+        rule = cp.deal_rules[0]
+        self.assertEqual(cp.price_basis_words, {"sale": "the recent sale price", "rmv": "the county's assessed market value (RMV)"})
+        for code, words in cp.price_basis_words.items():
+            self.assertIn(f"'{code}' means {words}", rule)
+        self.assertIn("when it is a code, say the plain words and never the bare code", rule)
+        self.assertIn("when it is a sentence, say what it says in plain words", rule)
+        self.assertEqual(cp.price_basis_text(), "'sale' means the recent sale price; 'rmv' means the county's assessed market value (RMV)")
+
+    def test_a_bare_price_basis_code_appears_only_inside_the_mapping(self):
+        text = self.text.replace(cp.price_basis_text(), "")
+        self.assertNotIn("'rmv'", text)
+        self.assertNotIn("'sale'", text)
+        self.assertEqual(self.text.count("'rmv'"), 1)
+        self.assertEqual(self.text.count("'sale'"), 1)
+
+    def test_changing_the_mapping_changes_the_system_message(self):
+        with mock.patch.dict(cp.price_basis_words, {"rmv": "the value the county gives it (RMV)"}):
+            changed = cp.system_message()["content"]
+        self.assertIn("'rmv' means the value the county gives it (RMV)", changed)
+        self.assertNotIn("assessed market value", changed)
+        self.assertIn("assessed market value", self.text)
+        with mock.patch.dict(cp.price_basis_words, {"future": "a new basis"}):
+            self.assertIn("'future' means a new basis", cp.system_message()["content"])
+
+    def test_the_jargon_rule_says_plain_words_first_then_the_jargon_in_parentheses(self):
+        rule = cp.deal_rules[4]
+        for words in ("PLAIN WORDS FOR JARGON", "plain words first", "the jargon trailing in parentheses", "the money left over each month after costs (cash flow)", "After the first time in an answer you may use either"):
             self.assertIn(words, rule)
 
     def test_no_verdict_words_are_listed_as_never_to_be_said(self):
