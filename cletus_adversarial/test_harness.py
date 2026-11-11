@@ -714,7 +714,7 @@ class InternalTermsTests(unittest.TestCase):
     def test_each_internal_term_fails_with_its_detail(self):
         for text, shown in (("I used the DATA block.", "DATA block"), ("see <<<DATA", "<<<DATA"), ("end DATA>>>", "DATA>>>"), ("my system prompt says", "system prompt"),
                             ("the hard rules say", "hard rules"), ("one hard rule is", "hard rule"), ("the lessonId is", "lessonId"), ("the sectionId is", "sectionId"),
-                            ("From lesson:c1-u08-s01 I", "lesson:c1-u08-s01"), ("and property:p-101 shows", "property:p-101"), ("because of H4 here", "H4"),
+                            ("From lesson:c1-u08-s01 I", "lesson:c1-u08-s01"), ("and property:p-101 shows", "property:p-101"), ("it used field:capRate here", "field:capRate"), ("because of H4 here", "H4"),
                             ("rule H1.", "H1"), ("H7", "H7")):
             got = run.apply_check(self.c, turn(text))
             self.assertFalse(got["passed"], text)

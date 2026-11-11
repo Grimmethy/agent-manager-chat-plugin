@@ -359,6 +359,61 @@ class RequestBodyTests(unittest.TestCase):
         self.assertEqual(seen[0]["messages"][0]["role"], "system")
 
 
+class IdFilterTests(unittest.TestCase):
+    TEXT = ("The lesson \"Cash flow\" (lesson:ba-u02-s01) covers this. See lesson:c1-u05-s02 now. Note: this stays. "
+            "Open (see more) and field:capRate.")
+    CLEAN = "The lesson \"Cash flow\" covers this. See now. Note: this stays. Open (see more) and"
+
+    @staticmethod
+    def run_chunks(chunks):
+        f = cm.IdFilter()
+        return "".join(f.feed(c) for c in chunks) + f.finish()
+
+    def test_a_parenthesised_token_goes_with_its_parentheses_and_space(self):
+        self.assertEqual(self.run_chunks(["covers this (lesson:ba-u02-s01) ok"]), "covers this ok")
+
+    def test_a_bare_token_goes(self):
+        self.assertEqual(self.run_chunks(["see lesson:c1-u05-s02 now"]), "see now")
+        self.assertEqual(self.run_chunks(["used field:capRate and property:p-101"]), "used and")
+
+    def test_the_whole_text_is_cleaned(self):
+        self.assertEqual(self.run_chunks([self.TEXT]), self.CLEAN)
+
+    def test_a_split_at_every_position_gives_the_same_text(self):
+        for i in range(len(self.TEXT) + 1):
+            self.assertEqual(self.run_chunks([self.TEXT[:i], self.TEXT[i:]]), self.CLEAN, i)
+
+    def test_one_character_at_a_time_gives_the_same_text(self):
+        self.assertEqual(self.run_chunks(list(self.TEXT)), self.CLEAN)
+
+    def test_a_colon_that_is_not_an_id_is_untouched(self):
+        for s in ("Note: this", "lesson: a title", "the field: is blank", "Cash flow: money in minus money out"):
+            self.assertEqual(self.run_chunks([s]), s)
+
+    def test_a_token_at_the_very_end_is_removed_on_finish(self):
+        self.assertEqual(self.run_chunks(["covers it (lesson:c1-u08-s01)"]), "covers it")
+        self.assertEqual(self.run_chunks(["covers it lesson:c1-u08-s01"]), "covers it")
+
+    def test_text_held_for_a_possible_token_is_flushed_when_it_is_not_one(self):
+        self.assertEqual(self.run_chunks(["the lesson", " was fun ("]), "the lesson was fun (")
+        self.assertEqual(self.run_chunks(["a (les"]), "a (les")
+
+    def test_a_chunk_ending_in_a_partial_token_is_held_back(self):
+        f = cm.IdFilter()
+        self.assertEqual(f.feed("hello (lesson:ba-u0"), "hello")
+        self.assertEqual(f.feed("2-s01) there"), " there")
+
+    def test_generate_stream_never_yields_an_id_even_when_split(self):
+        def post(body):
+            for piece in ("Cash flow (less", "on:ba-u02-s01) is money left.\n", "SOURCES: lesson:ba-u02-s01"):
+                yield {"message": {"content": piece}}
+            yield {"done": True}
+        with mock.patch.object(ollama_client, "MODEL", lambda: "m"):
+            out = "".join(cm.generate_stream(payload(), post=post))
+        self.assertNotIn("lesson:", out)
+        self.assertEqual(out, "Cash flow is money left.\n")
+
+
 class SourcesFilterTests(unittest.TestCase):
     def test_plain_text_passes_through(self):
         f = cm.SourcesFilter()
