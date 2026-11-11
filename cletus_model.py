@@ -65,6 +65,46 @@ class SourcesFilter:
         return tail
 
 
+class IdFilter:
+    """Removes internal id tokens (lesson:<id>, field:<name>, property:<id>) from the streamed answer text.
+
+    The prompt tells the model never to write ids, but it sometimes does, for example "(lesson:ba-u02-s01)". A token inside
+    parentheses is removed with the parentheses and the space before them; a bare token is removed with the space before it.
+    Text that could still turn into a token (a chunk that ends in "lesson:ba-u0", "(", "(les") is held until it resolves, the same
+    way SourcesFilter holds a partial SOURCES: marker, so a token split across chunks is removed too. finish() flushes what is held.
+    """
+
+    _names = "lesson|field|property"
+    _token = re.compile(r"[ \t]?\(\s*(?:%s):[\w.\-]+\s*\)|[ \t]?(?:%s):[\w.\-]+" % (_names, _names), re.IGNORECASE)
+    _open_tail = re.compile(r"(?:[ \t]?\(\s*(?:%s):[\w.\-]*\s*|[ \t]?(?:%s):[\w.\-]*)$" % (_names, _names), re.IGNORECASE)
+    _prefixes = {lead + (name + ":")[:j] for lead in ("", " ", "(", " (", "( ", " ( ", "\t") for name in ("lesson", "field", "property")
+                 for j in range(0, len(name) + 2)} - {""}
+
+    def __init__(self):
+        self._buf = ""
+
+    def _clean(self, text):
+        return self._token.sub("", text)
+
+    def _hold_at(self, buf):
+        m = self._open_tail.search(buf)
+        at = m.start() if m else len(buf)
+        for k in range(min(len(buf), 12), 0, -1):
+            if buf[-k:].lower() in self._prefixes and len(buf) - k < at:
+                at = len(buf) - k
+        return at
+
+    def feed(self, text):
+        self._buf += text
+        at = self._hold_at(self._buf)
+        out, self._buf = self._buf[:at], self._buf[at:]
+        return self._clean(out)
+
+    def finish(self):
+        out, self._buf = self._buf, ""
+        return self._clean(out)
+
+
 def parse_sources(line, payload):
     """The ids on a SOURCES: line that match what the payload supplied, in order, without repeats."""
     context = payload.get("context") or {}
@@ -119,6 +159,7 @@ def generate_stream(payload, post=None):
     body = request_body(payload, model)
     send = post or _default_post
     flt = SourcesFilter()
+    ids = IdFilter()
     try:
         for part in send(body):
             if not isinstance(part, dict):
@@ -127,7 +168,7 @@ def generate_stream(payload, post=None):
                 raise gw.Napping()
             text = (part.get("message") or {}).get("content") or ""
             if text:
-                out = flt.feed(text)
+                out = ids.feed(flt.feed(text))
                 if out:
                     yield out
             if part.get("done"):
@@ -136,7 +177,7 @@ def generate_stream(payload, post=None):
         raise
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise gw.Napping() from e
-    tail = flt.finish()
+    tail = ids.feed(flt.finish()) + ids.finish()
     if tail:
         yield tail
     return parse_sources(flt.sources_line, payload) if flt.sources_line else []

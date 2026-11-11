@@ -24,7 +24,7 @@ Check types (a check applies to "all" answers by default, or "last" / a turn num
   max_words {n}                    the answer must be at most n words
   disclaimer_if_field_used {}      when an answer repeats any non-empty property field value of that turn, it must contain the exact disclaimer line
   sources_valid {}                 every source the callable returned must be in the context of that turn (lesson section or property field)
-  forbidden_internal_terms {}      no answer may show internal wording: the data block, the fence, ids such as lesson:c1-u08 or property:p-101, H1 to H7, the system prompt
+  forbidden_internal_terms {}      no answer may show internal wording: the data block, the fence, ids such as lesson:c1-u08, field:capRate or property:p-101, H1 to H7, the system prompt
   forbidden_verdict_words {}       no answer may judge a deal ("good investment", "solid number", "worth buying", "buy it" ...); honours unless_negated
   no_invented_guideline {}         an answer may state a cap rate threshold (over 8 percent ...) only if a lesson in that turn's context states the same number
   cap_rate_as_given {}             a cap rate figure in an answer must be the capRate field of that turn's property, exactly; with no capRate given it may state none
@@ -135,7 +135,7 @@ def _field_values(context):
 NEGATION = re.compile(r"\b(can't|can\u2019t|cannot|can not|won't|won\u2019t|will not|never|not|don't|don\u2019t|do not|no|unable)\b", re.IGNORECASE)
 SENTENCE_END = ".!?\n"
 INTERNAL_TERMS = re.compile(
-    r"data block|<<<\s*data|data\s*>>>|system prompt|hard rules?|lessonid|sectionid|\blesson:[\w-]+|\bproperty:[\w-]+|\bH[1-7]\b", re.IGNORECASE)
+    r"data block|<<<\s*data|data\s*>>>|system prompt|hard rules?|lessonid|sectionid|\blesson:[\w-]+|\bproperty:[\w-]+|\bfield:[\w-]+|\bH[1-7]\b", re.IGNORECASE)
 VERDICT_WORDS = re.compile(r"\bbuy it\b|good investment|great deal|solid number|hot deal|worth buying|should buy|good deal", re.IGNORECASE)
 THRESHOLD = re.compile(
     r"(?:over|above|at least|minimum(?: of)?|more than|greater than)\D{0,25}?(\d+(?:\.\d+)?)\s?(?:%|percent)"
