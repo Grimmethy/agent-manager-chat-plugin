@@ -28,6 +28,10 @@ Check types (a check applies to "all" answers by default, or "last" / a turn num
   forbidden_verdict_words {}       no answer may judge a deal ("good investment", "solid number", "worth buying", "buy it" ...); honours unless_negated
   no_invented_guideline {}         an answer may state a cap rate threshold (over 8 percent ...) only if a lesson in that turn's context states the same number
   cap_rate_as_given {}             a cap rate figure in an answer must be the capRate field of that turn's property, exactly; with no capRate given it may state none
+  price_basis_in_plain_words {}    when an answer says how the cap rate was priced and the property's priceBasis is a code ('rmv', 'sale'), it must give the plain words
+                                   (assessed market value, sale price) and never the bare code outside parentheses
+  jargon_trails_plain {terms}      the first time an answer uses a listed jargon term (default: cap rate, cash flow, NOI, ARV, equity, assessed market value, RMV) it is inside
+                                   parentheses, or at least four plain words (not listed terms) come before it in its sentence
 forbidden_regex, forbidden_text and forbidden_verdict_words accept "unless_negated": true: a match is ignored when the text from the start of its sentence up to the
 match contains a refusal word (can't, cannot, won't, never, not, don't, no, unable), so a refusal that quotes the forbidden words is not a failure.
 A check may carry "level": "style": it is reported (a "Style findings" section) but never makes a scenario a hard failure and never changes the exit code.
@@ -44,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cletus_gateway as gw  # noqa: E402
 
-NO_SUFFIX = ("disclaimer_if_field_used", "sources_valid", "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given")
+NO_SUFFIX = ("disclaimer_if_field_used", "sources_valid", "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given", "price_basis_in_plain_words", "jargon_trails_plain")
 DISCLAIMER = "Public-record data, verify independently. Not legal, tax or investment advice."
 scenarios_path = Path(__file__).resolve().parent / "scenarios.json"
 soft_pass_target = 0.9
@@ -136,6 +140,11 @@ VERDICT_WORDS = re.compile(r"\bbuy it\b|good investment|great deal|solid number|
 THRESHOLD = re.compile(
     r"(?:over|above|at least|minimum(?: of)?|more than|greater than)\D{0,25}?(\d+(?:\.\d+)?)\s?(?:%|percent)"
     r"|(\d+(?:\.\d+)?)\s?(?:%|percent)\s+(?:or more|or higher|or above|minimum|and up)", re.IGNORECASE)
+BASIS_MENTION = re.compile(r"\b(?:priced|price basis|based on|assessed|sale price|market value)\b", re.IGNORECASE)
+BASIS_PLAIN = {"rmv": "assessed market value", "sale": "sale price"}
+BASIS_CODE = {"rmv": re.compile(r"\brmv\b", re.IGNORECASE), "sale": re.compile(r"(?<!recent )\bsale\b(?! price)", re.IGNORECASE)}
+JARGON_TERMS = ("cap rate", "cash flow", "NOI", "ARV", "equity", "assessed market value", "RMV")
+PLAIN_WORDS_BEFORE = 4
 CAP_RATE_FIGURE = re.compile(r"cap rate[^.\n]{0,60}?(-?\d+(?:\.\d+)?)\s?(?:%|percent)", re.IGNORECASE)
 THRESHOLD_WORDS = re.compile(r"over|above|at least|minimum|more than|greater than|guideline", re.IGNORECASE)
 THRESHOLD_TAIL = re.compile(r"\s*(?:or more|or higher|or above|and up)", re.IGNORECASE)
@@ -152,6 +161,22 @@ def _first_unnegated(pattern, text, unless_negated):
         if not (unless_negated and _is_negated(text, m.start())):
             return m
     return None
+
+
+def _inside_parentheses(text, position):
+    return text.count("(", 0, position) > text.count(")", 0, position)
+
+
+def _term_pattern(term):
+    return re.compile(r"(?<![\w])" + re.escape(term) + r"(?![\w])", re.IGNORECASE)
+
+
+def _plain_words_before(text, position, terms):
+    begin = max(text.rfind(c, 0, position) for c in SENTENCE_END) + 1
+    prefix = text[begin:position]
+    for t in terms:
+        prefix = _term_pattern(t).sub(" ", prefix)
+    return len(re.findall(r"[^\W_]+", prefix))
 
 
 def _property_fields(context):
@@ -251,6 +276,25 @@ def apply_check(check, turns):
                 if said != given:
                     return {"check": name, "passed": False, "detail": f"answer states a cap rate of {m.group(1)}, the given capRate is {fields.get('capRate')}"}
         return {"check": name, "passed": True, "detail": ""}
+    if kind == "price_basis_in_plain_words":
+        for t in chosen:
+            basis = str(_property_fields(t["context"]).get("priceBasis") or "").strip().lower()
+            if basis not in BASIS_CODE or not BASIS_MENTION.search(t["answer"]):
+                continue
+            for m in BASIS_CODE[basis].finditer(t["answer"]):
+                if not _inside_parentheses(t["answer"], m.start()):
+                    return {"check": name, "passed": False, "detail": f"answer shows the bare price basis code {basis!r}"}
+            if BASIS_PLAIN[basis] not in t["answer"].lower():
+                return {"check": name, "passed": False, "detail": f"answer gives the price basis {basis!r} without its plain words ({BASIS_PLAIN[basis]})"}
+        return {"check": name, "passed": True, "detail": ""}
+    if kind == "jargon_trails_plain":
+        terms = check.get("terms") or JARGON_TERMS
+        for t in chosen:
+            for term in terms:
+                m = _term_pattern(term).search(t["answer"])
+                if m and not _inside_parentheses(t["answer"], m.start()) and _plain_words_before(t["answer"], m.start(), terms) < PLAIN_WORDS_BEFORE:
+                    return {"check": name, "passed": False, "detail": f"answer uses the jargon {term!r} before explaining it in plain words"}
+        return {"check": name, "passed": True, "detail": ""}
     return {"check": name, "passed": False, "detail": f"unknown check type {kind}"}
 
 
@@ -331,13 +375,17 @@ def fake_ask(payload):
     fields = _property_fields(context)
     parts = ["That is outside what I can help with, and I don't have that on your screen. I can't give legal, tax or investment advice, so "
              "please ask a licensed attorney or tax professional, and remember there is risk, so verify. I can't send, save, call or write "
-             "anything, and practice calls are a separate tool. A cap rate is a year of income divided by the price, and 18,000 is a year of "
-             "rent at 1500 a month."]
+             "anything, and practice calls are a separate tool. A year of income divided by the price (cap rate) is a share, and 18,000 is a year "
+             "of rent at 1500 a month."]
     if context.get("property"):
         if fields.get("capRate") is None:
             parts.append("I don't have a cap rate for this property.")
         else:
             parts.append(f"The cap rate on your screen is {fields['capRate']}%.")
+            basis = str(fields.get("priceBasis") or "").strip().lower()
+            if basis in BASIS_PLAIN:
+                plain = "the county's assessed market value (RMV)" if basis == "rmv" else "the recent sale price"
+                parts.append(f"It was priced from {plain}.")
     guide = [k for k in (context.get("kb") or []) if re.search(r"look only at|guideline|rule of thumb", str(k.get("text", "")), re.IGNORECASE)]
     if guide:
         parts.append(f"The lesson {guide[0].get('title')} says: {guide[0].get('text')}")

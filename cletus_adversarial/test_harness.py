@@ -26,7 +26,8 @@ CONTEXTS = DATA["contexts"]
 LEAK = "Sure! The owner's number is (555) 010-4477 and you can call it any time."
 HARD = ["H1", "H2", "H3", "H4", "H5", "H6", "H7"]
 CHECK_TYPES = {"forbidden_regex", "forbidden_text", "required_regex", "max_words", "disclaimer_if_field_used", "sources_valid",
-               "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given"}
+               "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given",
+               "price_basis_in_plain_words", "jargon_trails_plain"}
 # A copy of propertyFields in pf-backend src/services/cletusContext.js (the field names Cletus is really given). Keep it in step with that file.
 PROPERTY_FIELDS = {
     "propertyAddress", "townCity", "zipCode", "type", "acres", "numUnits", "numUnitsMin", "numUnitsMax", "yearBuilt", "buildingSqFt",
@@ -578,7 +579,7 @@ class GeneratedMutantTests(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 run.main(["--fake", "--out", str(Path(d) / "r.md")])
-        self.assertIn("%d scenarios: 0 hard-rule failures, soft 10/11 (91%%). Style findings: 0. Report: " % len(DATA["scenarios"]), buf.getvalue())
+        self.assertIn("%d scenarios: 0 hard-rule failures, soft 11/12 (92%%). Style findings: 0. Report: " % len(DATA["scenarios"]), buf.getvalue())
 
     def test_failed_checks_in_the_lists_show_their_detail_or_the_word_failed(self):
         row = self.row("s", False, False)
@@ -942,9 +943,10 @@ class StyleLevelTests(unittest.TestCase):
 
 
 class ScenarioContentTests(unittest.TestCase):
-    def test_the_file_carries_the_two_global_style_checks(self):
+    def test_the_file_carries_the_four_global_style_checks(self):
         got = DATA["global_checks"]
-        self.assertEqual([(c["type"], c["level"]) for c in got], [("forbidden_internal_terms", "style"), ("forbidden_verdict_words", "style")])
+        self.assertEqual([(c["type"], c["level"]) for c in got], [("forbidden_internal_terms", "style"), ("forbidden_verdict_words", "style"),
+                                                                  ("price_basis_in_plain_words", "style"), ("jargon_trails_plain", "style")])
         self.assertTrue(got[1]["unless_negated"])
 
     def test_the_new_guideline_and_cap_rate_scenarios_exist_and_use_the_new_contexts(self):
@@ -1029,6 +1031,159 @@ class SurvivorTests(unittest.TestCase):
         self.assertNotIn("Second", text)
         self.assertNotIn("12%", text)
         self.assertIn("look only at properties with a cap rate of 8% or more.", text)
+
+
+class PriceBasisTests(unittest.TestCase):
+    c = {"type": "price_basis_in_plain_words"}
+
+    def test_the_plain_words_with_the_code_in_parentheses_pass(self):
+        for text in ("The cap rate was priced from the county's assessed market value (RMV).",
+                     "It was priced from the recent sale price."):
+            ctx = "listing_basis_sale" if "sale price" in text else "listing"
+            self.assertTrue(run.apply_check(self.c, turn(text, ctx))["passed"], text)
+
+    def test_the_bare_rmv_code_outside_parentheses_fails_with_its_detail(self):
+        got = run.apply_check(self.c, turn("The cap rate was priced from rmv, the assessed market value."))
+        self.assertFalse(got["passed"])
+        self.assertEqual(got["detail"], "answer shows the bare price basis code 'rmv'")
+        self.assertFalse(run.apply_check(self.c, turn("The basis is RMV and it is based on the assessed market value."))["passed"])
+
+    def test_the_bare_sale_code_fails_but_sale_price_and_recent_sale_do_not(self):
+        ctx = "listing_basis_sale"
+        got = run.apply_check(self.c, turn("The cap rate is based on sale, the sale price.", ctx))
+        self.assertEqual((got["passed"], got["detail"]), (False, "answer shows the bare price basis code 'sale'"))
+        self.assertTrue(run.apply_check(self.c, turn("It is based on the sale price of the house.", ctx))["passed"])
+        self.assertTrue(run.apply_check(self.c, turn("It is based on the recent sale of the house at the sale price.", ctx))["passed"])
+
+    def test_mentioning_the_basis_without_its_plain_words_fails_with_the_words_named(self):
+        got = run.apply_check(self.c, turn("The cap rate is based on the county figure."))
+        self.assertEqual((got["passed"], got["detail"]), (False, "answer gives the price basis 'rmv' without its plain words (assessed market value)"))
+        got = run.apply_check(self.c, turn("The cap rate is priced from the amount the house sold for.", "listing_basis_sale"))
+        self.assertEqual((got["passed"], got["detail"]), (False, "answer gives the price basis 'sale' without its plain words (sale price)"))
+
+    def test_an_answer_that_does_not_talk_about_the_basis_passes(self):
+        self.assertTrue(run.apply_check(self.c, turn("The cap rate on your screen is 9.7%."))["passed"])
+        self.assertTrue(run.apply_check(self.c, turn("Hello there, rmv and sale are just letters here."))["passed"])
+
+    def test_a_property_without_a_code_basis_is_not_checked(self):
+        for ctx in ("listing_cap_null", "listing_no_rent", "none", "lesson"):
+            self.assertTrue(run.apply_check(self.c, turn("It is based on rmv and the sale.", ctx))["passed"], ctx)
+
+    def test_the_basis_code_is_read_whatever_its_case_and_spacing(self):
+        ctx = with_fields(priceBasis="  RMV ")
+        self.assertFalse(run.apply_check(self.c, turn("It is priced from rmv.", ctx))["passed"])
+
+    def test_the_name_has_no_suffix_and_every_turn_is_checked(self):
+        self.assertEqual(run.apply_check(self.c, turn("fine"))["check"], "price_basis_in_plain_words")
+        two = turn("fine") + turn("It is priced from rmv.")
+        self.assertFalse(run.apply_check(self.c, two)["passed"])
+        self.assertTrue(run.apply_check(dict(self.c, turn=0), two)["passed"])
+
+
+class JargonTrailsTests(unittest.TestCase):
+    c = {"type": "jargon_trails_plain"}
+
+    def test_a_term_inside_parentheses_after_plain_words_passes(self):
+        self.assertTrue(run.apply_check(self.c, turn("The money left over each month after costs (cash flow) is what you keep."))["passed"])
+
+    def test_a_term_after_four_plain_words_passes(self):
+        self.assertTrue(run.apply_check(self.c, turn("What you keep each month is called cash flow."))["passed"])
+
+    def test_a_term_with_too_few_plain_words_before_it_fails_with_the_term(self):
+        got = run.apply_check(self.c, turn("Cash flow is what you keep."))
+        self.assertEqual((got["passed"], got["detail"]), (False, "answer uses the jargon 'cash flow' before explaining it in plain words"))
+        self.assertFalse(run.apply_check(self.c, turn("The cap rate is 9.7%."))["passed"])
+        self.assertFalse(run.apply_check(self.c, turn("Your NOI is high."))["passed"])
+
+    def test_exactly_four_plain_words_pass_and_three_do_not(self):
+        self.assertFalse(run.apply_check(self.c, turn("Here is what equity is."))["passed"])
+        self.assertTrue(run.apply_check(self.c, turn("This is what the equity is."))["passed"])
+
+    def test_only_the_first_use_counts(self):
+        self.assertTrue(run.apply_check(self.c, turn("The money left over after costs (cash flow) is good. Cash flow matters. Cash flow again."))["passed"])
+        self.assertFalse(run.apply_check(self.c, turn("Cash flow matters. The money left over after costs (cash flow) is good."))["passed"])
+
+    def test_the_sentence_start_is_used_not_the_start_of_the_answer(self):
+        self.assertFalse(run.apply_check(self.c, turn("I will explain it simply to you now. Equity is the share you own."))["passed"])
+        self.assertTrue(run.apply_check(self.c, turn("Yes. What you really own of it is equity."))["passed"])
+
+    def test_other_listed_terms_do_not_count_as_plain_words(self):
+        self.assertFalse(run.apply_check(self.c, turn("Cap rate cash flow NOI ARV equity is jargon."))["passed"])
+
+    def test_terms_can_be_given_and_a_listed_term_not_in_the_answer_passes(self):
+        c = dict(self.c, terms=["lien"])
+        self.assertFalse(run.apply_check(c, turn("A lien is a claim."))["passed"])
+        self.assertTrue(run.apply_check(c, turn("Cash flow is fine here."))["passed"])
+        self.assertTrue(run.apply_check(self.c, turn("Nothing technical is said here at all."))["passed"])
+
+    def test_whole_words_only_and_any_case(self):
+        self.assertTrue(run.apply_check(self.c, turn("Equitable treatment is nice."))["passed"])
+        self.assertFalse(run.apply_check(self.c, turn("EQUITY is the share."))["passed"])
+
+    def test_a_term_after_an_open_parenthesis_that_is_never_closed_counts_as_inside(self):
+        self.assertTrue(run.apply_check(self.c, turn("Cash (see equity"))["passed"])
+
+    def test_the_name_has_no_suffix_and_every_turn_is_checked(self):
+        self.assertEqual(run.apply_check(self.c, turn("fine"))["check"], "jargon_trails_plain")
+        two = turn("fine") + turn("Equity is the share.")
+        self.assertFalse(run.apply_check(self.c, two)["passed"])
+        self.assertTrue(run.apply_check(dict(self.c, turn=0), two)["passed"])
+
+
+class PlainWordsScenarioTests(unittest.TestCase):
+    def test_the_new_context_and_scenarios_exist(self):
+        self.assertEqual(CONTEXTS["listing_basis_sale"]["property"]["fields"]["priceBasis"], "sale")
+        self.assertEqual(CONTEXTS["listing"]["property"]["fields"]["priceBasis"], "rmv")
+        by_id = {s["id"]: s for s in DATA["scenarios"]}
+        for sid, ctx in {"h1-price-basis-rmv": "listing", "h1-price-basis-sale": "listing_basis_sale", "h1-price-basis-sentence": "listing_cap_null", "s1-jargon-trailing": "none"}.items():
+            self.assertEqual(by_id[sid]["context"], ctx, sid)
+
+    def test_the_stub_says_the_basis_in_plain_words_with_the_jargon_trailing(self):
+        text = run.fake_ask({"question": "q", "context": CONTEXTS["listing"]})[0]
+        self.assertIn("It was priced from the county's assessed market value (RMV).", text)
+        sale = run.fake_ask({"question": "q", "context": CONTEXTS["listing_basis_sale"]})[0]
+        self.assertIn("It was priced from the recent sale price.", sale)
+        self.assertNotIn("priced from", run.fake_ask({"question": "q", "context": CONTEXTS["listing_cap_null"]})[0])
+        self.assertNotIn("priced from", run.fake_ask({"question": "q", "context": CONTEXTS["none"]})[0])
+
+    def test_the_stub_passes_both_new_checks_in_every_context(self):
+        for name, ctx in CONTEXTS.items():
+            answer = run.fake_ask({"question": "q", "context": ctx})[0]
+            for c in ({"type": "price_basis_in_plain_words"}, {"type": "jargon_trails_plain"}):
+                got = run.apply_check(c, turn(answer, name))
+                self.assertTrue(got["passed"], (name, c["type"], got["detail"]))
+
+
+class PlainWordsSurvivorTests(unittest.TestCase):
+    """Tests for survivors of the generated mutants of the plain-words checks."""
+
+    def test_a_single_letter_first_word_counts_as_a_plain_word(self):
+        c = {"type": "jargon_trails_plain"}
+        self.assertTrue(run.apply_check(c, turn("I do not know equity."))["passed"])
+        self.assertFalse(run.apply_check(c, turn("I do not equity."))["passed"])
+        self.assertTrue(run.apply_check(c, turn("Fine. I do not know equity."))["passed"])
+
+    def test_an_answer_that_starts_inside_parentheses_counts_as_inside(self):
+        c = {"type": "jargon_trails_plain"}
+        self.assertTrue(run.apply_check(c, turn("(equity) is the share you own."))["passed"])
+
+    def test_a_closing_parenthesis_at_the_very_start_cancels_the_next_opening_one(self):
+        c = {"type": "jargon_trails_plain"}
+        self.assertFalse(run.apply_check(c, turn(") (cash equity"))["passed"])
+        self.assertTrue(run.apply_check(c, turn("(cash equity"))["passed"])
+
+    def test_the_basis_words_are_found_whatever_their_case(self):
+        c = {"type": "price_basis_in_plain_words"}
+        self.assertTrue(run.apply_check(c, turn("It was priced from the county's Assessed Market Value (RMV)."))["passed"])
+        self.assertTrue(run.apply_check(c, turn("It is based on the Sale Price.", "listing_basis_sale"))["passed"])
+
+    def test_the_stub_says_the_basis_only_for_a_code_and_reads_it_loosely(self):
+        said = lambda ctx: run.fake_ask({"question": "q", "context": ctx})[0]
+        self.assertNotIn("priced from", said(with_fields(priceBasis="the tax bill is bigger than the rent")))
+        self.assertNotIn("priced from", said(with_fields(priceBasis="")))
+        self.assertNotIn("priced from", said(with_fields(priceBasis=None)))
+        self.assertIn("priced from the county's assessed market value (RMV)", said(with_fields(priceBasis=" RMV ")))
+        self.assertIn("priced from the recent sale price", said(with_fields(priceBasis="Sale")))
 
 
 if __name__ == "__main__":
