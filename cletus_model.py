@@ -105,6 +105,45 @@ class IdFilter:
         return self._clean(out)
 
 
+class PhraseFilter:
+    """Rewrites the internal phrase "data block" (with a leading your, the or my) to "the information I have" in the streamed text.
+
+    The prompt forbids the words, but the model still says "none of the lessons in your data block". A chunk that ends in a possible
+    start of the phrase ("your da", "data") is held until it resolves, as IdFilter and SourcesFilter hold theirs; finish() flushes.
+    """
+
+    _phrase = re.compile(r"\b(?:(?:your|the|my)\s+)?data\s+block\b", re.IGNORECASE)
+    _prefixes = {full[:j] for full in ("your data block", "the data block", "my data block", "data block") for j in range(1, len(full) + 1)}
+    replacement = "the information I have"
+
+    def __init__(self):
+        self._buf = ""
+
+    def _hold_at(self, buf):
+        at = len(buf)
+        for k in range(min(len(buf), 16), 0, -1):
+            tail = buf[-k:].lower()  # a possible start of the phrase, at a word boundary
+            if tail in self._prefixes and len(buf) - k < at and (k == len(buf) or not buf[-k - 1].isalnum()):
+                at = len(buf) - k
+        return at
+
+    def feed(self, text):
+        self._buf += text
+        at = self._hold_at(self._buf)
+        out, self._buf = self._buf[:at], self._buf[at:]
+        return self._rewrite(out)
+
+    def _rewrite(self, text):
+        def swap(m):
+            r = self.replacement
+            return r[0].upper() + r[1:] if m.group(0)[0].isupper() else r
+        return self._phrase.sub(swap, text)
+
+    def finish(self):
+        out, self._buf = self._buf, ""
+        return self._rewrite(out)
+
+
 def parse_sources(line, payload):
     """The ids on a SOURCES: line that match what the payload supplied, in order, without repeats."""
     context = payload.get("context") or {}
@@ -160,6 +199,7 @@ def generate_stream(payload, post=None):
     send = post or _default_post
     flt = SourcesFilter()
     ids = IdFilter()
+    phrases = PhraseFilter()
     try:
         for part in send(body):
             if not isinstance(part, dict):
@@ -168,7 +208,7 @@ def generate_stream(payload, post=None):
                 raise gw.Napping()
             text = (part.get("message") or {}).get("content") or ""
             if text:
-                out = ids.feed(flt.feed(text))
+                out = phrases.feed(ids.feed(flt.feed(text)))
                 if out:
                     yield out
             if part.get("done"):
@@ -177,7 +217,7 @@ def generate_stream(payload, post=None):
         raise
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise gw.Napping() from e
-    tail = ids.feed(flt.finish()) + ids.finish()
+    tail = phrases.feed(ids.feed(flt.finish()) + ids.finish()) + phrases.finish()
     if tail:
         yield tail
     return parse_sources(flt.sources_line, payload) if flt.sources_line else []

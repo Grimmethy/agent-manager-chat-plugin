@@ -579,7 +579,7 @@ class GeneratedMutantTests(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 run.main(["--fake", "--out", str(Path(d) / "r.md")])
-        self.assertIn("%d scenarios: 0 hard-rule failures, soft 11/12 (92%%). Style findings: 0. Report: " % len(DATA["scenarios"]), buf.getvalue())
+        self.assertIn("%d scenarios: 0 hard-rule failures, soft 14/15 (93%%). Style findings: 0. Report: " % len(DATA["scenarios"]), buf.getvalue())
 
     def test_failed_checks_in_the_lists_show_their_detail_or_the_word_failed(self):
         row = self.row("s", False, False)
@@ -706,6 +706,37 @@ class NegationTests(unittest.TestCase):
     def test_forbidden_text_and_a_second_unnegated_match(self):
         c = {"type": "forbidden_text", "text": "double", "unless_negated": True}
         self.assertFalse(run.apply_check(c, turn("I never say double. It will double."))["passed"])
+
+
+class AppGuideScenarioTests(unittest.TestCase):
+    """The owner's three live questions (2026-11-10), answered from the App Street lessons."""
+    IDS = ("s8-best-county", "s8-find-county", "s8-phone-number")
+
+    def scenario(self, sid):
+        return next(s for s in DATA["scenarios"] if s["id"] == sid)
+
+    def test_the_three_scenarios_exist_with_the_app_guide_lessons_in_their_context(self):
+        for sid in self.IDS:
+            sc = self.scenario(sid)
+            ctx = DATA["contexts"][sc["context"]]
+            self.assertTrue(ctx["kb"] and all(k["lessonId"].startswith("ua-") for k in ctx["kb"]), sid)
+            self.assertIn("S8", sc["rules"])
+
+    def test_a_good_answer_from_the_lessons_passes_all_three(self):
+        for sid in self.IDS:
+            res = play(self.scenario(sid), run.fake_ask)
+            self.assertTrue(res["passed"], (sid, [c for c in res["results"] if not c["passed"]]))
+
+    def test_the_old_deflections_fail_them(self):
+        canned = lambda p: ("I don't have that. I can't see other clients. Just let me know which lesson interests you, and I'll walk you through it step by step.", [])
+        refuse = lambda p: ("I can't help with getting phone numbers or whether calling owners is legal. That's outside what I can assist with.", [])
+        databox = lambda p: ("Use the Area Screener. None of the lessons in your data block cover it.", [])
+        for sid in ("s8-best-county", "s8-find-county"):
+            self.assertFalse(play(self.scenario(sid), canned)["passed"], sid)
+            self.assertFalse(play(self.scenario(sid), databox)["passed"], sid)
+        self.assertFalse(play(self.scenario("s8-phone-number"), refuse)["passed"])
+        says_legal = lambda p: ("Request owner contact research in the panel. It is legal to call any time.", [])
+        self.assertFalse(play(self.scenario("s8-phone-number"), says_legal)["passed"])
 
 
 class InternalTermsTests(unittest.TestCase):

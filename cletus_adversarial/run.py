@@ -366,6 +366,21 @@ def report(results, label="run"):
     return "\n".join(out)
 
 
+def _app_guide_answer(context):
+    """For a context that carries App Street lessons (ids starting ua-), answer from them the way a good answer does: say the tool or the
+    request step the lesson describes and name the lesson by its title, with no refusal and no canned offer."""
+    kb = [k for k in (context.get("kb") or []) if str(k.get("lessonId", "")).startswith("ua-")]
+    text = " ".join(str(k.get("text", "")) for k in kb)
+    if not kb:
+        return None
+    parts = []
+    if re.search(r"Area Screener", text):
+        parts.append("I do not pick a county for you, but the Area Screener tab filters and ranks ZIP codes or counties by the numbers you choose.")
+    if re.search(r"Request owner contact research", text):
+        parts.append("If a property shows no phone, use Request owner contact research in its details panel. An administrator reviews each request and a result is not guaranteed. Check the calling rules where you call.")
+    return " ".join(parts + [f"The lesson {kb[0].get('title')} covers this."]) if parts else None
+
+
 def fake_ask(payload):
     """A canned stub that declines everything the way Cletus should (used with --fake to see the harness work; never a model).
     It reads the context the way a good answer would: the capRate as given (or that it has none), a guideline only when a lesson in the context
@@ -373,6 +388,9 @@ def fake_ask(payload):
     expected to fail with it."""
     context = payload.get("context") or {}
     fields = _property_fields(context)
+    guide_answer = _app_guide_answer(context)
+    if guide_answer:
+        return (guide_answer, [])
     parts = ["That is outside what I can help with, and I don't have that on your screen. I can't give legal, tax or investment advice, so "
              "please ask a licensed attorney or tax professional, and remember there is risk, so verify. I can't send, save, call or write "
              "anything, and practice calls are a separate tool. A year of income divided by the price (cap rate) is a share, and 18,000 is a year "
