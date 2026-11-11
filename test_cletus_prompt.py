@@ -126,10 +126,10 @@ class DealRulesTests(unittest.TestCase):
     def setUp(self):
         self.text = cp.system_message()["content"]
 
-    def test_the_five_deal_rules_are_in_the_system_message_after_the_hard_rules_and_before_the_soft_ones(self):
+    def test_the_six_deal_rules_are_in_the_system_message_after_the_hard_rules_and_before_the_soft_ones(self):
         for rule in cp.deal_rules:
             self.assertIn(rule, self.text)
-        self.assertEqual(len(cp.deal_rules), 5)
+        self.assertEqual(len(cp.deal_rules), 6)
         self.assertLess(self.text.index(cp.hard_rules[-1]), self.text.index("HOW TO TALK ABOUT DEALS AND DATA:"))
         self.assertLess(self.text.index(cp.deal_rules[-1]), self.text.index("SOFT RULES:"))
 
@@ -140,7 +140,7 @@ class DealRulesTests(unittest.TestCase):
 
     def test_the_module_list_is_what_the_builder_gives_and_the_message_uses_the_builder(self):
         self.assertEqual(cp.deal_rules, cp.build_deal_rules())
-        self.assertEqual(len(cp.build_deal_rules()), 5)
+        self.assertEqual(len(cp.build_deal_rules()), 6)
         with mock.patch.object(cp, "build_deal_rules", lambda: ["ONLY THIS RULE"]):
             message = cp.system_message()["content"]
         self.assertIn("HOW TO TALK ABOUT DEALS AND DATA:\n- ONLY THIS RULE\n\nSOFT RULES:", message)
@@ -175,6 +175,19 @@ class DealRulesTests(unittest.TestCase):
         rule = cp.deal_rules[4]
         for words in ("PLAIN WORDS FOR JARGON", "plain words first", "the jargon trailing in parentheses", "the money left over each month after costs (cash flow)", "After the first time in an answer you may use either"):
             self.assertIn(words, rule)
+
+    def test_the_cannot_answer_rule_is_plain_and_offers_no_canned_line(self):
+        rule = cp.deal_rules[5]
+        for words in ("WHEN YOU CANNOT ANSWER", "in one sentence", "name it by its title", "do not offer other lessons", "Never end with an offer such as", "never offer a lesson that does not fit"):
+            self.assertIn(words, rule)
+
+    def test_the_scope_answers_where_to_look_and_phone_questions_and_declines_only_the_legal_one(self):
+        for words in ("HOW TO FIND WHERE TO LOOK", "HOW TO GET AN OWNER'S PHONE NUMBER", "never refuse them", "Area Screener",
+                      "Decline ONLY that legality question"):
+            self.assertIn(words, cp.scope)
+        self.assertIn("I can't say whether that is allowed. Check the do-not-call and calling-hour rules where you call, and ask a licensed attorney.", cp.scope)
+        self.assertNotIn("for that question only", cp.scope)  # an instruction-style sentence the model once echoed back as its answer
+        self.assertIn("H3. Never guarantee returns, and never say that calling or contacting an owner is legal or compliant.", cp.hard_rules)
 
     def test_no_verdict_words_are_listed_as_never_to_be_said(self):
         rule = cp.deal_rules[1]
@@ -412,6 +425,44 @@ class IdFilterTests(unittest.TestCase):
             out = "".join(cm.generate_stream(payload(), post=post))
         self.assertNotIn("lesson:", out)
         self.assertEqual(out, "Cash flow is money left.\n")
+
+
+class PhraseFilterTests(unittest.TestCase):
+    TEXT = "None of the lessons in your data block cover this. The data block says more. Use the data now; a block of ice; my data blocks."
+    CLEAN = "None of the lessons in the information I have cover this. The information I have says more. Use the data now; a block of ice; my data blocks."
+
+    @staticmethod
+    def run_chunks(chunks):
+        f = cm.PhraseFilter()
+        return "".join(f.feed(c) for c in chunks) + f.finish()
+
+    def test_the_phrase_is_rewritten_with_its_leading_word_and_the_capital_kept(self):
+        self.assertEqual(self.run_chunks([self.TEXT]), self.CLEAN)
+        self.assertEqual(self.run_chunks(["the data block", " and my data block."]), "the information I have and the information I have.")
+
+    def test_a_split_at_every_position_and_one_character_at_a_time_give_the_same_text(self):
+        for i in range(len(self.TEXT) + 1):
+            self.assertEqual(self.run_chunks([self.TEXT[:i], self.TEXT[i:]]), self.CLEAN, i)
+        self.assertEqual(self.run_chunks(list(self.TEXT)), self.CLEAN)
+
+    def test_other_text_with_the_same_words_is_untouched(self):
+        for s in ("the data is here", "a block of ice", "data blocks", "my data", "your block"):
+            self.assertEqual(self.run_chunks([s]), s)
+
+    def test_a_chunk_ending_in_a_possible_start_is_held_back(self):
+        f = cm.PhraseFilter()
+        self.assertEqual(f.feed("see your da"), "see ")
+        self.assertEqual(f.feed("ta block now"), "the information I have now")
+
+    def test_generate_stream_never_says_data_block(self):
+        def post(body):
+            for piece in ("None of the lessons in your da", "ta block cover it.\nSOURCES:"):
+                yield {"message": {"content": piece}}
+            yield {"done": True}
+        with mock.patch.object(ollama_client, "MODEL", lambda: "m"):
+            out = "".join(cm.generate_stream(payload(), post=post))
+        self.assertNotIn("data block", out.lower())
+        self.assertEqual(out, "None of the lessons in the information I have cover it.\n")
 
 
 class SourcesFilterTests(unittest.TestCase):

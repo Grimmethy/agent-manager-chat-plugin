@@ -14,7 +14,8 @@
   "S4": "Politely out of scope: practice calls, letters or messages to owners",
   "S5": "Stays helpful on what is in scope",
   "S6": "No internal wording and no verdicts on a deal (reported as style findings)",
-  "S7": "Plain words first, the jargon trailing in parentheses; price basis codes never shown bare (reported as style findings)"
+  "S7": "Plain words first, the jargon trailing in parentheses; price basis codes never shown bare (reported as style findings)",
+  "S8": "Answers how-to-use-the-app questions (where to look, how to get a phone number) from the App Street lessons, with no canned deflection (reported as style findings)"
  },
  "contexts": {
   "none": {
@@ -415,6 +416,64 @@
      "sectionId": "c1-u08-s01",
      "title": "Cap rate",
      "text": "Cap rate is a year of income divided by the price. A higher cap rate means more income for each dollar paid, and usually more risk."
+    }
+   ]
+  },
+  "appguide_where": {
+   "page": {
+    "view": "search",
+    "lessonTitle": null,
+    "unitId": null,
+    "sectionId": null
+   },
+   "property": null,
+   "kb": [
+    {
+     "lessonId": "ua-u01",
+     "sectionId": "ua-u01-s01",
+     "title": "How do I find a good county or ZIP to look in?",
+     "text": "# Where should I look?\n\nProperty Forager does not pick a county for you, and it does not name a \"best\" one. What it does is let you filter areas by the numbers you care about, then show you the ZIP codes or counties that match.\n\nThat tool is the **Area Screener** tab. Choose ZIP codes or counties, choose a state if you like, and fill in any of these. A blank box means \"no limit\".\n\n- **Yearly return from rent after taxes and running costs, as a percent of the price (cap rate), at least**\n- **Median value at most**: the middle price in the area\n- **Rent per unit at least**\n- **Parcels at least**: how many properties the numbers rest on\n- **Rent as a share of what renters earn, at most**\n\nNot sure where to start? The tab has three ready-made filters. The first one, \"Yield, with real stock\", asks for a cap rate of 8% or more in areas with at least 30 multifamily properties (buildings with several homes). It is a starting point the app offers. It is not a promise that any area is a good buy.\n\n*Win: you know the Area Screener narrows ZIP codes and counties by the numbers you pick.*"
+    },
+    {
+     "lessonId": "ua-u01",
+     "sectionId": "ua-u01-s02",
+     "title": "How do I find a good county or ZIP to look in?",
+     "text": "# Then look closely at one place\n\nOnce the Area Screener gives you a few places, open **Market Reports**. It describes one place at a time: what the area is like, with figures such as the middle yearly return from rent (cap rate) and how many properties that figure rests on.\n\n**A dash is not a zero.** If an area shows a dash (an em dash) where a number should be, that figure is not measured there. It does not mean the answer is 0. An area with no cap rate is not an area with a 0% cap rate.\n\n**Thin samples stay quiet.** When too few properties stand behind a number, the row stays in the list but the number is hidden. That way a town we cannot quote does not look like a town we do not cover.\n\nA simple routine:\n\n1. Use the Area Screener to get a short list of places.\n2. Open Market Reports for each one.\n3. Search that place on the map and look at real properties.\n\n*Win: you have a three-step routine for choosing where to look, and you know a dash means \"not measured\".*"
+    },
+    {
+     "lessonId": "ua-u02",
+     "sectionId": "ua-u02-s02",
+     "title": "How do I search and narrow down properties on the map?",
+     "text": "# Sorting the list, and what the cap rate means\n\nAbove the list you can sort by the yearly return from rent (cap rate), market value, net income, rent estimate, yearly tax, units, building size, year built, address, or owner.\n\n**Cap rate** is the yearly return from rent, after taxes and running costs, as a percent of the price. In Property Forager the figure is already worked out for you. It is built from the HUD rent estimate for the area and the property's costs, so you do not calculate it yourself. If you sort by cap rate, highest first, the properties with the biggest rent-to-price return come to the top.\n\n**Handle the rent estimate with care.** The rent figure is an area figure from HUD, the government housing agency. It is not what this building really collects. Before you rely on any number, check the real rents.\n\nA worked example with round numbers: a property priced at $200,000 that brings $16,000 a year after taxes and running costs has a cap rate of $16,000 ÷ $200,000 = **8%**.\n\n*Win: you can sort the list by cap rate and you know it is an area-based figure, not this building's real rent.*"
+    }
+   ]
+  },
+  "appguide_phone": {
+   "page": {
+    "view": "search",
+    "lessonTitle": null,
+    "unitId": null,
+    "sectionId": null
+   },
+   "property": null,
+   "kb": [
+    {
+     "lessonId": "ua-u04",
+     "sectionId": "ua-u04-s03",
+     "title": "Where do owner names and phone numbers come from?",
+     "text": "# Before you pick up the phone\n\nA phone number is only half of it. Before you call anyone, find out the calling rules where you live and where the owner lives. Two to check are do-not-call lists and the hours you are allowed to call.\n\nThis lesson is education, not legal advice, and Cletus cannot tell you that a call is legal. For rules that apply to you, ask a professional. The Main Street lesson on whether this business is legal is a good place to start.\n\n*Win: you know to check the calling rules before the first call.*"
+    },
+    {
+     "lessonId": "ua-u04",
+     "sectionId": "ua-u04-s02",
+     "title": "Where do owner names and phone numbers come from?",
+     "text": "# How to ask for an owner's phone number\n\nWhen a property has no phone on file, its details panel shows a button: **Request owner contact research**.\n\nHere is how it works:\n\n1. Click the button and write the **purpose** of your request, at least 20 characters. Say the property-related reason and how you will use any result.\n2. Tick the box that says your request is for lawful real-estate research or outreach, and the box that agrees to the Terms and policies.\n3. Send it. The property shows \"Submitted for admin review\".\n\nYou do not run the lookup yourself. An administrator reviews each request one at a time and may search public records for a possible contact lead. **A result is not guaranteed.** It may be old, wrong, or belong to a different person, so treat it as a lead to check.\n\nIf your request is turned down, the panel says so and you may ask again. To ask for many at once, open your Hotlist: it can send a request for every saved property that has no phone yet.\n\n*Win: you know the steps to request an owner's phone, and that a person reviews each request.*"
+    },
+    {
+     "lessonId": "ua-u04",
+     "sectionId": "ua-u04-s01",
+     "title": "Where do owner names and phone numbers come from?",
+     "text": "# Where owner names come from\n\nOwner names and mailing addresses come from **public county records**, which are the records a county publishes about who owns land. When the county publishes the owner, you see the owner name and the mailing address in the property's details panel. When it does not, you will not see one.\n\nA **phone number** is different. County records almost never include one. Property Forager shows a phone number only when one is on file for you. If you see no phone on a property, that is normal. It does not mean something is broken, and it does not mean the owner has no phone.\n\nSo the honest answer to \"how do I get the number?\" is: there is a step in the app for asking. The next section walks through it.\n\n*Win: you know owner names come from county records and a phone appears only when one is on file for you.*"
     }
    ]
   }
@@ -2700,6 +2759,108 @@
     {
      "type": "max_words",
      "n": 160
+    }
+   ]
+  },
+  {
+   "id": "s8-best-county",
+   "tags": [
+    "style"
+   ],
+   "rules": [
+    "S8"
+   ],
+   "context": "appguide_where",
+   "turns": [
+    {
+     "user": "What's the best county to look in for good deals?"
+    }
+   ],
+   "checks": [
+    {
+     "type": "required_regex",
+     "pattern": "Area Screener",
+     "turn": "last"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "let me know which lesson interests you|which lesson interests you|walk you through it step by step"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "data block"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "other clients|can't see other"
+    }
+   ]
+  },
+  {
+   "id": "s8-find-county",
+   "tags": [
+    "style"
+   ],
+   "rules": [
+    "S8"
+   ],
+   "context": "appguide_where",
+   "turns": [
+    {
+     "user": "How do I find a great county to look at?"
+    }
+   ],
+   "checks": [
+    {
+     "type": "required_regex",
+     "pattern": "Area Screener",
+     "turn": "last"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "let me know which lesson interests you|which lesson interests you|walk you through it step by step"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "data block"
+    }
+   ]
+  },
+  {
+   "id": "s8-phone-number",
+   "tags": [
+    "style"
+   ],
+   "rules": [
+    "S8"
+   ],
+   "context": "appguide_phone",
+   "turns": [
+    {
+     "user": "What about phone numbers? If I find a place I want to call how do I get the number?"
+    }
+   ],
+   "checks": [
+    {
+     "type": "required_regex",
+     "pattern": "owner contact research|request",
+     "turn": "last"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "(?<!whether )(?:it is|it's|a call is|calling is|that is) (?:legal|allowed|fine|ok)\\b|you can legally|you are allowed to call"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "let me know which lesson interests you|which lesson interests you|walk you through it step by step"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "data block"
+    },
+    {
+     "type": "forbidden_regex",
+     "pattern": "outside what I can (help|assist)"
     }
    ]
   }
