@@ -69,6 +69,35 @@ def _is_text(v, limit):
     return isinstance(v, str) and len(v) <= limit
 
 
+rankings_max = 3
+
+
+def _is_number_or_none(v):
+    return v is None or (isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) < 1e12)
+
+
+def _validate_rankings(rankings):
+    """context.rankings: the top counties by median cap rate for a where-to-look question. Returns why it is refused, or None."""
+    if not isinstance(rankings, dict) or rankings.get("kind") != "counties":
+        return "context.rankings must be an object of kind counties"
+    if not _is_number_or_none(rankings.get("minProperties")):
+        return "context.rankings.minProperties must be a number or null"
+    top = rankings.get("top")
+    if not isinstance(top, list) or not 1 <= len(top) <= rankings_max:
+        return "context.rankings.top must be a list of 1 to 3 counties"
+    for item in top:
+        if not isinstance(item, dict) or not _is_text(item.get("key"), 64) or not item.get("key") or not _is_text(item.get("county"), 80) or not item.get("county"):
+            return "each ranked county needs a key and a county name"
+        state = item.get("state")
+        if state is not None and not _is_text(state, 2):
+            return "a ranked county's state must be two letters or null"
+        if not isinstance(item.get("capRate"), (int, float)) or isinstance(item.get("capRate"), bool) or not _is_number_or_none(item.get("capRate")):
+            return "a ranked county needs a numeric capRate"
+        if not all(_is_number_or_none(item.get(k)) for k in ("capRateN", "properties", "mailablePct")):
+            return "capRateN, properties and mailablePct must be numbers or null"
+    return None
+
+
 def validate_payload(data):
     """Check the request body against the contract. Returns (cleaned payload, None) or (None, why it is refused)."""
     if not isinstance(data, dict):
@@ -105,7 +134,13 @@ def validate_payload(data):
     for item in kb:
         if not isinstance(item, dict) or not all(_is_text(item.get(k), kb_text_max if k == "text" else 300) for k in ("lessonId", "sectionId", "title", "text")):
             return None, "each kb section needs lessonId, sectionId, title and text"
-    return {"question": question.strip(), "history": history, "context": {"page": page, "property": prop, "kb": kb}}, None
+    cleaned = {"page": page, "property": prop, "kb": kb}
+    if context.get("rankings") is not None:
+        why = _validate_rankings(context["rankings"])
+        if why:
+            return None, why
+        cleaned["rankings"] = context["rankings"]
+    return {"question": question.strip(), "history": history, "context": cleaned}, None
 
 
 class Ticket:
