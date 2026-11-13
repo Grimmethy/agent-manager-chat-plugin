@@ -522,7 +522,9 @@ class GeneratedMutantTests(unittest.TestCase):
         import subprocess
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "r.md"
-            done = subprocess.run([sys.executable, "-B", str(Path(run.__file__)), "--fake", "--out", str(out)], capture_output=True, text=True, timeout=60)
+            run_path = str(Path(__file__).resolve().parent / "run.py")
+            exe = sys.executable or "/usr/bin/python3.12"
+            done = subprocess.run([exe, "-B", run_path, "--fake", "--out", str(out)], capture_output=True, text=True, timeout=60)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertTrue(out.exists())
             self.assertIn("scenarios", done.stdout)
