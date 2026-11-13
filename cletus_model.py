@@ -145,6 +145,44 @@ class PhraseFilter:
         return self._rewrite(out)
 
 
+class DataBlockFilter:
+    """Rewrites the internal phrase "data block" in the streamed text: "your data block" becomes "what I can see", "my data block" becomes "what I can see", and "the data block" or a bare "data block" becomes "the information".
+
+    The same hold-back as PhraseFilter: a chunk that ends in a possible start of the phrase is held until it resolves; finish() flushes.
+    """
+
+    _phrase = re.compile(r"\b(?:(?P<lead>your|the|my)\s+)?data\s+block\b", re.IGNORECASE)
+    _prefixes = {full[:j] for full in ("your data block", "the data block", "my data block", "data block") for j in range(1, len(full) + 1)}
+    _wording = {"your": "what I can see", "my": "what I can see", "the": "the information", "": "the information"}
+
+    def __init__(self):
+        self._buf = ""
+
+    def _hold_at(self, buf):
+        at = len(buf)
+        for k in range(min(len(buf), 16), 0, -1):
+            tail = buf[-k:].lower()  # a possible start of the phrase, at a word boundary
+            if tail in self._prefixes and len(buf) - k < at and (k == len(buf) or not buf[-k - 1].isalnum()):
+                at = len(buf) - k
+        return at
+
+    def _rewrite(self, text):
+        def swap(m):
+            r = self._wording[(m.group("lead") or "").lower()]
+            return r[0].upper() + r[1:] if m.group(0)[0].isupper() else r
+        return self._phrase.sub(swap, text)
+
+    def feed(self, text):
+        self._buf += text
+        at = self._hold_at(self._buf)
+        out, self._buf = self._buf[:at], self._buf[at:]
+        return self._rewrite(out)
+
+    def finish(self):
+        out, self._buf = self._buf, ""
+        return self._rewrite(out)
+
+
 def parse_sources(line, payload):
     """The ids on a SOURCES: line that match what the payload supplied, in order, without repeats."""
     context = payload.get("context") or {}
@@ -250,7 +288,7 @@ def _filtered(send, body):
     """One model call through the three filters. Yields the cleaned text; RETURNS the withheld SOURCES line (or None)."""
     flt = SourcesFilter()
     ids = IdFilter()
-    phrases = PhraseFilter()
+    phrases = DataBlockFilter()
     try:
         for part in send(body):
             if not isinstance(part, dict):

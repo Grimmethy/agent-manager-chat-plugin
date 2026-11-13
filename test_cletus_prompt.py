@@ -464,7 +464,7 @@ class PhraseFilterTests(unittest.TestCase):
         with mock.patch.object(ollama_client, "MODEL", lambda: "m"):
             out = "".join(cm.generate_stream(payload(), post=post))
         self.assertNotIn("data block", out.lower())
-        self.assertEqual(out, "None of the lessons in the information I have cover it.\n")
+        self.assertEqual(out, "None of the lessons in what I can see cover it.\n")
 
 
 class InferSourcesTests(unittest.TestCase):
