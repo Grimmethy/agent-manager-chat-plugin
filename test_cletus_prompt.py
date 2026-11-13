@@ -944,5 +944,39 @@ class GenerateStreamTests(unittest.TestCase):
         self.assertEqual(frames[-1]["sources"], [{"kind": "field", "name": "capRate"}])
 
 
+class NewPromptBehaviourTests(unittest.TestCase):
+    """The legality decline, the app-usage answers and the phone-number answer keep their wording. Reads module strings only."""
+
+    def setUp(self):
+        self.scope = cp.scope
+        self.system = cp.system_message()["content"]
+
+    def test_legality_decline_is_quoted_example(self):
+        quote = chr(34)
+        example = quote + "I can't say whether that is allowed. Check the do-not-call and calling-hour rules where you call, and ask a licensed attorney." + quote
+        self.assertIn("Decline ONLY that legality question", self.scope)
+        self.assertIn("for example: " + example, self.scope)
+        self.assertEqual(self.scope.count(example), 1)
+
+    def test_scope_text_has_no_for_that_question_only(self):
+        self.assertNotIn("for that question only", self.scope)
+        self.assertNotIn("for that question only", self.system)
+
+    def test_app_usage_question_not_deflected(self):
+        self.assertIn("HOW TO FIND WHERE TO LOOK", self.scope)
+        self.assertIn("app questions", self.scope)
+        self.assertIn("answer them from", self.scope)
+        self.assertIn("never refuse them", self.scope)
+
+    def test_phone_number_question_not_deflected(self):
+        self.assertIn("HOW TO GET AN OWNER'S PHONE NUMBER", self.scope)
+        self.assertIn("never refuse them", self.scope)
+        h4 = cp.hard_rules[3]
+        self.assertTrue(h4.startswith("H4. "))
+        self.assertIn("phone number", h4)
+        self.assertIn("only if it appears in the property fields of the DATA block", h4)
+        self.assertIn(h4, self.system)
+
+
 if __name__ == "__main__":
     unittest.main()
