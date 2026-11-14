@@ -153,6 +153,14 @@ def api_chat_set_project(session_id):
         return jsonify({"ok": False, "error": "Session not found or no longer active"}), 404
     return jsonify({"ok": True, "chosen_project": label, "session": updated})
 
+@chat_bp.route("/api/chat/<session_id>/stop", methods=["POST"])
+def api_chat_stop(session_id):
+    """Stop the live turn for this session by setting its stop event. Returns 200 {"status": "stopping"} if a turn was live, otherwise 404."""
+    from chat_sessions import stop_session
+    if stop_session(session_id):
+        return jsonify({"status": "stopping"}), 200
+    abort(404)
+
 @chat_bp.route("/api/chat/active", methods=["GET"])
 def api_chat_active():
     """Loads (or creates, if none exists yet) the most recently used conversation --
@@ -392,6 +400,14 @@ def api_chat_message(session_id):
     # local_tool_client.stream_plan_with_tools() below reaches that same route.
 
     def generate():
+        from chat_sessions import _register_stop_event, _clear_stop_event
+        _register_stop_event(session_id)
+        try:
+            yield from _generate_inner()
+        finally:
+            _clear_stop_event(session_id)
+
+    def _generate_inner():
         from chat_sessions import record_turn_error
 
         def fail(msg):
@@ -429,6 +445,7 @@ def api_chat_message(session_id):
 
         if is_local_turn:
             yield ": working\n\n"  # SSE comment: gets the headers and a first byte to the browser before the (up to 20 s) preempt call
+            yield f"data: {json.dumps({'type': 'status', 'message': 'queued-for-GPU'})}\n\n"
             try:
                 preempted = internal_preempt()
             except InternalApiError as e:  # noqa: BLE001 -- never block a chat turn on this
