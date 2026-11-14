@@ -169,12 +169,15 @@ def api_chat_new():
     """Starts a fresh conversation alongside the existing ones (it no longer ends the
     active one -- POST /api/chat/<id>/close does that). Body: {provider?, model?,
     effort?} -- same _discuss_provider_args fallback (local by default) every other
-    Discuss-family start route already uses."""
+    Discuss-family start route already uses. An optional JSON body {"readOnly": true}
+    starts a read-only conversation: the Claude provider then gets Read, Grep and Glob only."""
     from app import CHAT_STORAGE_DIR, _call_chat, _chat_roots, _discuss_provider_args, instances_dir
     from chat_sessions import start_new_conversation
     provider, model, effort = _discuss_provider_args()
+    body = request.get_json(silent=True) or {}
     session = _call_chat(start_new_conversation, CHAT_STORAGE_DIR, _chat_roots(),
-                           instances_dir(), provider=provider, model=model, effort=effort)
+                           instances_dir(), provider=provider, model=model, effort=effort,
+                           read_only=body.get("readOnly") is True)
     return jsonify(session)
 
 
