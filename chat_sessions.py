@@ -56,6 +56,8 @@ PROVIDER_CLAUDE = "claude"
 # system"). cwd is the live repoRoot, not an isolated worktree -- see this module's own
 # header on the trust model this mirrors (this actual terminal session).
 CHAT_CLAUDE_ALLOWED_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
+# A read-only conversation (Feature Forge grill sessions, 2026-11-13): Claude may look but never change anything.
+CHAT_CLAUDE_READ_ONLY_TOOLS = "Read,Grep,Glob"
 CHAT_CLAUDE_MAX_TURNS = 30
 # 2026-11-03: a Chat turn is an agentic session (tools, up to CHAT_CLAUDE_MAX_TURNS turns), not a single
 # completion, but claude -p was killed at the 300 s default ("spawnSync claude ETIMEDOUT" on a repo-trial
@@ -263,7 +265,7 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _new_session(roots: list, instances_dir, provider: str, model: str, effort: str) -> dict:
+def _new_session(roots: list, instances_dir, provider: str, model: str, effort: str, read_only: bool = False) -> dict:
     session_id = f"chat-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     roots = [r for r in (roots or []) if r] or ["."]
     return {
@@ -276,6 +278,8 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
         # plugin/project repos, all read/write. See app.py:_chat_roots().
         "roots": roots,
         "repoRoot": roots[0],
+        # True: the Claude provider runs with Read, Grep and Glob only (CHAT_CLAUDE_READ_ONLY_TOOLS). Sessions saved before this field existed read as False.
+        "readOnly": bool(read_only),
         "instancesDir": str(instances_dir) if instances_dir else None,
         # Only meaningful for the Claude provider (claude_client.generate()'s own
         # `resume` param) -- the CLI's real session id, captured from the first reply and
@@ -314,7 +318,7 @@ def _last_used(session: dict) -> str:
     return max(session.get("lastActivityAt") or "", session.get("startedAt") or "")
 
 
-def _find_existing_empty_session(storage_dir: Path, roots: list, provider: str, model, effort) -> dict | None:
+def _find_existing_empty_session(storage_dir: Path, roots: list, provider: str, model, effort, read_only: bool = False) -> dict | None:
     """Find an existing active session that has never been touched (lastActivityAt is
     None) AND was created for the same roots, provider, model and effort. Used to
     deduplicate rapid "New Chat" clicks: if a freshly created session hasn't received its
@@ -325,7 +329,8 @@ def _find_existing_empty_session(storage_dir: Path, roots: list, provider: str, 
     for session in _read_sessions(storage_dir).values():
         if (session.get("status") == "active" and session.get("lastActivityAt") is None
                 and session.get("roots") == roots and session.get("provider") == provider
-                and session.get("model") == model and session.get("effort") == effort):
+                and session.get("model") == model and session.get("effort") == effort
+                and bool(session.get("readOnly")) == bool(read_only)):
             return session
     return None
 
@@ -350,7 +355,8 @@ def get_active_session(storage_dir: Path, roots: list, instances_dir=None,
 
 
 def start_new_conversation(storage_dir: Path, roots: list, instances_dir=None,
-                            provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
+                            provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None,
+                            read_only: bool = False) -> dict:
     """Starts a fresh conversation ALONGSIDE the existing ones (2026-10-18: it used to end
     every active session first, so "New" destroyed the chat you were in). Use
     end_session() to close one.
@@ -360,10 +366,10 @@ def start_new_conversation(storage_dir: Path, roots: list, instances_dir=None,
     message), return it instead of creating a duplicate. This prevents double-creating
     empty sessions when the New Chat button is clicked rapidly. Once a message has been
     sent in it, the next "New" creates a new conversation as before."""
-    existing_empty = _find_existing_empty_session(storage_dir, roots, provider, model, effort)
+    existing_empty = _find_existing_empty_session(storage_dir, roots, provider, model, effort, read_only)
     if existing_empty:
         return existing_empty
-    session = _new_session(roots, instances_dir, provider, model, effort)
+    session = _new_session(roots, instances_dir, provider, model, effort, read_only)
     _write_session(storage_dir, session)
     return session
 
@@ -522,7 +528,12 @@ def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
     # carries all of this forward on every later turn, same as before.
     if not session.get("claudeSessionId"):
         preamble_parts = []
-        if len(roots) > 1:
+        if session.get("readOnly"):
+            preamble_parts.append(
+                "This conversation is READ-ONLY: you can Read, Grep and Glob in the repos below, "
+                "and you must not try to change anything.\n" + _roots_blurb(session)
+            )
+        elif len(roots) > 1:
             preamble_parts.append(
                 "You are rooted at the agent-manager repo and also have full read/write "
                 "access to these additional repos:\n" + _roots_blurb(session)
@@ -581,7 +592,8 @@ def _send_claude(session: dict, message: str, storage_dir: Path) -> str:
     token_file = entry.get("tokenFile") if entry else None
     result = claude_client.generate(
         message, model=session.get("model"), effort=session.get("effort"),
-        cwd=session["repoRoot"], allowed_tools=CHAT_CLAUDE_ALLOWED_TOOLS,
+        cwd=session["repoRoot"],
+        allowed_tools=CHAT_CLAUDE_READ_ONLY_TOOLS if session.get("readOnly") else CHAT_CLAUDE_ALLOWED_TOOLS,
         max_turns=CHAT_CLAUDE_MAX_TURNS, resume=session.get("claudeSessionId"),
         add_dirs=roots[1:], allow_amplification=True,
         token_file=token_file, timeout_s=CHAT_CLAUDE_TIMEOUT_S,
