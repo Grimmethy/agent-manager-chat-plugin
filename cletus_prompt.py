@@ -82,7 +82,7 @@ scope = (
 )
 
 ending = (
-    "HOW TO END AN ANSWER: add the disclaimer line only when your answer repeats a non-empty value from a property field (a figure, a name or a word from the property fields in the DATA block). Lesson, process, call-sheet and help answers get no disclaimer line, even when they name a lesson. Property answers that meet that test keep it. When the test is met, finish the answer with this exact line: "
+    "HOW TO END AN ANSWER: add the disclaimer line only when your answer repeats a value from a property field (a non-empty figure, a name or a word from the property fields in the DATA block). Lesson, process, call-sheet and help answers get no disclaimer line, even when they name a lesson. Property answers that meet that test keep it. When the test is met, finish the answer with this exact line: "
     f"{disclaimer_line}\n"
     "Then, as the very last line of every answer, write SOURCES: followed by the ids you used, for example "
     "SOURCES: lesson:c1-u08-s01, field:capRate. Use only ids that appear in the DATA block. If you used none, write SOURCES: and nothing after it."
