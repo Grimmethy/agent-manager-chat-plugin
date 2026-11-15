@@ -220,6 +220,37 @@ def county_sources(answer, payload):
     return out
 
 
+def question_sources(payload, lesson):
+    """Lesson sources for the kb sections that share enough words with the client's question, not already in lesson, at most infer_max.
+
+    Scored with the same shared-word helper and thresholds as infer_sources, but against the question instead of the answer. Only sections
+    the payload supplied can be named.
+    """
+    words = _distinct_words(payload.get("question") or "")
+    if not words:
+        return []
+    have = {s.get("sectionId") for s in lesson if s.get("kind") == "lesson"}
+    scored = []
+    for item in ((payload.get("context") or {}).get("kb") or []):
+        if item.get("sectionId") in have:
+            continue
+        shared = len(words & _distinct_words(item.get("text", "")))
+        if shared >= infer_min_shared and shared / len(words) >= infer_min_share:
+            scored.append((shared, item))
+    scored.sort(key=lambda x: -x[0])
+    return [{"kind": "lesson", "lessonId": i["lessonId"], "sectionId": i["sectionId"]} for _, i in scored[:infer_max]]
+
+
+def all_sources(found, text, payload):
+    """The lesson sources (the SOURCES: line's valid ids, else worked out from the answer, plus question matches) and the county sources, together."""
+    lesson = [s for s in found if s["kind"] == "lesson"]
+    fields = [s for s in found if s["kind"] == "field"]
+    if not lesson:
+        lesson = infer_sources(text, payload)
+    lesson = lesson + question_sources(payload, lesson)
+    return fields + lesson + county_sources(text, payload)
+
+
 def request_body(payload, model):
     return {
         "model": model,
@@ -326,7 +357,7 @@ def generate_stream(payload, post=None):
         yield out
     text = "".join(emitted)
     found = parse_sources(sources_line, payload) if sources_line else []
-    return (found or infer_sources(text, payload)) + county_sources(text, payload)
+    return all_sources(found, text, payload)
 
 
 def _collect(send, body):
@@ -360,4 +391,4 @@ def _guarded(payload, body, send, context):
     if text:
         yield text
     found = parse_sources(sources_line, payload) if sources_line else []
-    return (found or infer_sources(text, payload)) + county_sources(text, payload)
+    return all_sources(found, text, payload)
