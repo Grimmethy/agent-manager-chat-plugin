@@ -371,6 +371,33 @@ def _collect(send, body):
             return "".join(parts), stop.value
 
 
+def add_rankings_caveats(text, payload, sources):
+    """Two deterministic sentences added to a county answer on the rankings path, with no model call.
+
+    A lesson title is named when the question asks for a lesson and the answer does not already give it. The top county gets a plain
+    sentence that it has no owner name to write to only when its supplied mailablePct is exactly 0: the context states no threshold, so
+    no other number is used.
+    """
+    context = payload.get("context") or {}
+    question = str(payload.get("question") or "").lower()
+    extra = []
+    if "lesson" in question or "point me to" in question:
+        titles = {i.get("sectionId"): i.get("title") for i in (context.get("kb") or [])}
+        for s in sources:
+            title = titles.get(s.get("sectionId")) if s.get("kind") == "lesson" else None
+            if title and str(title).lower() not in text.lower():
+                extra.append(f'The lesson "{cletus_prompt.neutralise(title)}" covers this.')
+                break
+    ranked = (context.get("rankings") or {}).get("top") or []
+    share = ranked[0].get("mailablePct") if ranked else None
+    if isinstance(share, (int, float)) and not isinstance(share, bool) and share == 0 and "owner name" not in text.lower():
+        name = cletus_prompt.neutralise(ranked[0].get("county") or "This county")
+        extra.append(f"{name} has no owner name we can write to (0%).")
+    if not extra:
+        return text
+    return text + " " + " ".join(extra)
+
+
 def _guarded(payload, body, send, context):
     """A county-ranking answer is held back until its figures are checked against the ranking, so a figure the model made up is never shown.
 
@@ -388,7 +415,8 @@ def _guarded(payload, body, send, context):
     if bad:
         guard_stats["fallback"] += 1
         text, sources_line = fallback_ranking_answer(context), None
-    if text:
-        yield text
     found = parse_sources(sources_line, payload) if sources_line else []
-    return all_sources(found, text, payload)
+    sources = all_sources(found, text, payload)
+    if text:
+        yield add_rankings_caveats(text, payload, sources)
+    return sources
