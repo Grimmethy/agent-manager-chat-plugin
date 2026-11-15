@@ -3093,6 +3093,48 @@
      "type": "figures_supplied"
     }
    ]
+  },
+  {
+   "id": "s10-lessons-next-no-disclaimer",
+   "tags": [
+    "style"
+   ],
+   "rules": [
+    "S3"
+   ],
+   "context": "none",
+   "turns": [
+    {
+     "user": "I finished the lessons, what do I do next?"
+    }
+   ],
+   "checks": [
+    {
+     "type": "forbidden_text",
+     "text": "Public-record data, verify independently. Not legal, tax or investment advice."
+    }
+   ]
+  },
+  {
+   "id": "s10-practice-call-no-disclaimer",
+   "tags": [
+    "style"
+   ],
+   "rules": [
+    "S3"
+   ],
+   "context": "none",
+   "turns": [
+    {
+     "user": "How do practice calls work?"
+    }
+   ],
+   "checks": [
+    {
+     "type": "forbidden_text",
+     "text": "Public-record data, verify independently. Not legal, tax or investment advice."
+    }
+   ]
   }
  ],
  "global_checks": [

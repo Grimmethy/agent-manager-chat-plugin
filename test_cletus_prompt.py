@@ -100,6 +100,15 @@ class SystemMessageTests(unittest.TestCase):
         self.assertEqual(cp.disclaimer_line, DISCLAIMER)
         self.assertIn("finish the answer with this exact line: " + DISCLAIMER, self.system["content"])
 
+    def test_the_disclaimer_is_only_for_property_field_answers(self):
+        text = self.system["content"]
+        self.assertIn("only when your answer repeats a value from a property field", text)
+
+    def test_noi_is_said_in_plain_words_first(self):
+        text = self.system["content"]
+        self.assertIn("the money left each year after the property's costs (NOI)", text)
+        self.assertNotIn("NOI:", text)
+
     def test_it_says_what_cletus_does_not_do(self):
         text = self.system["content"]
         for phrase in ("legal, tax or investment advice", "practice calls", "letters to owners", "licensed attorney"):
