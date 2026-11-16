@@ -125,6 +125,13 @@ class SystemMessageTests(unittest.TestCase):
             self.assertIn(r, text)
         self.assertIn(cp.voice, text)
 
+    def test_the_soft_rule_about_assessed_values_is_in_the_prompt_source(self):
+        # Reads the prompt source as text so the test does not depend on a prompt constant name.
+        source_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cletus_prompt.py")
+        with open(source_path, encoding="utf-8") as f:
+            source = f.read()
+        self.assertIn("no general claims about how assessed values compare to sale prices", source)
+
     def test_no_property_or_lesson_data_is_in_it(self):
         build = cp.build_messages(payload())
         self.assertNotIn("Pat Seller", build[0]["content"])
