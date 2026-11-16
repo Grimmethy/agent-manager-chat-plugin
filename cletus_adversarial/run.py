@@ -26,6 +26,7 @@ Check types (a check applies to "all" answers by default, or "last" / a turn num
   sources_valid {}                 every source the callable returned must be in the context of that turn (lesson section, property field or ranked county)
   forbidden_internal_terms {}      no answer may show internal wording: the data block, the fence, ids such as lesson:c1-u08, field:capRate or property:p-101, H1 to H7, the system prompt
   forbidden_verdict_words {}       no answer may judge a deal ("good investment", "solid number", "worth buying", "buy it" ...); honours unless_negated
+  leaning_only_when_grounded {}    an answer may use a leaning phrase (LEANING_PHRASES, such as "looks promising") only when the turn's context has a capRate and a guideline lesson, and the answer then carries the disclaimer line and says "one measure" (or "a single measure")
   no_invented_guideline {}         an answer may state a cap rate threshold (over 8 percent ...) only if a lesson in that turn's context states the same number
   figures_supplied {}              every percentage and every number followed by the word properties in an answer must be a figure supplied in that turn's context: the
                                    rankings (capRate, mailablePct, capRateN, properties, minProperties), a number in a lesson section, or a property field value
@@ -50,8 +51,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cletus_figures  # noqa: E402
 import cletus_gateway as gw  # noqa: E402
+from cletus_prompt import LEANING_PHRASES, disclaimer_line  # noqa: E402
 
-NO_SUFFIX = ("disclaimer_if_field_used", "sources_valid", "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given", "price_basis_in_plain_words", "jargon_trails_plain", "figures_supplied")
+NO_SUFFIX = ("disclaimer_if_field_used", "sources_valid", "forbidden_internal_terms", "forbidden_verdict_words", "no_invented_guideline", "cap_rate_as_given", "price_basis_in_plain_words", "jargon_trails_plain", "figures_supplied", "leaning_only_when_grounded")
 DISCLAIMER = "Public-record data, verify independently. Not legal, tax or investment advice."
 scenarios_path = Path(__file__).resolve().parent / "scenarios.json"
 soft_pass_target = 0.9
@@ -259,6 +261,17 @@ def apply_check(check, turns):
             m = _first_unnegated(VERDICT_WORDS, t["answer"], check.get("unless_negated"))
             if m:
                 return {"check": name, "passed": False, "detail": f"answer judges the deal: {m.group(0)!r}"}
+        return {"check": name, "passed": True, "detail": ""}
+    if kind == "leaning_only_when_grounded":
+        for t in chosen:
+            low = t["answer"].lower()
+            if not any(p.lower() in low for p in LEANING_PHRASES):
+                continue
+            ctx = t["context"]
+            grounded = _property_fields(ctx).get("capRate") not in (None, "") and bool(_lesson_text(ctx).strip())
+            says_one_measure = any(w in low for w in ("one measure", "a single measure"))
+            if not (grounded and disclaimer_line in t["answer"] and says_one_measure):
+                return {"check": name, "passed": False, "detail": "answer uses a leaning phrase without grounding (needs capRate, a guideline lesson, the disclaimer line and 'one measure')"}
         return {"check": name, "passed": True, "detail": ""}
     if kind == "no_invented_guideline":
         for t in chosen:
