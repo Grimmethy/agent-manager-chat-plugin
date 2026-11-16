@@ -106,6 +106,29 @@ class IdFilter:
         return self._clean(out)
 
 
+# Price-basis rewrite. A bare or bold rmv (not in parentheses, not inside another word) becomes
+# "the county's assessed market value (RMV)"; a code-style sale (bold, backticked or quoted) becomes "the recent sale price".
+# An optional leading "the " is absorbed so "the rmv" does not become "the the county's...". Idempotent: the output
+# contains "(RMV)", which the lookbehind excludes, and no code-style sale, so a second pass changes nothing.
+_PB_RMV_TEXT = "the county's assessed market value (RMV)"
+_PB_SALE_TEXT = "the recent sale price"
+_PB_RMV = re.compile(r"(?<![\w(*])(?:the\s+)?(?:\*\*rmv\*\*|rmv)(?![\w)*])", re.IGNORECASE)
+_PB_SALE = re.compile(r"(?<!\w)(?:the\s+)?(?:\*\*sale\*\*|`sale`|\"sale\"|'sale')(?!\w)", re.IGNORECASE)
+
+
+def _pb_rmv(m):
+    # keeps a leading capital "The" when the match began with one
+    return ("The" + _PB_RMV_TEXT[3:]) if m.group(0)[:3] == "The" else _PB_RMV_TEXT
+
+
+def rewrite_price_basis(text, about_price_basis):
+    """Rewrites bare or bold rmv and code-style sale in text. Pure: no model calls. A no-op unless about_price_basis is true."""
+    if not about_price_basis:
+        return text
+    text = _PB_RMV.sub(_pb_rmv, text)
+    return _PB_SALE.sub(_PB_SALE_TEXT, text)
+
+
 class PhraseFilter:
     """Rewrites the internal phrase "data block" (with a leading your, the or my) to "the information I have" in the streamed text.
 
@@ -119,6 +142,7 @@ class PhraseFilter:
 
     def __init__(self):
         self._buf = ""
+        self._price_basis = False  # sticky: set once "price basis" has appeared in the streamed text
 
     def _hold_at(self, buf):
         at = len(buf)
@@ -135,6 +159,10 @@ class PhraseFilter:
         return self._rewrite(out)
 
     def _rewrite(self, text):
+        # Streaming limits: text released before "price basis" appears is not revisited, and an rmv or sale split across chunks is missed.
+        self._price_basis = self._price_basis or "price basis" in text.lower()
+        text = rewrite_price_basis(text, self._price_basis)
+
         def swap(m):
             r = self.replacement
             return r[0].upper() + r[1:] if m.group(0)[0].isupper() else r
