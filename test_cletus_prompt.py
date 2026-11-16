@@ -476,6 +476,43 @@ class PhraseFilterTests(unittest.TestCase):
         self.assertEqual(out, "None of the lessons in the information I have cover it.\n")
 
 
+class PriceBasisRewriteTests(unittest.TestCase):
+    def test_a_bare_rmv_is_rewritten_and_a_leading_the_is_absorbed(self):
+        self.assertEqual(cm.rewrite_price_basis("Check the rmv here.", True), "Check the county's assessed market value (RMV) here.")
+        self.assertEqual(cm.rewrite_price_basis("The RMV is high.", True), "The county's assessed market value (RMV) is high.")
+
+    def test_a_bold_rmv_is_rewritten(self):
+        self.assertEqual(cm.rewrite_price_basis("Use **rmv** now.", True), "Use the county's assessed market value (RMV) now.")
+
+    def test_an_uppercase_rmv_is_rewritten(self):
+        self.assertEqual(cm.rewrite_price_basis("Use RMV now.", True), "Use the county's assessed market value (RMV) now.")
+
+    def test_an_rmv_already_in_parentheses_is_not_wrapped_again(self):
+        self.assertEqual(cm.rewrite_price_basis("See (rmv) and (RMV).", True), "See (rmv) and (RMV).")
+
+    def test_an_rmv_inside_another_word_is_untouched(self):
+        self.assertEqual(cm.rewrite_price_basis("The rmvalue and farmv are fine.", True), "The rmvalue and farmv are fine.")
+
+    def test_rewriting_twice_gives_the_same_text_as_rewriting_once(self):
+        once = cm.rewrite_price_basis("The rmv is in **rmv** and `sale` terms.", True)
+        self.assertEqual(once, "The county's assessed market value (RMV) is in the county's assessed market value (RMV) and the recent sale price terms.")
+        self.assertEqual(cm.rewrite_price_basis(once, True), once)
+
+    def test_sale_as_a_code_is_rewritten(self):
+        self.assertEqual(cm.rewrite_price_basis("Priced at `sale` today.", True), "Priced at the recent sale price today.")
+
+    def test_sale_in_ordinary_prose_is_untouched(self):
+        self.assertEqual(cm.rewrite_price_basis("The sale closed in a sale last May.", True), "The sale closed in a sale last May.")
+
+    def test_text_is_unchanged_when_it_is_not_about_price_basis(self):
+        self.assertEqual(cm.rewrite_price_basis("Use **rmv** and `sale` here.", False), "Use **rmv** and `sale` here.")
+
+    def test_the_data_block_rewrite_still_works_through_phrase_filter(self):
+        f = cm.PhraseFilter()
+        out = f.feed("The price basis is rmv. The data block says so.") + f.finish()
+        self.assertEqual(out, "The price basis is the county's assessed market value (RMV). The information I have says so.")
+
+
 class InferSourcesTests(unittest.TestCase):
     PHONE = ("When a property has no phone on file, the Request owner contact research button appears in the details panel. Click it and write "
              "a purpose of at least twenty characters, tick the lawful research box, and send it. An administrator reviews each request and may "
