@@ -2444,3 +2444,47 @@ Update the import statement in chat.js to import swapProviderLabel (the new name
 
 Benefits:
 Completes the rename refactoring and ensures chat.js continues to work correctly after the swap-view.js export is renamed. The import now uses a self-documenting name that indicates its source module.
+
+### AC-526 · AC-73a: Create shared provider-label module
+Strength: Strong
+Split-Depth: 1
+Files: static/provider-label.js
+
+Problem:
+Two view modules (static/sessions-view.js and static/swap-view.js) each contain their own branching logic for normalizing `session.provider` to a display label. The normalization rules (recognizing 'claude' and 'local', defaulting to 'unknown') are duplicated, and any future provider would need to be added in two places.
+
+Solution:
+Create static/provider-label.js exporting a single function `providerLabel(session)` that returns a structured result `{ provider, model, account }`. The `provider` field is normalized to one of 'claude', 'local', or 'unknown'. The `model` and `account` fields are read from the session object as-is (may be undefined). This module is the single authority on which provider strings are recognized and how they are normalized.
+
+Benefits:
+Single source of truth for provider normalization. Adding a new provider requires editing one file. The structured result lets each caller compose its own display string without duplicating the normalization logic.
+
+### AC-527 · AC-73b: Refactor sessions-view.js to use shared provider label
+Strength: Strong
+Split-Depth: 1
+Files: static/sessions-view.js
+Depends-On: AC-526
+
+Problem:
+static/sessions-view.js contains its own provider normalization logic in `providerLabel(row)`: it checks `row.provider === 'claude'` and falls back to 'Local', then conditionally appends the model. This duplicates the normalization rules that will live in the shared module.
+
+Solution:
+Import `providerLabel` from `./provider-label.js` (aliased to `resolveProvider` to avoid shadowing the exported name). Replace the inline branching with a call to `resolveProvider(row)`, then compose the display string from the structured result: if `result.provider === 'claude'` use 'Claude', otherwise 'Local'; if `result.model` is truthy append ` · <model>`, otherwise return the provider alone. The exported `providerLabel` still accepts a row object and returns a display string — the public API is unchanged.
+
+Benefits:
+Eliminates duplicated normalization logic. The display composition stays local to sessions-view.js (short label format), while the recognition rules live in the shared module. Downstream callers continue to receive a string with no changes.
+
+### AC-528 · AC-73c: Refactor swap-view.js to use shared provider label
+Strength: Strong
+Split-Depth: 1
+Files: static/swap-view.js
+Depends-On: AC-526
+
+Problem:
+static/swap-view.js contains its own provider normalization logic in `providerLabel(session)`: it branches on `s.provider === 'claude'` and `s.provider === 'local'`, with special handling for null/undefined account ('live account') and missing model. This duplicates the normalization rules that will live in the shared module.
+
+Solution:
+Import `providerLabel` from `./provider-label.js` (aliased to `resolveProvider`). Replace the inline branching with a call to `resolveProvider(session)`, then compose the display string from the structured result: if `result.provider === 'claude'` return `'Claude · <model> · <account>'` (using 'live account' when `result.account` is null/undefined, omitting the model part when `result.model` is falsy); if `result.provider === 'local'` return `'Local · <model>'` (or 'Local' when `result.model` is falsy); otherwise return 'Unknown'. The exported `providerLabel` still accepts a session object and returns a display string — the public API is unchanged.
+
+Benefits:
+Eliminates duplicated normalization logic. The longer formatted label (with account) stays local to swap-view.js, while the recognition rules live in the shared module. Preserves the current behavior including the 'live account' fallback and the Unknown case for unrecognized providers.
