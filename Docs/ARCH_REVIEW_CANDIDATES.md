@@ -2444,3 +2444,36 @@ Update the import statement in chat.js to import swapProviderLabel (the new name
 
 Benefits:
 Completes the rename refactoring and ensures chat.js continues to work correctly after the swap-view.js export is renamed. The import now uses a self-documenting name that indicates its source module.
+
+### AC-529 · Refactor stream_local_turn error contract in internal_api_client.py
+Strength: Strong
+Split-Depth: 1
+Files: internal_api_client.py
+
+Problem:
+stream_local_turn currently wraps both the initial requests.post + raise_for_status() AND the r.iter_lines() iteration in a single try/except that catches requests.RequestException and yields an in-body error object. This means connection failures (which should surface as HTTP 502 via InternalApiError, matching the contract of get_roots/preempt/reserve) are indistinguishable from mid-stream failures (which should yield an in-body error). The function's docstring also does not document this two-case contract.
+
+Solution:
+Split the single try/except in stream_local_turn into two scopes:
+1. Wrap the initial requests.post call and r.raise_for_status() in a try/except that catches requests.RequestException and raises InternalApiError (preserving the original exception as cause via raise ... from e).
+2. Wrap the r.iter_lines() iteration in a separate try/except that catches requests.RequestException and yields {"type": "error", "message": ...} into the response body.
+3. Update the docstring to document the two-case error contract: (a) initial-connection failure raises InternalApiError; (b) mid-stream failure yields an in-body error object.
+4. Add tests that mock requests.post to raise requests.RequestException before any body is sent (assert InternalApiError raised) and mock r.iter_lines() to raise after at least one line has been yielded (assert in-body error yielded).
+
+Benefits:
+Establishes a consistent error-propagation contract between streaming and non-streaming internal-API calls. Connection failures now correctly surface as HTTP 502 (via InternalApiError) rather than being silently converted to in-body error objects, matching the behavior of get_roots, preempt, and reserve. Mid-stream failures still yield in-body error objects as before. The updated docstring makes the contract explicit for future readers.
+
+### AC-530 · Verify app.py streaming path handler covers InternalApiError
+Strength: Strong
+Split-Depth: 1
+Files: app.py
+Depends-On: AC-529
+
+Problem:
+app.py has an except InternalApiError handler that returns HTTP 502 for non-streaming functions (get_roots, preempt, reserve). It is unclear whether this handler is also applied to the streaming path (stream_local_turn), which would be required for the new InternalApiError contract to take effect. If the streaming call site is missing this handler, the refactored stream_local_turn would raise InternalApiError unhandled, causing a 500 error instead of the intended 502.
+
+Solution:
+Verify that the except InternalApiError block in app.py is applied to calls to stream_local_turn (or its direct wrapper) in the same way it is for the non-streaming functions. If the streaming call site is missing this handler, add it. Do not modify any other error-handling logic in app.py.
+
+Benefits:
+Ensures the new InternalApiError contract from stream_local_turn is properly handled at the application layer, so connection failures result in HTTP 502 responses rather than unhandled exceptions or 500 errors. This completes the end-to-end error propagation for the streaming path.
