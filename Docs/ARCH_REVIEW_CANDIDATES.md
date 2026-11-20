@@ -2444,3 +2444,90 @@ Update the import statement in chat.js to import swapProviderLabel (the new name
 
 Benefits:
 Completes the rename refactoring and ensures chat.js continues to work correctly after the swap-view.js export is renamed. The import now uses a self-documenting name that indicates its source module.
+
+### AC-531 · AC-101a: Extract swap-view providerLabel to shared module
+Strength: Strong
+Split-Depth: 1
+Files: static/provider-label.js, static/swap-view.js
+
+Problem:
+static/swap-view.js contains a providerLabel function that handles claude (with account suffix), local, and unknown providers. This function is more complete than the one in static/sessions-view.js but is duplicated. Extracting it to a shared module allows both views to use a consistent implementation.
+
+Solution:
+Create static/provider-label.js with the providerLabel function from static/swap-view.js. Update static/swap-view.js to import from the shared module.
+
+Benefits:
+Deduplicates the providerLabel logic, making it easier to maintain and update in the future.
+
+### AC-532 · AC-101b: Update sessions-view to use shared providerLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/sessions-view.js
+Depends-On: AC-531
+
+Problem:
+static/sessions-view.js has its own providerLabel function that collapses unknown providers to 'Local' and never shows accounts. This differs from the shared implementation in static/provider-label.js. To use the shared module, the sessions view needs to pass account information or suppress the account suffix.
+
+Solution:
+Update static/sessions-view.js to import providerLabel from static/provider-label.js. Since session rows don't have account data, pass account: null to suppress the account suffix. Note: this changes the behavior for unknown providers from 'Local' to 'Unknown'.
+
+Benefits:
+Uses the shared providerLabel implementation, ensuring consistency across views. The behavioral change (unknown providers now show 'Unknown' instead of 'Local') is more accurate.
+
+### AC-533 · AC-101a: Create shared providerLabel with showAccount option
+Strength: Strong
+Split-Depth: 1
+Files: static/provider-label.js, static/swap-view.js
+
+Problem:
+static/swap-view.js and static/sessions-view.js both have providerLabel functions with different semantics. The swap view shows account suffix for claude providers, while the sessions view doesn't. Extracting a shared function with a showAccount option allows both views to use a consistent implementation.
+
+Solution:
+Create static/provider-label.js with a providerLabel function that accepts an optional showAccount parameter. Update static/swap-view.js to import and use the shared function with showAccount: true.
+
+Benefits:
+Deduplicates the providerLabel logic while preserving the swap view's account suffix behavior.
+
+### AC-534 · AC-101b: Update sessions-view to use shared providerLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/sessions-view.js
+Depends-On: AC-531
+
+Problem:
+static/sessions-view.js has its own providerLabel function that doesn't show accounts. To use the shared implementation, it needs to import from static/provider-label.js and use the default showAccount=false behavior.
+
+Solution:
+Update static/sessions-view.js to import providerLabel from static/provider-label.js. The default showAccount=false behavior matches the current sessions view behavior (no account suffix).
+
+Benefits:
+Uses the shared providerLabel implementation, ensuring consistency across views. No behavioral change for the sessions view.
+
+### AC-535 · AC-101a: Create shared providerLabel with showAccount option
+Strength: Strong
+Split-Depth: 1
+Files: static/provider-label.js, static/swap-view.js
+
+Problem:
+static/swap-view.js and static/sessions-view.js both have providerLabel functions with different semantics. The swap view shows account suffix for claude providers, while the sessions view doesn't. Extracting a shared function with a showAccount option allows both views to use a consistent implementation.
+
+Solution:
+Create static/provider-label.js with a providerLabel function that accepts an optional showAccount parameter. Update static/swap-view.js to import and use the shared function with showAccount: true.
+
+Benefits:
+Deduplicates the providerLabel logic while preserving the swap view's account suffix behavior.
+
+### AC-536 · AC-101b: Update sessions-view to use shared providerLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/sessions-view.js
+Depends-On: AC-531
+
+Problem:
+static/sessions-view.js has its own providerLabel function that doesn't show accounts. To use the shared implementation, it needs to import from static/provider-label.js and use the default showAccount=false behavior.
+
+Solution:
+Update static/sessions-view.js to import providerLabel from static/provider-label.js. The default showAccount=false behavior matches the current sessions view behavior (no account suffix).
+
+Benefits:
+Uses the shared providerLabel implementation, ensuring consistency across views. No behavioral change for the sessions view.
