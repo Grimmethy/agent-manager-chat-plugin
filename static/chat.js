@@ -111,6 +111,43 @@ function renderMarkdown(text) {
 // Own transcript renderer, deliberately NOT the host's shared grillRenderTranscript()
 // (an iframe can't call a function in a different document anyway) -- see this file's
 // own header comment.
+// 'HH:MM:SS' from an ISO timestamp string.
+function chatStampOf(iso) {
+  const m = String(iso).match(/T(\d{2}):(\d{2}):(\d{2})/);
+  return m ? `${m[1]}:${m[2]}:${m[3]}` : String(iso).slice(11, 19);
+}
+
+// Records msg.paragraphs[] = {text, arrivedAt} from the streamed text so far. A
+// paragraph keeps the arrivedAt it got when first seen; only new ones are stamped.
+function chatNoteParagraphs(msg, text) {
+  const segs = String(text).split(/\n{2,}/);
+  while (segs.length && segs[segs.length - 1] === '') segs.pop();
+  if (!Array.isArray(msg.paragraphs)) msg.paragraphs = [];
+  segs.forEach((seg, i) => {
+    if (msg.paragraphs[i]) msg.paragraphs[i].text = seg;
+    else msg.paragraphs[i] = { text: seg, arrivedAt: new Date().toISOString() };
+  });
+}
+
+// One <div> per paragraph (not <p>: rendered markdown can start with a block element)
+// with its own arrival stamp. Without a paragraphs array, falls back to the old
+// message-level timestamp stamp, or no stamp when there is none.
+function chatParagraphsBody(msg, isAssistant) {
+  const render = (seg) => (isAssistant ? renderMarkdown(seg) : escapeHtml(seg));
+  if (Array.isArray(msg.paragraphs) && msg.paragraphs.length) {
+    return msg.paragraphs.map((p) =>
+      `<div class="chat-msg-seg"><span class="chat-seg-ts">${escapeHtml(chatStampOf(p.arrivedAt))}</span>${render(p.text)}</div>`
+    ).join('');
+  }
+  if (msg.timestamp) {
+    const stamp = chatStampOf(msg.timestamp);
+    return String(msg.text).split(/\n{2,}/).map((seg) =>
+      `<div class="chat-msg-seg"><span class="chat-seg-ts">${escapeHtml(stamp)}</span>${render(seg)}</div>`
+    ).join('');
+  }
+  return render(msg.text);
+}
+
 function chatRenderTranscript(transcript, session) {
   const assistantLabel = session && session.provider === 'claude' ? 'Claude' : 'Local';
   const rows = transcript.map((t, idx) => {
@@ -119,20 +156,7 @@ function chatRenderTranscript(transcript, session) {
     const roleLabel = t.role === 'assistant' ? assistantLabel : (t.role === 'system' ? 'System' : 'You');
     const cls = (t.role === 'assistant' ? 'chat-msg-assistant' : (t.role === 'system' ? 'chat-msg-system' : 'chat-msg-user')) + (t.error ? ' chat-msg-error' : '');
     const isAssistant = t.role === 'assistant' && !t.error; // error notices stay literal text, not markdown (underscores in env var names get eaten)
-    let body;
-    if (t.timestamp) {
-      const m = String(t.timestamp).match(/T(\d{2}):(\d{2}):(\d{2})/);
-      const stamp = m ? `${m[1]}:${m[2]}:${m[3]}` : String(t.timestamp).slice(11, 19);
-      // A <div> wrapper per segment, not <p> -- rendered markdown can itself start
-      // with a block element (<pre>, <ul>, a heading, ...), and a block element
-      // inside a <p> gets silently split by the HTML parser, breaking the timestamp
-      // span's placement.
-      body = String(t.text).split(/\n{2,}/).map(seg =>
-        `<div class="chat-msg-seg"><span class="chat-seg-ts">${escapeHtml(stamp)}</span>${isAssistant ? renderMarkdown(seg) : escapeHtml(seg)}</div>`
-      ).join('');
-    } else {
-      body = isAssistant ? renderMarkdown(t.text) : escapeHtml(t.text);
-    }
+    const body = chatParagraphsBody(t, isAssistant);
     const cards = (t.templates || []).map((tp, ti) => {
       const done = tp.status === 'saved';
       const note = tp.message ? `<div class="tpl-note tpl-${escapeHtml(tp.status)}">${escapeHtml(tp.message)}</div>` : '';
@@ -627,6 +651,7 @@ class ChatPane {
             if (preemptText) { assistantEntry.text = preemptText; this.render(); }
           } else if (evt.type === 'chunk') {
             assistantEntry.text += evt.text;
+            chatNoteParagraphs(assistantEntry, assistantEntry.text);
             this.render();
           } else if (evt.type === 'final') {
             finalSession = evt.session;
