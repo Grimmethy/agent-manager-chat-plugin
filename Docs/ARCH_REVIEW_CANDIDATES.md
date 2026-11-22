@@ -2444,3 +2444,39 @@ Update the import statement in chat.js to import swapProviderLabel (the new name
 
 Benefits:
 Completes the rename refactoring and ensures chat.js continues to work correctly after the swap-view.js export is renamed. The import now uses a self-documenting name that indicates its source module.
+
+### AC-548 · AC-119a: Create static/provider-label.js shared utility
+Strength: Strong
+Split-Depth: 1
+Files: static/provider-label.js
+
+Problem:
+static/sessions-view.js defines `providerLabel(row)` which returns 'Local' for non-claude providers (ignoring model), and 'Local · <model>' or 'Claude · <model>' otherwise. static/swap-view.js defines `providerLabel(session)` which returns 'Unknown' for non-claude/non-local providers, and includes account info for claude. The two functions have divergent semantics (especially the fallback for unknown providers), but share the 'Claude · <model>' and 'Local · <model>' patterns. There is no shared utility yet.
+
+Solution:
+Create `static/provider-label.js` exporting `formatProviderLabel(provider, model, account?)` with unified semantics:
+- If `provider === 'claude'`: return `'Claude · <model>'` if model present, else `'Claude · <account>'` (or `'Claude · live account'` if account null/undefined).
+- If `provider === 'local'`: return `'Local · <model>'` if model present, else `'Local'`.
+- Otherwise: return `'Unknown'`.
+
+This matches swap-view.js's more complete behavior. sessions-view.js's `providerLabel` will be refactored to call this new function.
+
+Benefits:
+Single source of truth for provider labeling. Eliminates divergence where sessions-view.js silently dropped the 'Unknown' case (showing nothing for unknown providers). Makes future provider additions (e.g. 'gemini') trivial.
+
+### AC-549 · AC-119b: Refactor sessions-view.js and swap-view.js to use shared utility
+Strength: Strong
+Split-Depth: 1
+Files: static/sessions-view.js, static/swap-view.js
+Depends-On: AC-548
+
+Problem:
+After creating the shared utility, both `static/sessions-view.js` and `static/swap-view.js` still define their own `providerLabel` functions with slightly different signatures and behaviors. `sessions-view.js`'s `providerLabel(row)` ignores account and returns bare 'Local' for non-claude. `swap-view.js`'s `providerLabel(session)` includes account and returns 'Unknown'. Both are called from `chat.js` and internally (e.g., `filterChats` in sessions-view.js calls `providerLabel(r)`).
+
+Solution:
+1. In `static/sessions-view.js`: Remove the `providerLabel` function definition. Add import: `import { formatProviderLabel } from './provider-label.js';`. Update `formatRow` to call `formatProviderLabel(row.provider, row.model)`. Update `filterChats` to call `formatProviderLabel(r.provider, r.model)`.
+2. In `static/swap-view.js`: Remove the `providerLabel` function definition. Add import: `import { formatProviderLabel } from './provider-label.js';`. Update the single call site (in `syncSwapHeader` via chat.js) to pass `session.provider`, `session.model`, `session.account`.
+3. Verify `chat.js` import: it imports `providerLabel` from `swap-view.js`. Update this import to `formatProviderLabel` from `provider-label.js` and update the call site in `syncSwapHeader` to pass the three arguments.
+
+Benefits:
+Both views now use identical semantics for provider labeling. The 'Unknown' fallback is preserved. Account info is correctly included for claude sessions. Eliminates ~20 lines of duplicated logic. `chat.js` import is updated to use the shared utility directly.
