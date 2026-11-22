@@ -128,6 +128,29 @@ class ChatParagraphsTests(unittest.TestCase):
         self.assertEqual(transcript[0]["timestamp"], FakeClock.t1)
         self.assertEqual(transcript[-1]["role"], "assistant")
 
+    # Stamp rule (read from chat_sessions._stream_message_turn): there is no
+    # per-paragraph storage. The user entry takes the first clock tick (t1)
+    # and the assistant entry takes the second (t2) when its placeholder is
+    # appended; later chunks only rewrite the entry's "text", never its
+    # "timestamp". Paragraphs are derived from the stored assistant text via
+    # split("\n\n") and all share the assistant entry's single stamp (t2). A
+    # "\n\n" boundary split across chunks is reassembled in the stored text,
+    # so it still yields two paragraphs.
+    def test_split_boundary_yields_two_paragraphs_with_shared_stamp(self):
+        transcript = run_turn(["first\n", "\nsecond"])
+        entry = transcript[-1]
+        self.assertEqual(entry["role"], "assistant")
+        self.assertEqual(entry["text"].split("\n\n"), ["first", "second"])
+        self.assertEqual(entry["timestamp"], FakeClock.t2)
+
+    def test_single_paragraph_spanning_chunks_has_one_stamp(self):
+        transcript = run_turn(["one ", "two ", "three"])
+        entry = transcript[-1]
+        paragraphs = entry["text"].split("\n\n")
+        self.assertEqual(paragraphs, ["one two three"])
+        # Stamp is fixed at placeholder creation (t2); later chunks leave it.
+        self.assertEqual(entry["timestamp"], FakeClock.t2)
+
 
 if __name__ == "__main__":
     unittest.main()
