@@ -1270,7 +1270,14 @@ def stream_message(storage_dir: Path, session_id: str, message: str):
             _busy_sessions.discard(session_id)
 
 
-def _stream_message_turn(storage_dir: Path, session: dict, message: str):
+def _paragraph_count(text: str) -> int:
+    """Number of paragraphs started in text: non-blank segments split on blank-line (\\n\\n) boundaries."""
+    return sum(1 for seg in re.split(r"\n\n+", text or "") if seg.strip())
+
+
+def _stream_message_turn(storage_dir: Path, session: dict, message: str, clock=None):
+    # HUB0072: injected clock used only for per-paragraph arrival times.
+    clock = clock or _now_iso
     # 2026-09-01 (Grimmethy: "time stamps to the second programmed into each
     # thought segment"): capture the turn's wall-clock time so the transcript
     # render (grillRenderTranscript in index.html) can stamp each segment. Old
@@ -1286,7 +1293,7 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
     # whatever hadn't streamed yet. Any interruption now loses at most the last unwritten
     # chunk, regardless of cause (a reloader restart, a crash, a dropped connection) --
     # the whole point is not depending on reaching a specific line of code at the end.
-    session["transcript"].append({"role": "assistant", "text": "", "timestamp": _now_iso()})
+    session["transcript"].append({"role": "assistant", "text": "", "timestamp": _now_iso(), "paragraph_times": []})
     _touch(session)
     _write_session(storage_dir, session)
 
@@ -1296,6 +1303,7 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
         reply = _send_claude(session, message, storage_dir)
         reply_parts.append(reply)
         session["transcript"][-1]["text"] = reply
+        session["transcript"][-1]["paragraph_times"] = [clock()] * _paragraph_count(reply)
         _write_session(storage_dir, session)
         yield {"type": "chunk", "text": reply}
     else:
@@ -1326,10 +1334,15 @@ def _stream_message_turn(storage_dir: Path, session: dict, message: str):
                 yield item
             else:
                 # Text chunk - accumulate for coalescing
+                arrival = clock()
                 coalesce_buffer.append(item)
                 coalesce_chars += len(item)
                 reply_parts.append(item)
                 session["transcript"][-1]["text"] = "".join(reply_parts)
+                _times = session["transcript"][-1].setdefault("paragraph_times", [])
+                _new = _paragraph_count(session["transcript"][-1]["text"]) - len(_times)
+                if _new > 0:
+                    _times.extend([arrival] * _new)
                 _write_session(storage_dir, session)
                 
                 # Check if we should flush based on time or character count
