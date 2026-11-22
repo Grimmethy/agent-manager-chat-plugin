@@ -110,11 +110,13 @@ def stream_local_turn(*, messages: list = None, prompt: str = None, max_turns: i
                        source: str = None, allow_write: bool = False, primary_root: str = None,
                        extra_roots: list = None, force_summary_on_cap: bool = False,
                        allow_amplification: bool = False, context_log_session_id: str = None):
-    """Generator sibling of local_tool_client.py's own stream_plan_with_tools -- SAME
-    result shape ({"type": "chunk"|"final"|"error", ...}), just sourced from the core
-    dashboard's SSE stream instead of a local Node subprocess. Read timeout matches
-    local_tool_client.py's own SUBPROCESS_TIMEOUT_S ceiling (6000s) -- a real multi-turn
-    call can legitimately run that long."""
+    """Generator sibling of local_tool_client.py's own stream_plan_with_tools -- yields
+    {"type": "chunk"|"final", ...} items from the core dashboard's SSE stream instead of
+    a local Node subprocess. On transport failures (connection refused, non-2xx, missing
+    token), raises InternalApiError -- consistent with the non-streaming helpers
+    (get_roots, preempt, reserve, run_command). Read timeout matches local_tool_client.py's
+    own SUBPROCESS_TIMEOUT_S ceiling (6000s) -- a real multi-turn call can legitimately
+    run that long."""
     body = {"maxTurns": max_turns}
     if messages is not None:
         body["messages"] = messages
@@ -150,4 +152,4 @@ def stream_local_turn(*, messages: list = None, prompt: str = None, max_turns: i
                 except json.JSONDecodeError:
                     continue
     except requests.RequestException as e:
-        yield {"type": "error", "error": f"internal API local-turn call failed: {e}"}
+        raise InternalApiError(f"internal API local-turn call failed: {e}") from e
