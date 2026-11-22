@@ -3135,6 +3135,27 @@
      "text": "Public-record data, verify independently. Not legal, tax or investment advice."
     }
    ]
+  },
+  {
+   "id": "price_basis_rmv_plain",
+   "tags": [
+    "style"
+   ],
+   "rules": [
+    "S7"
+   ],
+   "context": "listing",
+   "turns": [
+    {
+     "user": "What does the price basis on this property mean?"
+    }
+   ],
+   "checks": [
+    {
+     "type": "price_basis_in_plain_words",
+     "level": "style"
+    }
+   ]
   }
  ],
  "global_checks": [
