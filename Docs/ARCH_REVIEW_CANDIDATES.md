@@ -2444,3 +2444,47 @@ Update the import statement in chat.js to import swapProviderLabel (the new name
 
 Benefits:
 Completes the rename refactoring and ensures chat.js continues to work correctly after the swap-view.js export is renamed. The import now uses a self-documenting name that indicates its source module.
+
+### AC-539 · AC-106a: Create shared provider-label.js module
+Strength: Strong
+Split-Depth: 1
+Files: static/provider-label.js
+
+Problem:
+The provider-labeling logic is duplicated and divergent across static/sessions-view.js and static/swap-view.js. sessions-view.js defaults unknown providers to 'Local', while swap-view.js returns 'Unknown' and includes account info with a 'live account' fallback. Extracting a shared function eliminates duplication and ensures consistent behavior.
+
+Solution:
+Create static/provider-label.js with an exported providerLabel(session, options = {}) function that handles Claude/Local providers, supports an includeAccount option (defaulting to false), and returns 'Unknown' for truly unknown providers. The function normalizes input, maps 'claude' to 'Claude', maps 'local' to 'Local', and conditionally appends account info (using 'live account' when account is null/undefined).
+
+Benefits:
+Eliminates duplication, ensures consistent behavior across call sites, makes future changes easier, and fixes the bug where sessions-view.js incorrectly defaults unknown providers to 'Local'.
+
+### AC-540 · AC-106b: Migrate sessions-view.js to shared providerLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/sessions-view.js
+Depends-On: AC-539
+
+Problem:
+static/sessions-view.js has a local providerLabel function that duplicates logic from static/swap-view.js and uses a different default for unknown providers (defaulting to 'Local' instead of 'Unknown').
+
+Solution:
+Import providerLabel from ./provider-label.js and replace the local definition with a call to the shared function. The local function is called as providerLabel(row) in formatRow and filterChats, which matches the shared function's signature with default options.
+
+Benefits:
+Eliminates duplication, ensures consistent behavior with swap-view.js, and fixes the bug where unknown providers were incorrectly labeled as 'Local'.
+
+### AC-541 · AC-106c: Migrate swap-view.js to shared providerLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/swap-view.js
+Depends-On: AC-539
+
+Problem:
+static/swap-view.js has a local providerLabel function that duplicates logic from static/sessions-view.js.
+
+Solution:
+Import providerLabel from ./provider-label.js and replace the local definition with a call to the shared function with includeAccount: true. The local function is called as providerLabel(session) in the swap UI, which maps to providerLabel(session, { includeAccount: true }) in the shared function.
+
+Benefits:
+Eliminates duplication, ensures consistent behavior with sessions-view.js.
