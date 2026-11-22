@@ -108,6 +108,25 @@ function renderMarkdown(text) {
   return container.innerHTML;
 }
 
+// Pure: reduce an ISO timestamp to HH:MM:SS ('' when unusable).
+function chatStampText(ts) {
+  if (!ts) return '';
+  const m = String(ts).match(/T(\d{2}):(\d{2}):(\d{2})/);
+  return m ? `${m[1]}:${m[2]}:${m[3]}` : String(ts).slice(11, 19);
+}
+
+// Pure: split a transcript entry's text on blank lines and pair each segment with the
+// time that paragraph arrived (t.paragraph_times[i]). t.timestamp is used only when
+// paragraph_times is missing entirely.
+function chatSegmentsWithStamps(t) {
+  if (!t || typeof t.text !== 'string') return [];
+  const hasTimes = Array.isArray(t.paragraph_times);
+  return t.text.split(/\n{2,}/).map((text, i) => ({
+    text,
+    stamp: chatStampText(hasTimes ? t.paragraph_times[i] : t.timestamp),
+  }));
+}
+
 // Own transcript renderer, deliberately NOT the host's shared grillRenderTranscript()
 // (an iframe can't call a function in a different document anyway) -- see this file's
 // own header comment.
@@ -120,15 +139,13 @@ function chatRenderTranscript(transcript, session) {
     const cls = (t.role === 'assistant' ? 'chat-msg-assistant' : (t.role === 'system' ? 'chat-msg-system' : 'chat-msg-user')) + (t.error ? ' chat-msg-error' : '');
     const isAssistant = t.role === 'assistant' && !t.error; // error notices stay literal text, not markdown (underscores in env var names get eaten)
     let body;
-    if (t.timestamp) {
-      const m = String(t.timestamp).match(/T(\d{2}):(\d{2}):(\d{2})/);
-      const stamp = m ? `${m[1]}:${m[2]}:${m[3]}` : String(t.timestamp).slice(11, 19);
+    if (t.timestamp || Array.isArray(t.paragraph_times)) {
       // A <div> wrapper per segment, not <p> -- rendered markdown can itself start
       // with a block element (<pre>, <ul>, a heading, ...), and a block element
       // inside a <p> gets silently split by the HTML parser, breaking the timestamp
       // span's placement.
-      body = String(t.text).split(/\n{2,}/).map(seg =>
-        `<div class="chat-msg-seg"><span class="chat-seg-ts">${escapeHtml(stamp)}</span>${isAssistant ? renderMarkdown(seg) : escapeHtml(seg)}</div>`
+      body = chatSegmentsWithStamps(t).map(({ text: seg, stamp }) =>
+        `<div class="chat-msg-seg">${stamp ? `<span class="chat-seg-ts">${escapeHtml(stamp)}</span>` : ''}${isAssistant ? renderMarkdown(seg) : escapeHtml(seg)}</div>`
       ).join('');
     } else {
       body = isAssistant ? renderMarkdown(t.text) : escapeHtml(t.text);
@@ -1280,3 +1297,7 @@ if (document.readyState === 'loading') document.addEventListener('DOMContentLoad
 else mountChat();
 
 export { ChatPane, SessionSwitcher, showToast };
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { chatSegmentsWithStamps };
+}
