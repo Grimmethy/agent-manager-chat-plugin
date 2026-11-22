@@ -2444,3 +2444,32 @@ Update the import statement in chat.js to import swapProviderLabel (the new name
 
 Benefits:
 Completes the rename refactoring and ensures chat.js continues to work correctly after the swap-view.js export is renamed. The import now uses a self-documenting name that indicates its source module.
+
+### AC-537 · AC-107a: Expose is_plain_row as public helper in handoff.py
+Strength: Strong
+Split-Depth: 1
+Files: handoff.py
+
+Problem:
+handoff.py defines _is_plain_row as a private helper (leading underscore) that filters transcript rows by checking isinstance(row, dict), absence of truthy 'error', and absence of marker=True. chat_sessions.py duplicates this exact filtering inline in _build_local_messages. Because the function is private, chat_sessions.py cannot import it without violating module encapsulation conventions, and the write-up's suggestion of a 'thin public wrapper' has not been implemented.
+
+Solution:
+Add a public alias is_plain_row = _is_plain_row at module level in handoff.py, immediately after the _is_plain_row definition. Add a one-line docstring to the alias noting it is a public wrapper around the private helper. The alias is a single line and does not change any behavior — it only changes the import surface.
+
+Benefits:
+Creates the importable surface chat_sessions.py needs without renaming the canonical implementation. The private _is_plain_row remains the source of truth; the public name is a thin, obvious alias. This is the only change needed in this file and is independently safe to land.
+
+### AC-538 · AC-107b: Centralize plain-row filtering in chat_sessions.py using handoff.is_plain_row
+Strength: Strong
+Split-Depth: 1
+Files: chat_sessions.py
+Depends-On: AC-537
+
+Problem:
+chat_sessions._build_local_messages contains inline filtering that mirrors handoff._is_plain_row: it skips rows with truthy 'error' and rows with marker=True. This duplicated logic is the exact reason AC-107 exists. The inline conditions are: `if turn.get('error'): continue` and `if turn.get('marker') is True: continue` inside the replay loop over recent transcript rows. These two checks are functionally equivalent to is_plain_row (the isinstance(dict) guard is implicit since transcript rows are always dicts), so the duplication can be safely removed.
+
+Solution:
+1) Add `from handoff import is_plain_row` to the top-level imports in chat_sessions.py (alongside existing handoff imports if any). 2) In _build_local_messages, replace the two inline `if turn.get('error'): continue` and `if turn.get('marker') is True: continue` guards with a single `if not is_plain_row(turn): continue` guard. 3) Update the surrounding comment to reference handoff.is_plain_row as the canonical rule instead of describing the inline conditions.
+
+Benefits:
+Eliminates the duplicated filtering logic. The filtering rule now lives in exactly one place (handoff.py). If the rule ever needs to change (e.g., adding another skip condition), only handoff.py needs updating. No new top-level dependencies are introduced — handoff.py is I/O-free and does not import chat_sessions.py, so no circular dependency is created.
