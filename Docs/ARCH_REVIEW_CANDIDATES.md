@@ -2444,3 +2444,32 @@ Update the import statement in chat.js to import swapProviderLabel (the new name
 
 Benefits:
 Completes the rename refactoring and ensures chat.js continues to work correctly after the swap-view.js export is renamed. The import now uses a self-documenting name that indicates its source module.
+
+### AC-544 · AC-115a: Add label validation to accounts.make_live
+Strength: Strong
+Split-Depth: 1
+Files: accounts.py
+
+Problem:
+accounts.make_live currently only checks if a label exists in the registry, raising KeyError for unknown labels. It does not validate label format, so the route layer in routes/accounts.py must duplicate the validation logic by calling accounts._valid_label before invoking make_live. This violates the separation of concerns: the registry module should enforce its own invariants.
+
+Solution:
+Add label format validation at the top of accounts.make_live. If the label fails _LABEL_RE validation, raise ValueError with a descriptive message before the membership check. Keep the existing KeyError behavior for unknown labels. After confirming _valid_label is no longer used elsewhere, remove it and replace internal usages with the regex check directly.
+
+Benefits:
+accounts.make_live becomes self-contained and independently testable. The route layer no longer needs to know about label grammar. Validation rules live in one place, matching the pattern already used in accounts.add.
+
+### AC-545 · AC-115b: Remove duplicate validation from routes/accounts.py
+Strength: Strong
+Split-Depth: 1
+Files: routes/accounts.py
+Depends-On: AC-544
+
+Problem:
+routes/accounts.py calls accounts._valid_label(label) before accounts.make_live, duplicating validation logic that now lives in the registry module. This creates a maintenance burden: if validation rules change, both files must be updated. The route layer should only handle HTTP status mapping, not business rule validation.
+
+Solution:
+Remove the if-not-accounts._valid_label(label) guard. Wrap the accounts.make_live call in a try/except that catches ValueError (return 400) and KeyError (return 404). This handles both invalid labels (now raised by make_live) and unknown labels (existing behavior) in a single error-handling block.
+
+Benefits:
+The route layer is simplified and focused on HTTP concerns. No duplicate validation logic. The change is backward-compatible: invalid labels still return 400, unknown labels still return 404, but now the validation is centralized in accounts.py.
