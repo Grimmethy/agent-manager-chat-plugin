@@ -2444,3 +2444,32 @@ Update the import statement in chat.js to import swapProviderLabel (the new name
 
 Benefits:
 Completes the rename refactoring and ensures chat.js continues to work correctly after the swap-view.js export is renamed. The import now uses a self-documenting name that indicates its source module.
+
+### AC-546 · Extract CHAT_STORAGE_DIR to config.py
+Strength: Strong
+Split-Depth: 1
+Files: .venv/lib/python3.12/site-packages/flask/config.py, app.py
+
+Problem:
+CHAT_STORAGE_DIR is defined in app.py, which creates a coupling with routes/accounts.py that forces lazy imports and potential circular import issues. The constant should live in a configuration module that both app.py and routes/accounts.py can depend on without coupling to each other.
+
+Solution:
+Create a new config.py module at the project root containing CHAT_STORAGE_DIR (extracted from app.py). Update app.py to import CHAT_STORAGE_DIR from config.py instead of defining it locally. The STATE_DIR computation logic moves to config.py as well.
+
+Benefits:
+Establishes a clean configuration module for application-level constants. Removes CHAT_STORAGE_DIR from app.py's namespace so other modules can import it without coupling to app. Prepares the ground for breaking the circular import by giving routes/accounts.py an alternative import target.
+
+### AC-547 · Replace lazy app imports in routes/accounts.py with config imports
+Strength: Strong
+Split-Depth: 1
+Files: routes/accounts.py
+Depends-On: AC-546
+
+Problem:
+routes/accounts.py still uses lazy imports from app.py to access CHAT_STORAGE_DIR inside _accounts_body and api_chat_accounts_make_live. This maintains the circular coupling: app.py imports routes.accounts at module level, and routes/accounts.py imports from app.py inside function bodies.
+
+Solution:
+Replace the two lazy 'from app import CHAT_STORAGE_DIR' statements with a single top-level 'from config import CHAT_STORAGE_DIR' import. Remove the docstring comment explaining the circular import workaround. Update the function bodies to use the module-level import.
+
+Benefits:
+Eliminates the circular import between routes/accounts.py and app.py. routes/accounts.py no longer depends on app.py, making it independently importable. The import graph becomes acyclic: both modules depend on config.py but not on each other.
