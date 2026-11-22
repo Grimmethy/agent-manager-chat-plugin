@@ -2444,3 +2444,32 @@ Update the import statement in chat.js to import swapProviderLabel (the new name
 
 Benefits:
 Completes the rename refactoring and ensures chat.js continues to work correctly after the swap-view.js export is renamed. The import now uses a self-documenting name that indicates its source module.
+
+### AC-542 · AC-111a: Extract shared formatProviderLabel utility and refactor sessions-view
+Strength: Strong
+Split-Depth: 1
+Files: static/provider-label.js, static/sessions-view.js
+
+Problem:
+static/sessions-view.js contains a providerLabel function that duplicates logic with static/swap-view.js. The two implementations diverge on unknown providers (sessions-view shows 'Local', swap-view shows 'Unknown'), and sessions-view doesn't support the account parameter. This creates maintenance burden and a bug where unrecognized providers are mislabeled as 'Local'.
+
+Solution:
+Create static/provider-label.js with a unified formatProviderLabel(provider, model, account?) function that maps 'claude'→'Claude', 'local'→'Local', else→'Unknown', and renders two-segment form (no account) or three-segment form (with account, defaulting null/undefined to 'live account'). Refactor static/sessions-view.js to import and use this shared utility, passing (row.provider, row.model) with no third argument at both call sites (formatRow and filterChats).
+
+Benefits:
+Single source of truth for provider labeling, consistent behavior across views, fixes the bug where unknown providers were shown as 'Local' instead of 'Unknown', easier to maintain and extend.
+
+### AC-543 · AC-111b: Refactor swap-view to use shared formatProviderLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/swap-view.js
+Depends-On: AC-542
+
+Problem:
+static/swap-view.js contains a providerLabel function that duplicates logic with the newly created static/provider-label.js. After AC-111a lands, swap-view should use the shared utility for consistency and to eliminate duplication.
+
+Solution:
+Refactor static/swap-view.js to import formatProviderLabel from static/provider-label.js and replace the local providerLabel implementation with a call to formatProviderLabel(session.provider, session.model, session.account), preserving the existing behavior including the 'live account' default for null/undefined accounts.
+
+Benefits:
+Eliminates duplication, ensures consistent behavior across views, simplifies future changes to provider labeling, reduces maintenance burden.
