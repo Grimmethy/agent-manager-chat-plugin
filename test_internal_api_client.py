@@ -148,11 +148,32 @@ class StreamLocalTurnTest(unittest.TestCase):
             events = list(iac.stream_local_turn(prompt="hi"))
             self.assertEqual(events, [{"type": "final", "response": "ok"}])
 
-    def test_request_failure_yields_an_error_event_instead_of_raising(self):
+    def test_request_failure_raises_internal_api_error(self):
         with mock.patch("requests.post", side_effect=requests.ConnectionError("refused")):
-            events = list(iac.stream_local_turn(prompt="hi"))
-            self.assertEqual(len(events), 1)
-            self.assertEqual(events[0]["type"], "error")
+            with self.assertRaises(iac.InternalApiError) as ctx:
+                list(iac.stream_local_turn(prompt="hi"))
+            self.assertIn("local-turn call failed", str(ctx.exception))
+
+    def test_http_error_status_raises_internal_api_error(self):
+        resp = self._fake_stream_response([])
+        resp.raise_for_status.side_effect = requests.HTTPError("500")
+        with mock.patch("requests.post", return_value=resp):
+            with self.assertRaises(iac.InternalApiError):
+                list(iac.stream_local_turn(prompt="hi"))
+
+    def test_mid_stream_failure_raises_after_earlier_events(self):
+        def lines():
+            yield 'data: {"type": "chunk", "text": "a"}'
+            raise requests.ConnectionError("dropped")
+
+        resp = self._fake_stream_response([])
+        resp.iter_lines.return_value = lines()
+        got = []
+        with mock.patch("requests.post", return_value=resp):
+            with self.assertRaises(iac.InternalApiError):
+                for ev in iac.stream_local_turn(prompt="hi"):
+                    got.append(ev)
+        self.assertEqual(got, [{"type": "chunk", "text": "a"}])
 
     def test_messages_takes_precedence_over_prompt_in_the_request_body(self):
         captured = {}
