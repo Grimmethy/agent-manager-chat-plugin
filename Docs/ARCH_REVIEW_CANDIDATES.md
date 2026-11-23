@@ -2473,3 +2473,47 @@ Replace the two lazy 'from app import CHAT_STORAGE_DIR' statements with a single
 
 Benefits:
 Eliminates the circular import between routes/accounts.py and app.py. routes/accounts.py no longer depends on app.py, making it independently importable. The import graph becomes acyclic: both modules depend on config.py but not on each other.
+
+### AC-567 · AC-143a: Add a stdlib-only core_repo_root.py module that defines CORE_REPO_ROOT
+Strength: Strong
+Split-Depth: 1
+Files: core_repo_root.py
+
+Problem:
+model_stats_client.py runs `from app import CORE_REPO_ROOT`, and CORE_REPO_ROOT is defined at module level in app.py. That makes a small subprocess-wrapper module depend on the whole Flask app module just to read one path constant. There is no leaf module that both app.py and model_stats_client.py can import without pulling in Flask. This sub-candidate only adds that leaf module, as a new file at the repo root next to app.py and model_stats_client.py. The two import updates are separate sub-candidates that depend on this one.
+
+Solution:
+Create `core_repo_root.py` at the repo root. It imports only `os` and `pathlib.Path`, with no Flask, app, or client imports. It defines `CORE_REPO_ROOT = Path(os.environ.get("AGENT_MANAGER_CORE_REPO_ROOT", "/media/model-cache/github/agent-manager")).resolve()`, copying the expression that app.py uses today, so the value has the same type (`Path`), the same env var, the same default string, and the same `.resolve()` behavior. The expression does not use `__file__`, so placing it in a new file does not change the result. Add a short module docstring saying this is the one place the core agent-manager checkout location is resolved. Do not touch app.py or model_stats_client.py in this change.
+
+Benefits:
+Gives both consumers a dependency-free home for the constant. No existing behavior changes, because nothing imports the new module yet. Later sub-candidates can then be small, mechanical import swaps.
+
+### AC-568 · AC-143b: Make model_stats_client.py import CORE_REPO_ROOT from core_repo_root instead of app
+Strength: Strong
+Split-Depth: 1
+Files: model_stats_client.py
+Depends-On: AC-567
+
+Problem:
+model_stats_client.py has `from app import CORE_REPO_ROOT`, which imports the Flask app module (and its import-time side effects, such as the state-dir creation and chmod) whenever the stats client is imported. The module docstring also says the path comes "via app.py's CORE_REPO_ROOT". This depends on AC-143a: it can only be applied after `core_repo_root.py` exists and defines CORE_REPO_ROOT.
+
+Solution:
+In model_stats_client.py, replace the line `from app import CORE_REPO_ROOT` with `from core_repo_root import CORE_REPO_ROOT`. Keep the import order sensible next to `from node_client_util import run_node_with_tempfile`. Update the docstring phrase "(via app.py's CORE_REPO_ROOT)" to say the value comes from core_repo_root.py. Leave `MODEL_STATS_DB_JS = CORE_REPO_ROOT / "src" / "model-stats-db.js"` and every function body unchanged, so the resolved path to model-stats-db.js is identical to today's.
+
+Benefits:
+Removes the client's import-time dependency on app.py. The stats client can then be imported, and unit-tested with unittest, without loading Flask. It also removes the risk of a circular import if app.py ever imports the client. The runtime path to src/model-stats-db.js is unchanged.
+
+### AC-569 · AC-143c: Make app.py import CORE_REPO_ROOT from core_repo_root instead of defining it inline
+Strength: Strong
+Split-Depth: 1
+Files: app.py
+Depends-On: AC-567
+
+Problem:
+app.py currently defines CORE_REPO_ROOT inline as `Path(os.environ.get("AGENT_MANAGER_CORE_REPO_ROOT", "/media/model-cache/github/agent-manager")).resolve()`. After AC-143a adds core_repo_root.py, the same expression would exist in two places and could drift apart. This depends on AC-143a: it can only be applied after `core_repo_root.py` exists. Other code in app.py uses the name, including ENV_FILE_PATH, DASHBOARD_SETTINGS_PATH and `_chat_roots`, and other modules may do `from app import CORE_REPO_ROOT`. So the name must stay available in app.py's namespace.
+
+Solution:
+In app.py, remove the inline `CORE_REPO_ROOT = Path(os.environ.get(...)).resolve()` assignment under the "Core-repo location + small shared utilities" heading. Add `from core_repo_root import CORE_REPO_ROOT` to the imports, after the `from flask import ...` line. Leave `ENV_FILE_PATH = CORE_REPO_ROOT / "agent-manager.env"` and `DASHBOARD_SETTINGS_PATH = CORE_REPO_ROOT / "dashboard-settings.json"` unchanged. Keep the `os` and `Path` imports, since STATE_DIR and other code in app.py still use them. Because the name is imported into app.py's module namespace, existing `from app import CORE_REPO_ROOT` and `app.CORE_REPO_ROOT` references keep working. Make no other edits to app.py.
+
+Benefits:
+Leaves one definition of CORE_REPO_ROOT, so app.py and model_stats_client.py cannot resolve different roots. Behavior is unchanged, since the value and type are the same. The name is still re-exported from app.py for any other consumers.
