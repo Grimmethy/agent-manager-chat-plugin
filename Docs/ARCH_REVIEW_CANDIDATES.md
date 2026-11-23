@@ -2473,3 +2473,31 @@ Replace the two lazy 'from app import CHAT_STORAGE_DIR' statements with a single
 
 Benefits:
 Eliminates the circular import between routes/accounts.py and app.py. routes/accounts.py no longer depends on app.py, making it independently importable. The import graph becomes acyclic: both modules depend on config.py but not on each other.
+
+### AC-562 · AC-138a: Use agent_hosts.get_host in _resolve_host instead of a hand-rolled name loop
+Strength: Strong
+Split-Depth: 1
+Files: agent_client.py
+
+Problem:
+In agent_client.py, `_resolve_host(name=None)` fetches `hosts = agent_hosts.hosts()` and then runs `for host in hosts: if host.name == name: return host`, falling through to `raise AgentError(f"unknown session agent host '{name}'")`. `agent_hosts.get_host(name)` already does this same comparison (`h.name == name`, first match, `None` on a miss), so the name match is duplicated. The `name is None` branch needs the full `hosts` list (it checks `len(hosts) == 1` and uses `len(hosts)` in its message), so that part must stay as it is.
+
+Solution:
+In `_resolve_host`, keep the `hosts = agent_hosts.hosts()` call and the whole `if name is None:` block unchanged. Replace the `for host in hosts: if host.name == name: return host` loop with `host = agent_hosts.get_host(name)`, then `if host is not None: return host`. Keep the final `raise AgentError(f"unknown session agent host '{name}'")` exactly as written, so the exception type and message do not change. Do not modify agent_hosts.py, since `get_host` is already present and correct. Do not touch any other function.
+
+Benefits:
+Removes the duplicated host-by-name matching in agent_client.py so the rule lives only in agent_hosts.get_host. Unknown-name behavior (AgentError with the same message) and the None/single-host behavior are preserved.
+
+### AC-563 · AC-138b: Drop the redundant function-local `import agent_hosts` in _delete_session_from_host
+Strength: Strong
+Split-Depth: 1
+Files: agent_client.py
+
+Problem:
+`_delete_session_from_host` already looks up its host via `agent_hosts.get_host(host_name)`, so it needs no loop change. It does, however, re-import the module with a function-local `import agent_hosts` even though agent_client.py already has a module-level `import agent_hosts`. This is leftover duplication around the same host-lookup path and hides that the module-level import is the only one used elsewhere in the file.
+
+Solution:
+In `_delete_session_from_host`, delete the line `    import agent_hosts` (and the blank line directly after it if that leaves two consecutive blank lines in the function body). Leave the `host = agent_hosts.get_host(host_name)` call, the `if not host:` warning and `return False`, and everything else in the function unchanged. The module-level import supplies `agent_hosts`.
+
+Benefits:
+Finishes the get_host consolidation in agent_client.py: every host-by-name lookup goes through the module-level `agent_hosts.get_host` with a single import style. There is no behavior change.
