@@ -2473,3 +2473,32 @@ Replace the two lazy 'from app import CHAT_STORAGE_DIR' statements with a single
 
 Benefits:
 Eliminates the circular import between routes/accounts.py and app.py. routes/accounts.py no longer depends on app.py, making it independently importable. The import graph becomes acyclic: both modules depend on config.py but not on each other.
+
+### AC-550 · AC-123a: Move `_auth_headers` to `agent_hosts.py`
+Strength: Strong
+Split-Depth: 1
+Files: agent_hosts.py, agent_client.py
+
+Problem:
+The `_auth_headers` function in `agent_client.py` duplicates token-resolution logic that belongs in `agent_hosts.py`, where `read_token` already lives. This creates two places that construct the same `Authorization: Bearer <token>` header, risking drift when token semantics change.
+
+Solution:
+Move `_auth_headers` from `agent_client.py` to `agent_hosts.py` as a public function `get_headers(host) -> dict`. The function should call the existing `read_token(host)` primitive and return `{"Authorization": f"Bearer {token}"}` when a token exists, or `{}` otherwise. Update `agent_client.py` to import `get_headers` from `agent_hosts` and replace the inline `_auth_headers` calls with the imported function.
+
+Benefits:
+Single source of truth for host token resolution. Any future change to token semantics (e.g., scheme selection, token-file fallback rules) only needs to happen in one place. Existing callers (`list_all`, `open_events`) continue to work unchanged.
+
+### AC-551 · AC-123b: Refactor remaining inline token lookups in `agent_client.py`
+Strength: Strong
+Split-Depth: 1
+Files: agent_client.py
+Depends-On: AC-550
+
+Problem:
+After AC-123a lands, `_delete_session_from_host` still constructs an `Authorization` header inline by calling `agent_hosts.read_token` directly and building the header dict. This violates the centralization goal and duplicates the `Bearer` scheme logic that `get_headers` already encapsulates.
+
+Solution:
+Replace the inline token lookup in `_delete_session_from_host` with a call to `agent_hosts.get_headers(host_name)`. The function should look up the host via `agent_hosts.get_host(host_name)`, pass it to `get_headers`, and use the returned dict as the `headers` argument to `requests.delete`. No other changes to URL construction, error handling, or logging.
+
+Benefits:
+Eliminates the last inline token-construction site in `agent_client.py`. Ensures `_delete_session_from_host` uses the same token-resolution path as `list_all` and `open_events`, preventing future divergence. Simplifies the function body.
