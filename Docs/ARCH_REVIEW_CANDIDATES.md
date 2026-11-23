@@ -2473,3 +2473,47 @@ Replace the two lazy 'from app import CHAT_STORAGE_DIR' statements with a single
 
 Benefits:
 Eliminates the circular import between routes/accounts.py and app.py. routes/accounts.py no longer depends on app.py, making it independently importable. The import graph becomes acyclic: both modules depend on config.py but not on each other.
+
+### AC-564 · AC-142a: Extract shared is_plain_row predicate into row_utils.py
+Strength: Strong
+Split-Depth: 1
+Files: row_utils.py
+
+Problem:
+handoff.py._is_plain_row and chat_sessions.py._build_local_messages implement identical skip logic: drop rows where error is truthy or marker is True. This duplication means any future change to the predicate must be applied in two places, risking drift.
+
+Solution:
+Create row_utils.py with a public is_plain_row(row) -> bool function. The function returns False if row is not a dict, if row.get('error') is truthy, or if row.get('marker') is True; otherwise True. Include a docstring citing both original call sites.
+
+Benefits:
+Single source of truth for the row-filtering predicate; eliminates duplication between handoff.py and chat_sessions.py; simplifies future maintenance and testing.
+
+### AC-565 · AC-142b: Refactor handoff.py to use shared is_plain_row
+Strength: Strong
+Split-Depth: 1
+Files: handoff.py
+Depends-On: AC-564
+
+Problem:
+handoff.py defines a local _is_plain_row that duplicates the logic now in row_utils.is_plain_row (from AC-142a). The function is called by transcript_tokens and build_handoff.
+
+Solution:
+Import is_plain_row from row_utils at the top of handoff.py. Replace the local _is_plain_row definition with a thin alias (is_plain_row = row_utils.is_plain_row) to preserve the private naming convention used by internal callers, or directly rename internal calls to use the imported name. Update all call sites to use the shared function.
+
+Benefits:
+Removes duplicated predicate logic; ensures handoff.py uses the same filtering rules as chat_sessions.py; reduces code surface.
+
+### AC-566 · AC-142c: Refactor chat_sessions.py to use shared is_plain_row
+Strength: Strong
+Split-Depth: 1
+Files: chat_sessions.py
+Depends-On: AC-564
+
+Problem:
+chat_sessions.py._build_local_messages has inline skip logic (if turn.get('error'): continue; if turn.get('marker') is True: continue) that duplicates the predicate now in row_utils.is_plain_row (from AC-142a).
+
+Solution:
+Import is_plain_row from row_utils at the top of chat_sessions.py. In _build_local_messages, replace the two inline continue checks with a single 'if not is_plain_row(turn): continue' call. Preserve the original comment about failure notices being for the human.
+
+Benefits:
+Removes duplicated predicate logic; aligns chat_sessions.py with handoff.py's filtering behavior; simplifies the replay loop.
