@@ -2473,3 +2473,47 @@ Replace the two lazy 'from app import CHAT_STORAGE_DIR' statements with a single
 
 Benefits:
 Eliminates the circular import between routes/accounts.py and app.py. routes/accounts.py no longer depends on app.py, making it independently importable. The import graph becomes acyclic: both modules depend on config.py but not on each other.
+
+### AC-554 · AC-125a: Create chat_utils.py with is_plain_row predicate
+Strength: Strong
+Split-Depth: 1
+Files: chat_utils.py
+
+Problem:
+The plain-row predicate (skip rows with truthy 'error' or 'marker': True) is defined in handoff.py as _is_plain_row and duplicated inline in chat_sessions.py's _send_claude. This violates DRY and makes the skip rules hard to maintain consistently.
+
+Solution:
+Create a new module chat_utils.py containing a public function is_plain_row(row) -> bool that implements the predicate: returns True for normal user/assistant turns (not failure notices, not swap_session audit markers). The function checks isinstance(row, dict), row.get('error') is falsy, and row.get('marker') is not True.
+
+Benefits:
+Single source of truth for the plain-row filter; easier to maintain and test the skip rules; reduces duplication between handoff.py and chat_sessions.py.
+
+### AC-555 · AC-125b: Update handoff.py to use chat_utils.is_plain_row
+Strength: Strong
+Split-Depth: 1
+Files: handoff.py
+Depends-On: AC-554
+
+Problem:
+handoff.py defines _is_plain_row inline, duplicating logic that should live in the shared chat_utils module (created in AC-125a). This creates two locations to maintain the same predicate.
+
+Solution:
+Import is_plain_row from chat_utils at the top of handoff.py. Replace all call sites (in transcript_tokens and build_handoff) to use the imported function. Remove the local _is_plain_row definition and its docstring cross-reference to chat_sessions._build_local_messages.
+
+Benefits:
+Eliminates duplication in handoff.py; aligns with the shared utility module; preserves behavior since the function signature and logic are unchanged.
+
+### AC-556 · AC-125c: Update chat_sessions.py to use chat_utils.is_plain_row
+Strength: Strong
+Split-Depth: 1
+Files: chat_sessions.py
+Depends-On: AC-554
+
+Problem:
+chat_sessions.py contains inline logic in _send_claude that duplicates the plain-row predicate: 'if isinstance(row, dict) and not row.get("error") and row.get("marker") is not True'. This should use the shared function from chat_utils (created in AC-125a).
+
+Solution:
+Import is_plain_row from chat_utils. Replace the inline predicate in the list comprehension 'plain_earlier = [row for row in earlier if isinstance(row, dict) and not row.get("error") and row.get("marker") is not True]' with 'plain_earlier = [row for row in earlier if is_plain_row(row)]'.
+
+Benefits:
+Eliminates duplication in chat_sessions.py; aligns with the shared utility module; preserves behavior since the logic is semantically equivalent.
