@@ -2473,3 +2473,32 @@ Replace the two lazy 'from app import CHAT_STORAGE_DIR' statements with a single
 
 Benefits:
 Eliminates the circular import between routes/accounts.py and app.py. routes/accounts.py no longer depends on app.py, making it independently importable. The import graph becomes acyclic: both modules depend on config.py but not on each other.
+
+### AC-552 · Extract AgentError into a dedicated agent_errors module
+Strength: Strong
+Split-Depth: 1
+Files: agent_errors.py, agent_client.py
+
+Problem:
+AgentError is defined inside agent_client.py, which is a caller module. This prevents other modules (notably agent_hosts.py) from raising AgentError without importing agent_client, inverting the intended dependency direction. The class is a pure error type and should live in a leaf module with no dependencies on callers.
+
+Solution:
+Create agent_errors.py as a new leaf module containing only the AgentError class (copied verbatim from agent_client.py: class AgentError(RuntimeError): ...). Update agent_client.py to remove the local AgentError definition and replace it with `from agent_errors import AgentError`. No other code in agent_client.py references AgentError beyond its raise sites, so the import swap is sufficient.
+
+Benefits:
+Establishes the leaf of the dependency graph (agent_errors ← agent_hosts ← agent_client). Enables agent_hosts.py to raise AgentError without importing agent_client. Makes AgentError discoverable as a public error type for any module that needs it.
+
+### AC-553 · Unify host resolution into agent_hosts.resolve_host
+Strength: Strong
+Split-Depth: 1
+Files: agent_hosts.py, agent_client.py
+Depends-On: AC-552
+
+Problem:
+Host resolution logic is split: agent_client._resolve_host(name=None) implements the full contract (name-based lookup via agent_hosts.get_host, single-host fallback, AgentError on failure) while agent_hosts.py only exposes get_host(name) which returns None on miss and has no fallback semantics. Callers in agent_client (open_events, _delete_session_from_host) must reach into agent_hosts.hosts() and do their own lookup, duplicating the resolution contract. Error messages for 'unknown host' and 'no configured host' live in agent_client rather than the module that owns host configuration.
+
+Solution:
+Add `def resolve_host(name: str | None = None) -> Host` to agent_hosts.py. When name is provided, delegate to the existing get_host(name); when name is None, return the single configured host (raising AgentError if zero or more-than-one hosts are configured). On the unknown-name path, raise AgentError with the same message format as the current _resolve_host. Import AgentError from agent_errors (candidate 1). In agent_client.py, replace the two call sites — `_resolve_host(host)` in open_events and `agent_hosts.get_host(host_name)` in _delete_session_from_host — with `agent_hosts.resolve_host(...)` using the same argument, and delete the _resolve_host function definition entirely.
+
+Benefits:
+Single source of truth for host resolution lives in the module that owns host configuration. Error messages for 'unknown host' and 'no configured host' are identical across all callers. agent_client.py no longer implements resolution logic, only consumption. The dependency graph stays one-way: agent_errors ← agent_hosts ← agent_client.
