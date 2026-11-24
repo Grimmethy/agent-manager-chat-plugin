@@ -27,7 +27,7 @@ from pathlib import Path
 # Claude chat turn can raise real side-findings into the brain dump and record concept-
 # build tallies), not incidental bloat safe to strip. Same "point at the core repo's real
 # copy" treatment as local_tool_client.py, not vendoring.
-from app import CORE_REPO_ROOT
+from config import CORE_REPO_ROOT
 
 CLAUDE_CLIENT_JS = CORE_REPO_ROOT / "src" / "claude-client.js"
 
