@@ -30,9 +30,7 @@ from flask import Flask, abort, jsonify, render_template
 
 # --- Core-repo location + small shared utilities ----------------------------------------
 
-CORE_REPO_ROOT = Path(os.environ.get(
-    "AGENT_MANAGER_CORE_REPO_ROOT", "/media/model-cache/github/agent-manager",
-)).resolve()
+from config import CORE_REPO_ROOT
 ENV_FILE_PATH = CORE_REPO_ROOT / "agent-manager.env"
 DASHBOARD_SETTINGS_PATH = CORE_REPO_ROOT / "dashboard-settings.json"
 
