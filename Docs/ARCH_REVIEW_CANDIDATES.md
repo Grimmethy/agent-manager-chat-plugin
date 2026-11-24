@@ -2532,3 +2532,32 @@ Create `test_row_utils.py` using `unittest`, since the repo's tests use unittest
 
 Benefits:
 Pins the exact skip contract in one place, including the `is True` marker detail. Any future change to the shared rule fails here, which protects both `handoff` and `chat_sessions`.
+
+### AC-581 · Add unittest characterization tests for agent_client._resolve_host
+Strength: Strong
+Split-Depth: 1
+Files: test_agent_client_resolve_host.py
+
+Problem:
+agent_client._resolve_host(name=None) has three behaviours that are about to be refactored: name=None with exactly one configured host returns that host; name=None with zero or several hosts raises AgentError (message starts with '<n> session agents are configured; pass host=<name> to pick one'); a name that matches no host raises AgentError("unknown session agent host '<name>'"). Nothing pins these down, so a refactor could change them without anyone noticing. Hosts come from agent_hosts.hosts(), which reads AGENT_MANAGER_SESSION_AGENT_URLS (a JSON list of {host, url}) or AGENT_MANAGER_SESSION_AGENT_URL (a single host named 'default') on every call.
+
+Solution:
+Add a new unittest module (unittest only, no pytest) that sets the env vars with unittest.mock.patch.dict(os.environ, ..., clear=False) and covers these cases: (1) a matching name in a two-host plural config returns the Host with that name; (2) an unknown name raises agent_client.AgentError whose message contains "unknown session agent host 'nope'"; (3) name=None with the singular env var returns the Host named 'default'; (4) name=None with no hosts configured raises AgentError; (5) name=None with two hosts raises AgentError whose message contains 'pass host=<name>'. The tests call only agent_client._resolve_host and touch no production code.
+
+Benefits:
+Locks in the current return values, exception type and message text before the delegation refactor, so that refactor can be shown to preserve behaviour. The tests are also a regression net for later changes to host resolution.
+
+### AC-582 · Make _resolve_host delegate named lookup to agent_hosts.get_host
+Strength: Strong
+Split-Depth: 1
+Files: agent_client.py
+Depends-On: AC-581
+
+Problem:
+agent_client._resolve_host re-implements the named lookup that agent_hosts.get_host already provides. It loops `for host in hosts: if host.name == name: return host`, while get_host loops over hosts() with the same `h.name == name` comparison and returns None on a miss. The two loops can drift apart, and get_host is the intended single source of truth for lookup by name. agent_hosts.py needs no edit: get_host already exists and behaves identically, and agent_client already has a module-level `import agent_hosts`. The name=None auto-select branch is specific to agent_client and stays where it is.
+
+Solution:
+In _resolve_host, keep `hosts = agent_hosts.hosts()` and the `if name is None:` branch exactly as they are, including the single-host return and the `{len(hosts)} session agents are configured; pass host=<name> to pick one` AgentError. Replace only the `for host in hosts: if host.name == name: return host` loop with `host = agent_hosts.get_host(name)`, then `if host is not None: return host`. Keep the final `raise AgentError(f"unknown session agent host '{name}'")` unchanged. Leave the signature, docstring and return type alone. Do not modify agent_hosts.py. The characterization tests from the previous sub-candidate must pass unchanged.
+
+Benefits:
+Name matching lives in one place (agent_hosts.get_host), which removes the duplicated loop. Behaviour is unchanged: same return value, same AgentError type and message. The diff is confined to a few lines of _resolve_host.
