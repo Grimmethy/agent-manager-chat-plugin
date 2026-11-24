@@ -2532,3 +2532,32 @@ Create `test_row_utils.py` using `unittest`, since the repo's tests use unittest
 
 Benefits:
 Pins the exact skip contract in one place, including the `is True` marker detail. Any future change to the shared rule fails here, which protects both `handoff` and `chat_sessions`.
+
+### AC-590 · AC-100a: Extract shared providerLabel helper
+Strength: Strong
+Split-Depth: 1
+Files: static/provider-label.js
+
+Problem:
+static/sessions-view.js and static/swap-view.js each define their own providerLabel function with divergent signatures (row vs session) and slightly different output formats. This duplication means updates to provider-labeling logic must be applied in two places, creating risk of drift.
+
+Solution:
+Create static/provider-label.js with a canonical providerLabel({provider, model, account}) function that encapsulates the full labeling logic (Claude with account, Local with model, Unknown fallback). Both consumer files will import from this shared module.
+
+Benefits:
+Single source of truth for provider labeling; adding new providers or changing format requires one edit; consistent output across session list and swap UI.
+
+### AC-591 · AC-100b: Migrate consumers to shared providerLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/swap-view.js, static/sessions-view.js
+Depends-On: AC-590
+
+Problem:
+After AC-100a lands, static/swap-view.js and static/sessions-view.js still define their own local providerLabel functions, duplicating the canonical logic in static/provider-label.js.
+
+Solution:
+Replace the local providerLabel in both files with imports from static/provider-label.js. swap-view.js passes {provider: session.provider, model: session.model, account: session.account}; sessions-view.js passes {provider: row.provider, model: row.model, account: null}.
+
+Benefits:
+Eliminates duplicate provider-labeling code; ensures both UI surfaces use identical formatting; removes maintenance burden of keeping two implementations in sync.
