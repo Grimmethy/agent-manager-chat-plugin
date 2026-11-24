@@ -2473,3 +2473,104 @@ Replace the two lazy 'from app import CHAT_STORAGE_DIR' statements with a single
 
 Benefits:
 Eliminates the circular import between routes/accounts.py and app.py. routes/accounts.py no longer depends on app.py, making it independently importable. The import graph becomes acyclic: both modules depend on config.py but not on each other.
+
+### AC-577 · AC-151a: Add pass-through aliases to internal_api_client.py
+Strength: Strong
+Split-Depth: 1
+Files: internal_api_client.py
+
+Problem:
+local_tool_client.py is a zero-value shim that re-exports stream_plan_with_tools and LocalToolClientError from internal_api_client.py. Before callers can be migrated off local_tool_client, the symbols it currently exposes must be available from internal_api_client itself so imports can be swapped in-place without changing call-site signatures.
+
+Solution:
+Add two module-level aliases at the top of internal_api_client.py (after the existing imports and before the first function definition):
+
+    stream_plan_with_tools = stream_local_turn
+    LocalToolClientError = InternalApiError
+
+These preserve the exact public names that app.py and chat_sessions.py currently import from local_tool_client, while routing through the real implementation in internal_api_client.
+
+Benefits:
+Centralizes the implementation in internal_api_client.py, eliminates the indirection layer, and prepares the ground for caller migration. The aliases are identity mappings (stream_plan_with_tools is a verbatim pass-through to stream_local_turn per the shim's own docstring), so behavior is unchanged.
+
+### AC-578 · AC-151b: Migrate app.py imports off local_tool_client
+Strength: Strong
+Split-Depth: 1
+Files: app.py
+Depends-On: AC-577
+
+Problem:
+app.py's _call_chat function imports LocalToolClientError from local_tool_client and catches it to convert failures into 502 responses. After the shim is removed, this import will break.
+
+Solution:
+In app.py, replace the import in _call_chat:
+
+    from local_tool_client import LocalToolClientError
+
+with:
+
+    from internal_api_client import LocalToolClientError
+
+The LocalToolClientError alias added in AC-151a resolves to InternalApiError, so the except LocalToolClientError block continues to catch the same exception type. No other symbols from local_tool_client are imported in app.py.
+
+Benefits:
+Removes app.py's dependency on local_tool_client.py. The catch block continues to work identically since LocalToolClientError is an alias for InternalApiError.
+
+### AC-579 · AC-151c: Migrate chat_sessions.py imports and call site off local_tool_client
+Strength: Strong
+Split-Depth: 1
+Files: chat_sessions.py
+Depends-On: AC-577
+
+Problem:
+chat_sessions.py imports local_tool_client at module level and calls local_tool_client.stream_plan_with_tools(...) in _stream_local(). After the shim is removed, both the import and the call site will break.
+
+Solution:
+In chat_sessions.py:
+
+1. Replace the module-level import:
+
+    import local_tool_client
+
+with:
+
+    from internal_api_client import stream_plan_with_tools
+
+2. In _stream_local(), replace the call site:
+
+    for event in local_tool_client.stream_plan_with_tools(
+        messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
+        primary_root=roots[0], extra_roots=roots[1:], force_summary_on_cap=True,
+        allow_amplification=True, context_log_session_id=session["id"],
+    ):
+
+with:
+
+    for event in stream_plan_with_tools(
+        messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
+        primary_root=roots[0], extra_roots=roots[1:], force_summary_on_cap=True,
+        allow_amplification=True, context_log_session_id=session["id"],
+    ):
+
+The stream_plan_with_tools alias added in AC-151a resolves to stream_local_turn, so the call semantics are unchanged.
+
+Benefits:
+Removes chat_sessions.py's dependency on local_tool_client.py. The call site continues to work identically since stream_plan_with_tools is an identity alias for stream_local_turn.
+
+### AC-580 · AC-151d: Delete local_tool_client.py
+Strength: Strong
+Split-Depth: 1
+Files: local_tool_client.py
+
+Problem:
+After AC-151b and AC-151c migrate all callers, local_tool_client.py is no longer imported anywhere. It is a zero-value pass-through shim with no unique logic, constants, or side effects -- just two identity aliases and one pass-through function.
+
+Solution:
+Delete the file local_tool_client.py entirely. Run a final grep to confirm no remaining references:
+
+    grep -r "local_tool_client" --include="*.py" .
+
+If the grep returns only the deleted file itself (or no results), the deletion is safe.
+
+Benefits:
+Removes dead code, eliminates an unnecessary indirection layer, and simplifies the codebase. The shim served its purpose during the Phase 3 migration but is now redundant.
