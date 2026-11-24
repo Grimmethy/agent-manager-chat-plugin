@@ -2473,3 +2473,62 @@ Replace the two lazy 'from app import CHAT_STORAGE_DIR' statements with a single
 
 Benefits:
 Eliminates the circular import between routes/accounts.py and app.py. routes/accounts.py no longer depends on app.py, making it independently importable. The import graph becomes acyclic: both modules depend on config.py but not on each other.
+
+### AC-573 · Add row_utils.is_plain_row as the single shared skip predicate
+Strength: Strong
+Split-Depth: 1
+Files: row_utils.py
+
+Problem:
+handoff.py defines `_is_plain_row(row)`, and `chat_sessions._build_local_messages` repeats the same skip logic inline: skip failure-notice rows (truthy `error`) and `swap_session` audit rows (`marker` is True). Its docstring says it is 'the exact two skips chat_sessions._build_local_messages uses'. The two copies can drift apart, and `handoff` has no neutral module it can share the rule through without importing storage code.
+
+Solution:
+Create a new standard-library-only module `row_utils.py`, placed alongside handoff.py, with one function `is_plain_row(row)` and a docstring stating the contract. The body must copy the current `handoff._is_plain_row` exactly: return False if `row` is not a dict; return False if `row.get('error')` is truthy; return False if `row.get('marker') is True`; otherwise return True. The `marker` check must stay `is True`, not truthiness, because that is what handoff.py does today. The module imports nothing from the project, so it cannot create an import cycle.
+
+Benefits:
+One definition of 'plain row' that both modules can import. It adds no I/O or storage dependency to `handoff`, and it keeps current behaviour exactly.
+
+### AC-574 · Make handoff._is_plain_row delegate to row_utils.is_plain_row
+Strength: Strong
+Split-Depth: 1
+Files: handoff.py
+Depends-On: AC-573
+
+Problem:
+handoff.py holds its own copy of the skip predicate in `_is_plain_row`, which `transcript_tokens` and `build_handoff` call. The module docstring also says the skips 'mirror `_build_local_messages` in chat_sessions.py', and the `_is_plain_row` docstring says it is 'the exact two skips chat_sessions._build_local_messages uses'. Both describe a copy-by-convention that the shared predicate replaces. This depends on `row_utils.is_plain_row` having been added by the first candidate.
+
+Solution:
+In handoff.py, add `import row_utils`, matching how the repo imports sibling modules. Reduce `_is_plain_row(row)` to a thin wrapper that returns `row_utils.is_plain_row(row)`, so `transcript_tokens`, `build_handoff` and any test that references `_is_plain_row` keep working unchanged. Rewrite the module docstring sentence about mirroring `_build_local_messages`, and the `_is_plain_row` docstring, to say the rule now lives in `row_utils.is_plain_row`. Leave `window_tokens`, `estimate_tokens`, `transcript_tokens`, `needs_summary` and `build_handoff` bodies untouched.
+
+Benefits:
+The duplicate predicate body is removed from handoff.py. Callers and tests are unaffected because the wrapper keeps the private name. The docstrings no longer describe a mechanism that does not exist.
+
+### AC-575 · Use row_utils.is_plain_row in chat_sessions._build_local_messages
+Strength: Strong
+Split-Depth: 1
+Files: chat_sessions.py
+Depends-On: AC-573
+
+Problem:
+`_build_local_messages` in chat_sessions.py skips error and marker rows with its own inline check inside its transcript replay loop, which duplicates `handoff._is_plain_row`. If one copy changes and the other does not, the rows the local model replays and the rows the hand-off counts or renders will disagree. This depends on `row_utils.is_plain_row` having been added by the first candidate.
+
+Solution:
+In chat_sessions.py, add `import row_utils`, matching the file's existing import style. Inside `_build_local_messages`, replace only the inline error/marker skip condition in the replay loop with a call to `row_utils.is_plain_row(row)`. Leave every other per-row step in that loop, such as role mapping and `text` handling, and the rest of the function unchanged. Before replacing, check the existing condition against `is_plain_row`. If any case differs, such as a non-dict row or a `marker` value that is truthy but not `True`, keep the replacement so that `_build_local_messages` behaves exactly as it does today for those rows. Do not touch any other function in the file.
+
+Benefits:
+`chat_sessions` and `handoff` apply the same skip rule from one definition, so the model replay and the hand-off can no longer drift apart. The change is small and keeps the behaviour of `_build_local_messages` for existing sessions.
+
+### AC-576 · Add unittest coverage for row_utils.is_plain_row
+Strength: Strong
+Split-Depth: 1
+Files: test_row_utils.py
+Depends-On: AC-573
+
+Problem:
+The shared predicate has no tests of its own. Its contract has three parts: non-dict rows are rejected, a truthy `error` rejects the row, and `marker` rejects the row only when it is exactly `True`. A later refactor could silently turn the `is True` check into a truthiness check and change how rows are filtered. This depends on `row_utils.is_plain_row` having been added by the first candidate.
+
+Solution:
+Create `test_row_utils.py` using `unittest`, since the repo's tests use unittest and pytest is not declared. Place it with the repo's other tests and follow their naming. Add a `unittest.TestCase` that imports `row_utils` and checks these cases. (1) A plain `{'role': 'user', 'text': 'hi'}` row returns True. (2) A row with `error` set to a non-empty string returns False. (3) A row with `marker: True` returns False. (4) A row with both `error` and `marker` set returns False. (5) Rows with `error` of None, False or '' return True. (6) A row with `marker: False` returns True. (7) A row with a truthy but non-True marker, such as `marker: 1` or `marker: 'x'`, returns True, which pins the `is True` semantics. (8) Non-dict inputs (None, a string, a list) return False.
+
+Benefits:
+Pins the exact skip contract in one place, including the `is True` marker detail. Any future change to the shared rule fails here, which protects both `handoff` and `chat_sessions`.
