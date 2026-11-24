@@ -2532,3 +2532,47 @@ Create `test_row_utils.py` using `unittest`, since the repo's tests use unittest
 
 Benefits:
 Pins the exact skip contract in one place, including the `is True` marker detail. Any future change to the shared rule fails here, which protects both `handoff` and `chat_sessions`.
+
+### AC-585 · AC-96a: rename swap-view providerLabel export to swapProviderLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/swap-view.js
+
+Problem:
+static/swap-view.js exports `providerLabel(session)`, the swap-view helper, which has the same name as the sessions-view helper `providerLabel(row)` in static/sessions-view.js. Two exports with one name make it ambiguous which helper a caller means. The swap helper has no internal self-references, so only its declaration changes. Renaming it will break the existing import in chat.js until the chat.js candidate lands, so that candidate must follow this one.
+
+Solution:
+In static/swap-view.js, change the declaration `export function providerLabel(session) {` to `export function swapProviderLabel(session) {`. Leave the parameter, body, and return values unchanged. Add one comment line directly above it: `// Swap-view counterpart of sessions-view.js providerLabel(row); exported here as swapProviderLabel.` Do not change any other code in this file.
+
+Benefits:
+Gives the swap-view helper a name that no longer collides with the sessions-view helper, so each export is unambiguous. Parameter shape and output format are unchanged, so runtime behavior of this helper is identical.
+
+### AC-586 · AC-96b: cross-reference comment on sessions-view providerLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/sessions-view.js
+Depends-On: AC-585
+
+Problem:
+static/sessions-view.js exports `providerLabel(row)` for the chat dropdown, and filterChats and formatRow in the same file call it. Nothing in this file says that a sibling swap-view helper shares the name. Once AC-96a lands, that sibling is exported as `swapProviderLabel`, and a reader of sessions-view has no pointer to it.
+
+Solution:
+In static/sessions-view.js, insert one comment line immediately above `export function providerLabel(row) {`: `// Sessions-view helper. The swap-view counterpart in static/swap-view.js is exported as swapProviderLabel.` Leave the function name, body, and every other line unchanged.
+
+Benefits:
+Documents the rename from the sessions-view side, so a reader of either module can find the other helper. No code changes, so behavior is unchanged.
+
+### AC-587 · AC-96c: update chat.js to import and call swapProviderLabel
+Strength: Strong
+Split-Depth: 1
+Files: static/chat.js
+Depends-On: AC-585
+
+Problem:
+chat.js imports the swap-view helper under the name `providerLabel` and uses a manual import alias to tell it apart from the sessions-view helper. After AC-96a renames the swap-view export to `swapProviderLabel`, that import no longer resolves, which breaks chat.js at load time. The alias existed only to disambiguate the two names, so it is unnecessary once the swap helper has its own name. The exact import line, alias name, and call-sites are in chat.js itself.
+
+Solution:
+In chat.js: (a) change the swap-view import so it imports `swapProviderLabel` from static/swap-view.js, keeping the path already used in that import; (b) remove the alias import that disambiguated the two helpers; (c) change every call-site that used the swap-view helper, including any that were reached through the alias, to call `swapProviderLabel(...)`; (d) leave calls to the sessions-view helper as `providerLabel`, and confirm that no call-site still refers to the removed alias. Make no other changes to chat.js.
+
+Benefits:
+Restores chat.js's import so it resolves to the renamed export. Removes the alias, so chat.js refers to the two helpers by distinct names and no longer needs a workaround to tell them apart.
