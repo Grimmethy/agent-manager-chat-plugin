@@ -2532,3 +2532,32 @@ Create `test_row_utils.py` using `unittest`, since the repo's tests use unittest
 
 Benefits:
 Pins the exact skip contract in one place, including the `is True` marker detail. Any future change to the shared rule fails here, which protects both `handoff` and `chat_sessions`.
+
+### AC-588 · AC-98a: Create provider-format.js and migrate swap-view.js
+Strength: Strong
+Split-Depth: 1
+Files: static/provider-format.js, static/swap-view.js
+
+Problem:
+swap-view.js exports a providerLabel(session) function that duplicates formatting logic. The function handles three cases (claude with optional account, local, unknown) but this logic should be shared with sessions-view.js, which has its own divergent providerLabel(row) implementation.
+
+Solution:
+Create static/provider-format.js exporting providerLabel({provider, model, account}) that accepts an optional account parameter and always uses the more informative swap-view behavior (showing 'live account' when account is missing, returning 'Unknown' for unrecognized providers). Update swap-view.js to import and re-export this function, removing the local implementation. The swap-view.js call sites (swapOptions, internal providerLabel calls) continue to work unchanged since the signature is compatible.
+
+Benefits:
+Establishes the shared formatting module. swap-view.js immediately benefits from the single source of truth. The new module's signature ({provider, model, account}) is forward-compatible with both callers.
+
+### AC-589 · AC-98b: Migrate sessions-view.js and chat.js to provider-format.js
+Strength: Strong
+Split-Depth: 1
+Files: static/sessions-view.js, static/chat.js
+Depends-On: AC-588
+
+Problem:
+sessions-view.js has its own providerLabel(row) that produces different output than the unified version: non-claude providers return 'Local' instead of 'Unknown', and claude without an account omits the ' · live account' suffix. chat.js imports providerLabel from swap-view.js but should import from the shared module for consistency.
+
+Solution:
+Update sessions-view.js to import providerLabel from provider-format.js. The function will now produce the more informative labels (swap-view behavior). Update chat.js to import providerLabel from provider-format.js instead of swap-view.js. Verify test/sessions-view.test.mjs imports are updated if it references providerLabel from sessions-view.js (keep re-export if needed, or update test import). The behavior change is intentional: the unified function now consistently shows account info when available.
+
+Benefits:
+Completes the unification. All provider labels now use one function with consistent behavior. chat.js has a single import source. The more informative labels (showing account when present) are now used everywhere.
