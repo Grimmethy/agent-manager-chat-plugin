@@ -2473,3 +2473,47 @@ Replace the two lazy 'from app import CHAT_STORAGE_DIR' statements with a single
 
 Benefits:
 Eliminates the circular import between routes/accounts.py and app.py. routes/accounts.py no longer depends on app.py, making it independently importable. The import graph becomes acyclic: both modules depend on config.py but not on each other.
+
+### AC-570 · AC-148a: add config.get_local_model() as the routing layer's accessor for LOCAL_MODEL
+Strength: Strong
+Split-Depth: 1
+Files: .venv/lib/python3.12/site-packages/flask/config.py
+
+Problem:
+The routing layer (the swap route and the reserve/close/message handlers) reads the local model name by calling `ollama_client.MODEL()`. That function lives in `ollama_client.py`, the Ollama HTTP client, so the client's env-var accessor leaks into routing code that has no other reason to depend on the client. There is no neutral, shared place to read `LOCAL_MODEL`. `ollama_client.MODEL()` reads `os.environ.get("LOCAL_MODEL")` on every call, so it returns None when unset. `ollama_client.py` must stay unchanged, because `generate()` inside it still uses `MODEL()`. First check whether a shared config module already exists. If one does, add the function there. If none exists, create `config.py` next to the route modules.
+
+Solution:
+Add `get_local_model() -> str` to `config.py`, creating the file if no shared config module exists. The function has a one-line docstring and returns `os.environ.get("LOCAL_MODEL", "")`. It must read the environment at call time, not at import time, matching the per-call behavior of `ollama_client.MODEL()`, so a LOCAL_MODEL set after import is still seen. Include `import os`. Add no other settings and touch no other file. Do not modify or deprecate `ollama_client.MODEL()`.
+
+Benefits:
+Gives the routing layer a client-independent accessor for LOCAL_MODEL. Purely additive, so it changes no behavior until callers migrate. It is a prerequisite for the call-site and test migrations that follow.
+
+### AC-571 · AC-148b: switch the swap route and reserve/close/message handlers from ollama_client.MODEL() to config.get_local_model()
+Strength: Strong
+Split-Depth: 1
+Files: app.py
+Depends-On: AC-570
+
+Problem:
+The Flask routing module (imported by the tests as `app`) defines the swap route (`POST /api/chat/<id>/swap`) and `api_chat_reserve`. It also defines the close and message handlers. It calls `ollama_client.MODEL()` to get the model name it passes to `internal_api_client.reserve(sid, model, <bool>)`. That couples routing code to the Ollama client's env accessor. This change can only be written correctly after `config.get_local_model()` exists, which the earlier candidate adds. If a handler also uses `ollama_client` for something other than `MODEL()`, keep that import there and only move the `MODEL()` usage.
+
+Solution:
+In this module, add `from config import get_local_model`, adjusted to the repo's import style. Replace every `ollama_client.MODEL()` call in the swap route and the reserve/close/message handlers with `get_local_model()`. Remove `import ollama_client` only if it becomes unused in this file. Leave the argument order and the shape of the `internal_api_client.reserve(...)` calls unchanged. Do not touch `ollama_client.py`. Before editing, confirm that nothing downstream of `internal_api_client.reserve` distinguishes None from `""` for the model argument, since the unset-LOCAL_MODEL result changes from None to `""`.
+
+Benefits:
+The routing layer no longer depends on the Ollama client for configuration. A future change to the client, or to how the model name is sourced, cannot break the routing layer's reserve calls.
+
+### AC-572 · AC-148c: update test_chat_routes_swap.py to assert against config.get_local_model() instead of ollama_client.MODEL()
+Strength: Strong
+Split-Depth: 1
+Files: test_chat_routes_swap.py
+Depends-On: AC-571
+
+Problem:
+`test_leaving_local_while_reserved_releases_the_reservation` in `SwapReservationTest` asserts `reserve.call_args[0] == (SID, ollama_client.MODEL(), False)`. The test file also has `import ollama_client  # noqa: E402`. Once the handlers use `config.get_local_model()`, this assertion compares against the old accessor. With LOCAL_MODEL unset the handler would pass `""` while the test expects None, so the test fails. The test is also coupled to the Ollama client for a value the client no longer supplies. This must land after the handler migration in `app.py`, which in turn depends on `config.get_local_model()`.
+
+Solution:
+Add `from config import get_local_model  # noqa: E402` alongside the other imports, after the `sys.path.insert`. Change the assertion to `self.assertEqual(reserve.call_args[0], (SID, get_local_model(), False))`. Remove `import ollama_client  # noqa: E402` if nothing else in the file uses it, and check the rest of the file first. If any test patches `ollama_client.MODEL`, retarget it to set `LOCAL_MODEL` in the environment or to patch `get_local_model` in the handler's namespace. Keep every assertion's intent the same. Run it with `python -m unittest test_chat_routes_swap test_chat_routes -v`, using unittest as the repo does.
+
+Benefits:
+The swap-route test no longer imports the Ollama client and verifies the same behavior through the routing layer's own accessor. This completes removing `ollama_client.MODEL()` from the routing layer and its tests.
