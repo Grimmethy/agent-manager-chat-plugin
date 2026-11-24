@@ -2532,3 +2532,32 @@ Create `test_row_utils.py` using `unittest`, since the repo's tests use unittest
 
 Benefits:
 Pins the exact skip contract in one place, including the `is True` marker detail. Any future change to the shared rule fails here, which protects both `handoff` and `chat_sessions`.
+
+### AC-583 · Add shared providerDisplay helper to swap-view.js and route providerLabel through it
+Strength: Strong
+Split-Depth: 1
+Files: static/swap-view.js
+
+Problem:
+In static/swap-view.js, the provider-to-label rules live only inside the exported providerLabel(session): claude gives 'Claude · <model> · <account>', where the account reads 'live account' when session.account is null or undefined and the model part is left out when the model is empty; local gives 'Local · <model>' or 'Local'; anything else gives 'Unknown'. static/sessions-view.js has its own divergent providerLabel and cannot reuse these rules, because they are not exposed as a parameterised helper. Because of this, the same session can get contradictory labels in the two views.
+
+Solution:
+Add and export `providerDisplay(session, options)` in static/swap-view.js, where options is `{ includeAccount }` and defaults to `{}`. Move the body of the current providerLabel into it unchanged, except that the claude account segment is added only when `includeAccount` is true. With includeAccount true the claude branch keeps its present output exactly: `'Claude · ' + s.model + ' · ' + account` when a model exists (account being `s.account != null ? s.account : 'live account'`), and `'Claude · ' + account` when there is no model. With includeAccount false the claude branch returns `'Claude · ' + s.model` or `'Claude'`. The local branch (`'Local · ' + s.model` or `'Local'`) and the final `'Unknown'` fallback are unchanged. Then rewrite the exported providerLabel(session) as `return providerDisplay(session, { includeAccount: true });`, keeping its name, signature and doc comment. Swap-menu labels, including the model for claude sessions, stay byte-for-byte identical. Add tests to test/swap-view.test.mjs (node:test) for providerDisplay with includeAccount true and false across claude with and without model and account, local with and without model, a made-up provider, and a missing session.
+
+Benefits:
+Gives the label rules a single owner that both views can import, with no behaviour change for the swap menu. It is a small, self-contained edit to one file and is safe to land alone.
+
+### AC-584 · Make sessions-view.js providerLabel delegate to the shared providerDisplay
+Strength: Strong
+Split-Depth: 1
+Files: static/sessions-view.js
+Depends-On: AC-583
+
+Problem:
+static/sessions-view.js exports providerLabel(row) as a binary rule: `row && row.provider === 'claude' ? 'Claude' : 'Local'`, with ` · <model>` appended when row.model is set. Any provider other than claude, including a missing or unrecognised value, is shown as 'Local' in the session switcher, while the swap menu in static/swap-view.js labels the same session 'Unknown'. This is the contradictory-labels bug. It depends on the earlier sub-candidate, which adds the exported `providerDisplay` to static/swap-view.js.
+
+Solution:
+In static/sessions-view.js, add `import { providerDisplay } from './swap-view.js';` at the top of the module. This is safe because swap-view.js imports nothing. Replace the body of the exported providerLabel(row) with `return providerDisplay(row, { includeAccount: false });`, and delete the now-unused local `provider` ternary and model-append line. Keep the export name, so formatRow (`provider: providerLabel(row)`) and filterChats (`has(providerLabel(r))`) need no edits. Claude and local rows render exactly as before ('Claude · <model>', 'Claude', 'Local · <model>', 'Local'). Rows with a missing or unrecognised provider now read 'Unknown', matching the swap menu. Update only the existing test/sessions-view.test.mjs assertions that encode the old 'Local' fallback for unknown or missing providers, and add one case asserting that sessions-view and swap-view agree on the model-and-provider part of the label.
+
+Benefits:
+Removes the divergent implementation, so one rule decides what a valid provider is and both views show the same provider label for the same session. The change is small and touches one file, with no changes to callers or exports.
