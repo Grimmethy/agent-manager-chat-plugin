@@ -28,10 +28,10 @@ def _fake_response(json_body=None, status=200):
 class TokenTest(unittest.TestCase):
     def test_missing_token_raises_before_any_request(self):
         with mock.patch.dict("os.environ", {}, clear=True), \
-             mock.patch("requests.get") as m_get:
+             mock.patch("requests.request") as m_request:
             with self.assertRaises(iac.InternalApiError):
                 iac.get_roots()
-            m_get.assert_not_called()
+            m_request.assert_not_called()
 
 
 class GetRootsTest(unittest.TestCase):
@@ -41,18 +41,18 @@ class GetRootsTest(unittest.TestCase):
         self.addCleanup(self._env.stop)
 
     def test_returns_roots_on_success(self):
-        with mock.patch("requests.get", return_value=_fake_response({"roots": ["/a", "/b"]})) as m:
+        with mock.patch("requests.request", return_value=_fake_response({"roots": ["/a", "/b"]})) as m:
             self.assertEqual(iac.get_roots(), ["/a", "/b"])
             headers = m.call_args.kwargs["headers"]
             self.assertEqual(headers["X-Internal-Token"], "tok")
 
     def test_connection_failure_raises_internal_api_error(self):
-        with mock.patch("requests.get", side_effect=requests.ConnectionError("refused")):
+        with mock.patch("requests.request", side_effect=requests.ConnectionError("refused")):
             with self.assertRaises(iac.InternalApiError):
                 iac.get_roots()
 
     def test_http_error_raises_internal_api_error(self):
-        with mock.patch("requests.get", return_value=_fake_response(status=403)):
+        with mock.patch("requests.request", return_value=_fake_response(status=403)):
             with self.assertRaises(iac.InternalApiError):
                 iac.get_roots()
 
@@ -65,11 +65,11 @@ class PreemptTest(unittest.TestCase):
 
     def test_returns_preempted_list(self):
         summary = [{"lane": "worker-1", "action": "killed"}]
-        with mock.patch("requests.post", return_value=_fake_response({"preempted": summary})):
+        with mock.patch("requests.request", return_value=_fake_response({"preempted": summary})):
             self.assertEqual(iac.preempt(), summary)
 
     def test_failure_raises(self):
-        with mock.patch("requests.post", side_effect=requests.Timeout("slow")):
+        with mock.patch("requests.request", side_effect=requests.Timeout("slow")):
             with self.assertRaises(iac.InternalApiError):
                 iac.preempt()
 
@@ -81,7 +81,7 @@ class ReserveTest(unittest.TestCase):
         self.addCleanup(self._env.stop)
 
     def test_claim_sends_model_and_on_true(self):
-        with mock.patch("requests.post", return_value=_fake_response({"reservationId": "s1", "reserved": True})) as m:
+        with mock.patch("requests.request", return_value=_fake_response({"reservationId": "s1", "reserved": True})) as m:
             result = iac.reserve("s1", "qwen3.8", True)
             self.assertEqual(result, {"reservationId": "s1", "reserved": True})
             self.assertEqual(m.call_args.kwargs["json"], {"reservationId": "s1", "on": True, "model": "qwen3.8"})
@@ -90,24 +90,24 @@ class ReserveTest(unittest.TestCase):
         # Contract: the body ALWAYS carries a "model" key (the server expects it
         # present); only a genuinely absent model (None, and LOCAL_MODEL unset)
         # is a client-side error.
-        with mock.patch("requests.post", return_value=_fake_response({"reservationId": "s1", "reserved": False})) as m:
+        with mock.patch("requests.request", return_value=_fake_response({"reservationId": "s1", "reserved": False})) as m:
             iac.reserve("s1", "", False)
             self.assertEqual(m.call_args.kwargs["json"], {"reservationId": "s1", "on": False, "model": ""})
 
     def test_claiming_without_a_model_raises_internalapierror_before_any_request(self):
         # model=None and LOCAL_MODEL unset, on=True -> InternalApiError (the type the routes handle), and no HTTP request is sent.
         with mock.patch.dict("os.environ", {}, clear=True):
-            with mock.patch("requests.post") as m_post:
+            with mock.patch("requests.request") as m_request:
                 with self.assertRaises(iac.InternalApiError) as ctx:
                     iac.reserve("s1", None, True)
                 self.assertIn("model", str(ctx.exception).lower())
                 self.assertIn("LOCAL_MODEL", str(ctx.exception))
-                m_post.assert_not_called()
+                m_request.assert_not_called()
 
     def test_releasing_without_a_model_still_works_and_sends_no_model_key(self):
         # The server only requires a model when claiming; a release (api_chat_close's best-effort call) must not start raising.
         with mock.patch.dict("os.environ", {"AGENT_MANAGER_INTERNAL_TOKEN": "tok"}, clear=True):
-            with mock.patch("requests.post", return_value=_fake_response({"reservationId": "s1", "reserved": False})) as m:
+            with mock.patch("requests.request", return_value=_fake_response({"reservationId": "s1", "reserved": False})) as m:
                 self.assertEqual(iac.reserve("s1", None, False), {"reservationId": "s1", "reserved": False})
                 self.assertEqual(m.call_args.kwargs["json"], {"reservationId": "s1", "on": False})
 
@@ -116,7 +116,7 @@ class ReserveTest(unittest.TestCase):
             "AGENT_MANAGER_INTERNAL_TOKEN": "tok",
             "LOCAL_MODEL": "local-x",
         }, clear=True):
-            with mock.patch("requests.post", return_value=_fake_response({"reservationId": "s1", "reserved": True})) as m:
+            with mock.patch("requests.request", return_value=_fake_response({"reservationId": "s1", "reserved": True})) as m:
                 iac.reserve("s1", on=True)
                 self.assertEqual(m.call_args.kwargs["json"], {"reservationId": "s1", "on": True, "model": "local-x"})
 
@@ -138,26 +138,26 @@ class StreamLocalTurnTest(unittest.TestCase):
 
     def test_yields_parsed_chunks_and_final(self):
         lines = ['data: {"type": "chunk", "text": "a"}', 'data: {"type": "final", "response": "a"}']
-        with mock.patch("requests.post", return_value=self._fake_stream_response(lines)):
+        with mock.patch("requests.request", return_value=self._fake_stream_response(lines)):
             events = list(iac.stream_local_turn(prompt="hi", max_turns=3))
             self.assertEqual(events, [{"type": "chunk", "text": "a"}, {"type": "final", "response": "a"}])
 
     def test_skips_non_data_and_blank_lines(self):
         lines = ["", ": comment", 'data: {"type": "final", "response": "ok"}']
-        with mock.patch("requests.post", return_value=self._fake_stream_response(lines)):
+        with mock.patch("requests.request", return_value=self._fake_stream_response(lines)):
             events = list(iac.stream_local_turn(prompt="hi"))
             self.assertEqual(events, [{"type": "final", "response": "ok"}])
 
     def test_request_failure_raises_internal_api_error(self):
-        with mock.patch("requests.post", side_effect=requests.ConnectionError("refused")):
+        with mock.patch("requests.request", side_effect=requests.ConnectionError("refused")):
             with self.assertRaises(iac.InternalApiError) as ctx:
                 list(iac.stream_local_turn(prompt="hi"))
-            self.assertIn("local-turn call failed", str(ctx.exception))
+            self.assertIn("POST", str(ctx.exception))
 
     def test_http_error_status_raises_internal_api_error(self):
         resp = self._fake_stream_response([])
         resp.raise_for_status.side_effect = requests.HTTPError("500")
-        with mock.patch("requests.post", return_value=resp):
+        with mock.patch("requests.request", return_value=resp):
             with self.assertRaises(iac.InternalApiError):
                 list(iac.stream_local_turn(prompt="hi"))
 
@@ -169,7 +169,7 @@ class StreamLocalTurnTest(unittest.TestCase):
         resp = self._fake_stream_response([])
         resp.iter_lines.return_value = lines()
         got = []
-        with mock.patch("requests.post", return_value=resp):
+        with mock.patch("requests.request", return_value=resp):
             with self.assertRaises(iac.InternalApiError):
                 for ev in iac.stream_local_turn(prompt="hi"):
                     got.append(ev)
@@ -178,11 +178,11 @@ class StreamLocalTurnTest(unittest.TestCase):
     def test_messages_takes_precedence_over_prompt_in_the_request_body(self):
         captured = {}
 
-        def fake_post(url, headers=None, json=None, **kwargs):
+        def fake_request(method, url, headers=None, json=None, **kwargs):
             captured.update(json)
             return self._fake_stream_response(['data: {"type": "final", "response": "ok"}'])
 
-        with mock.patch("requests.post", side_effect=fake_post):
+        with mock.patch("requests.request", side_effect=fake_request):
             list(iac.stream_local_turn(messages=[{"role": "user", "content": "hi"}], prompt="ignored"))
             self.assertIn("messages", captured)
             self.assertNotIn("prompt", captured)
@@ -190,22 +190,22 @@ class StreamLocalTurnTest(unittest.TestCase):
     def test_context_log_session_id_included_when_set(self):
         captured = {}
 
-        def fake_post(url, headers=None, json=None, **kwargs):
+        def fake_request(method, url, headers=None, json=None, **kwargs):
             captured.update(json)
             return self._fake_stream_response(['data: {"type": "final", "response": "ok"}'])
 
-        with mock.patch("requests.post", side_effect=fake_post):
+        with mock.patch("requests.request", side_effect=fake_request):
             list(iac.stream_local_turn(prompt="hi", context_log_session_id="chat-1-abc"))
         self.assertEqual(captured.get("contextLogSessionId"), "chat-1-abc")
 
     def test_context_log_session_id_omitted_when_not_set(self):
         captured = {}
 
-        def fake_post(url, headers=None, json=None, **kwargs):
+        def fake_request(method, url, headers=None, json=None, **kwargs):
             captured.update(json)
             return self._fake_stream_response(['data: {"type": "final", "response": "ok"}'])
 
-        with mock.patch("requests.post", side_effect=fake_post):
+        with mock.patch("requests.request", side_effect=fake_request):
             list(iac.stream_local_turn(prompt="hi"))
         self.assertNotIn("contextLogSessionId", captured)
 
