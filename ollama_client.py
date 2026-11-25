@@ -39,6 +39,10 @@ def pinned_num_ctx() -> int:
 
 def generate(prompt: str, think: bool = False, temperature: float = 0.4, num_predict: int = 900) -> dict:
     """POSTs to Ollama's /api/generate. Returns {"response": str, "thinking": str}."""
+    # Read per-call so callers that mutate os.environ (e.g. tests, multi-tenant
+    # workers) see the current value without re-importing the module.
+    base_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    arbiter_class = os.environ.get("OLLAMA_ARBITER_CLASS", "interactive")
     body = {
         "model": MODEL(),
         "prompt": prompt,
@@ -47,10 +51,13 @@ def generate(prompt: str, think: bool = False, temperature: float = 0.4, num_pre
         "keep_alive": KEEP_ALIVE,
         "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": pinned_num_ctx()},
     }
+    headers = {"Content-Type": "application/json"}
+    if arbiter_class:
+        headers["X-Arbiter-Class"] = arbiter_class
     req = urllib.request.Request(
-        f"{OLLAMA_URL}/api/generate",
+        f"{base_url}/api/generate",
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=240) as resp:
