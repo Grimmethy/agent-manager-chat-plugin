@@ -42,37 +42,38 @@ def _headers(extra: dict = None) -> dict:
     return h
 
 
-def get_roots() -> list:
+def _request(method: str, url: str, **kwargs) -> requests.Response:
+    """Centralized HTTP helper: wraps a `requests` call in a try/except that converts
+    any `requests.RequestException` (connection refused, timeout, HTTP error, etc.) into
+    an `InternalApiError` with a consistent message format. Callers no longer need their
+    own try/except blocks for transport failures."""
     try:
-        r = requests.get(f"{CORE_DASHBOARD_URL}/api/internal/chat/roots", headers=_headers(), timeout=10)
+        r = requests.request(method, url, **kwargs)
         r.raise_for_status()
-        return r.json().get("roots", [])
+        return r
     except requests.RequestException as e:
-        raise InternalApiError(f"GET /api/internal/chat/roots failed: {e}") from e
+        raise InternalApiError(f"{method.upper()} {url} failed: {e}") from e
+
+
+def get_roots() -> list:
+    r = _request("GET", f"{CORE_DASHBOARD_URL}/api/internal/chat/roots", headers=_headers(), timeout=10)
+    return r.json().get("roots", [])
 
 
 def run_command(argv: list, repo: str, proposal_id: str, confirmed_at: str, session_id: str = None) -> dict:
     """Asks core to run ONE owner-confirmed, allowlisted command (POST /api/internal/chat/run-command; core re-validates everything itself). Returns core's reply:
     { ok, exitCode, stdout, stderr, durationMs } for a command that ran, { ok: False, refused } for one that did not. A transport failure raises InternalApiError."""
-    try:
-        r = requests.post(
-            f"{CORE_DASHBOARD_URL}/api/internal/chat/run-command", headers=_headers(),
-            json={"argv": argv, "repo": repo, "proposalId": proposal_id, "confirmedAt": confirmed_at, "sessionId": session_id},
-            timeout=960,  # core caps a command at 900 s
-        )
-        r.raise_for_status()
-        return r.json()
-    except (requests.RequestException, ValueError) as e:
-        raise InternalApiError(f"POST /api/internal/chat/run-command failed: {e}") from e
+    r = _request(
+        "POST", f"{CORE_DASHBOARD_URL}/api/internal/chat/run-command", headers=_headers(),
+        json={"argv": argv, "repo": repo, "proposalId": proposal_id, "confirmedAt": confirmed_at, "sessionId": session_id},
+        timeout=960,  # core caps a command at 900 s
+    )
+    return r.json()
 
 
 def preempt() -> list:
-    try:
-        r = requests.post(f"{CORE_DASHBOARD_URL}/api/internal/chat/preempt", headers=_headers(), timeout=20)
-        r.raise_for_status()
-        return r.json().get("preempted", [])
-    except requests.RequestException as e:
-        raise InternalApiError(f"POST /api/internal/chat/preempt failed: {e}") from e
+    r = _request("POST", f"{CORE_DASHBOARD_URL}/api/internal/chat/preempt", headers=_headers(), timeout=20)
+    return r.json().get("preempted", [])
 
 
 RESERVE_TIMEOUT_S = 300  # the default: a CLAIM genuinely blocks on the core side behind a busy worker lane
@@ -92,18 +93,14 @@ def reserve(reservation_id: str, model: str = None, on: bool = True, timeout: fl
     body = {"reservationId": reservation_id, "on": on}
     if model is not None:
         body["model"] = model
-    try:
-        # Genuinely blocking on the server side (single_flight_lock.acquire() can wait
-        # for a worker lane's current call) -- so the DEFAULT stays long: the user's reserve toggle
-        # must not give up and return 502 while the core request keeps waiting and then records a
-        # reservation the UI says does not exist. Only a best-effort caller (the per-message refresh
-        # of an already-reserved session) passes a short `timeout`.
-        r = requests.post(f"{CORE_DASHBOARD_URL}/api/internal/chat/reserve", headers=_headers(),
-                           json=body, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except requests.RequestException as e:
-        raise InternalApiError(f"POST /api/internal/chat/reserve failed: {e}") from e
+    # Genuinely blocking on the server side (single_flight_lock.acquire() can wait
+    # for a worker lane's current call) -- so the DEFAULT stays long: the user's reserve toggle
+    # must not give up and return 502 while the core request keeps waiting and then records a
+    # reservation the UI says does not exist. Only a best-effort caller (the per-message refresh
+    # of an already-reserved session) passes a short `timeout`.
+    r = _request("POST", f"{CORE_DASHBOARD_URL}/api/internal/chat/reserve", headers=_headers(),
+                   json=body, timeout=timeout)
+    return r.json()
 
 
 def stream_local_turn(*, messages: list = None, prompt: str = None, max_turns: int = 5,
@@ -138,12 +135,9 @@ def stream_local_turn(*, messages: list = None, prompt: str = None, max_turns: i
         body["contextLogSessionId"] = context_log_session_id
 
     try:
-        with requests.post(
-            f"{CORE_DASHBOARD_URL}/api/internal/chat/local-turn",
-            headers=_headers({"Accept": "text/event-stream"}),
-            json=body, stream=True, timeout=(10, 6000),
-        ) as r:
-            r.raise_for_status()
+        with _request("POST", f"{CORE_DASHBOARD_URL}/api/internal/chat/local-turn",
+                      headers=_headers({"Accept": "text/event-stream"}),
+                      json=body, stream=True, timeout=(10, 6000)) as r:
             for line in r.iter_lines(decode_unicode=True):
                 if not line or not line.startswith("data: "):
                     continue
@@ -151,5 +145,9 @@ def stream_local_turn(*, messages: list = None, prompt: str = None, max_turns: i
                     yield json.loads(line[len("data: "):])
                 except json.JSONDecodeError:
                     continue
-    except requests.RequestException as e:
+    except InternalApiError:
+        raise
+    except Exception as e:
+        # Should not happen: _request already converts RequestException to InternalApiError.
+        # This catches any unexpected error (e.g., from iter_lines) and wraps it consistently.
         raise InternalApiError(f"internal API local-turn call failed: {e}") from e
